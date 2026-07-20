@@ -13,6 +13,29 @@ const DEFAULT_RELEASE_REPO = "AgentWrapper/agent-orchestrator";
 // shortcut/launcher at the SAME name. Drift here means a broken Start menu
 // shortcut on Windows (#2414) or "could not find the Electron app binary" on deb.
 const EXECUTABLE_NAME = "agent-orchestrator";
+const LOCAL_SIGNING = process.env.AO_LOCAL_SIGNING === "true";
+
+// A self-signed certificate has no Apple Team ID. Hardened-runtime library
+// validation therefore rejects Electron Framework even when every nested bundle
+// has the same local certificate. Limit this entitlement exception to the
+// explicit private, single-machine build; Developer-ID builds remain unchanged.
+const localOsxSign = {
+	identity: process.env.APPLE_SIGNING_IDENTITY!,
+	continueOnError: false,
+	optionsForFile: (filePath: string) => {
+		if (!filePath.endsWith(".app")) return {};
+		if (filePath.includes("(Plugin).app")) return {};
+		if (filePath.includes("(GPU).app") || filePath.includes("(Renderer).app")) {
+			return {
+				entitlements: [
+					"com.apple.security.cs.allow-jit",
+					"com.apple.security.cs.disable-library-validation",
+				],
+			};
+		}
+		return { entitlements: "assets/entitlements.local.plist" };
+	},
+};
 
 // parseReleaseRepo turns an "owner/repo" string (from AO_RELEASE_REPO) into the
 // publisher-github { owner, name } shape, falling back to the production default
@@ -46,7 +69,9 @@ const config: ForgeConfig = {
 		//    `notarytool store-credentials`. See ao-macos-signed-release runbook.
 		// Both are valid NotaryToolCredentials, so no cast is needed.
 		osxSign: process.env.APPLE_SIGNING_IDENTITY
-			? { identity: process.env.APPLE_SIGNING_IDENTITY }
+			? LOCAL_SIGNING
+				? localOsxSign
+				: { identity: process.env.APPLE_SIGNING_IDENTITY }
 			: process.env.CSC_LINK
 				? {}
 				: undefined,
