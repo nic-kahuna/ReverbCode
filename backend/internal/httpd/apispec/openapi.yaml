@@ -1866,6 +1866,8 @@ components:
           type: string
         kind:
           type: string
+        launchRoute:
+          $ref: '#/components/schemas/DomainAgentLaunchRoute'
         previewRevision:
           format: int64
           type: integer
@@ -1877,6 +1879,8 @@ components:
           items:
             $ref: '#/components/schemas/SessionPRFacts'
           type: array
+        requestedRoute:
+          $ref: '#/components/schemas/DomainAgentRoute'
         status:
           enum:
           - working
@@ -1938,6 +1942,30 @@ components:
       required:
       - state
       - lastActivityAt
+      type: object
+    DomainAgentLaunchRoute:
+      properties:
+        harness:
+          type: string
+        model:
+          type: string
+        reasoningEffort:
+          type: string
+      required:
+      - harness
+      type: object
+    DomainAgentRoute:
+      properties:
+        harness:
+          type: string
+        model:
+          type: string
+        reasoningEffort:
+          type: string
+      required:
+      - harness
+      - model
+      - reasoningEffort
       type: object
     DomainReviewerConfig:
       properties:

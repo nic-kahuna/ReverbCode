@@ -187,6 +187,22 @@ func mapSessionRows(rows []gen.Session) []domain.SessionRecord {
 }
 
 func rowToRecord(row gen.Session) domain.SessionRecord {
+	var requestedRoute *domain.AgentRoute
+	if row.RequestedHarness != "" {
+		requestedRoute = &domain.AgentRoute{
+			Harness:         domain.AgentHarness(row.RequestedHarness),
+			Model:           row.RequestedModel,
+			ReasoningEffort: domain.ReasoningEffort(row.RequestedReasoningEffort),
+		}
+	}
+	var launchRoute *domain.AgentLaunchRoute
+	if row.LaunchRouteRecorded {
+		launchRoute = &domain.AgentLaunchRoute{
+			Harness:         row.Harness,
+			Model:           row.LaunchModel,
+			ReasoningEffort: domain.ReasoningEffort(row.LaunchReasoningEffort),
+		}
+	}
 	return domain.SessionRecord{
 		ID:          row.ID,
 		ProjectID:   row.ProjectID,
@@ -206,6 +222,8 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 			RuntimeHandleID: row.RuntimeHandleID,
 			AgentSessionID:  row.AgentSessionID,
 			Prompt:          row.Prompt,
+			RequestedRoute:  requestedRoute,
+			LaunchRoute:     launchRoute,
 			PreviewURL:      row.PreviewURL,
 			PreviewRevision: row.PreviewRevision,
 		},
@@ -216,51 +234,81 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 
 func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams {
 	activity := normalActivity(rec.Activity, rec.CreatedAt)
+	requestedHarness, requestedModel, requestedEffort := requestedRouteColumns(rec.Metadata.RequestedRoute)
+	launchModel, launchEffort, launchRecorded := launchRouteColumns(rec.Metadata.LaunchRoute)
 	return gen.InsertSessionParams{
-		ID:              rec.ID,
-		ProjectID:       rec.ProjectID,
-		Num:             num,
-		IssueID:         rec.IssueID,
-		Kind:            rec.Kind,
-		Harness:         rec.Harness,
-		DisplayName:     rec.DisplayName,
-		ActivityState:   activity.State,
-		ActivityLastAt:  activity.LastActivityAt,
-		FirstSignalAt:   timeToNullTime(rec.FirstSignalAt),
-		IsTerminated:    rec.IsTerminated,
-		Branch:          rec.Metadata.Branch,
-		WorkspacePath:   rec.Metadata.WorkspacePath,
-		RuntimeHandleID: rec.Metadata.RuntimeHandleID,
-		AgentSessionID:  rec.Metadata.AgentSessionID,
-		Prompt:          rec.Metadata.Prompt,
-		PreviewURL:      rec.Metadata.PreviewURL,
-		PreviewRevision: rec.Metadata.PreviewRevision,
-		CreatedAt:       rec.CreatedAt,
-		UpdatedAt:       rec.UpdatedAt,
+		ID:                       rec.ID,
+		ProjectID:                rec.ProjectID,
+		Num:                      num,
+		IssueID:                  rec.IssueID,
+		Kind:                     rec.Kind,
+		Harness:                  rec.Harness,
+		DisplayName:              rec.DisplayName,
+		ActivityState:            activity.State,
+		ActivityLastAt:           activity.LastActivityAt,
+		FirstSignalAt:            timeToNullTime(rec.FirstSignalAt),
+		IsTerminated:             rec.IsTerminated,
+		Branch:                   rec.Metadata.Branch,
+		WorkspacePath:            rec.Metadata.WorkspacePath,
+		RuntimeHandleID:          rec.Metadata.RuntimeHandleID,
+		AgentSessionID:           rec.Metadata.AgentSessionID,
+		Prompt:                   rec.Metadata.Prompt,
+		PreviewURL:               rec.Metadata.PreviewURL,
+		PreviewRevision:          rec.Metadata.PreviewRevision,
+		RequestedHarness:         requestedHarness,
+		RequestedModel:           requestedModel,
+		RequestedReasoningEffort: requestedEffort,
+		LaunchModel:              launchModel,
+		LaunchReasoningEffort:    launchEffort,
+		LaunchRouteRecorded:      launchRecorded,
+		CreatedAt:                rec.CreatedAt,
+		UpdatedAt:                rec.UpdatedAt,
 	}
 }
 
 func recordToUpdate(rec domain.SessionRecord) gen.UpdateSessionParams {
 	activity := normalActivity(rec.Activity, rec.UpdatedAt)
+	requestedHarness, requestedModel, requestedEffort := requestedRouteColumns(rec.Metadata.RequestedRoute)
+	launchModel, launchEffort, launchRecorded := launchRouteColumns(rec.Metadata.LaunchRoute)
 	return gen.UpdateSessionParams{
-		ID:              rec.ID,
-		IssueID:         rec.IssueID,
-		Kind:            rec.Kind,
-		Harness:         rec.Harness,
-		DisplayName:     rec.DisplayName,
-		ActivityState:   activity.State,
-		ActivityLastAt:  activity.LastActivityAt,
-		FirstSignalAt:   timeToNullTime(rec.FirstSignalAt),
-		IsTerminated:    rec.IsTerminated,
-		Branch:          rec.Metadata.Branch,
-		WorkspacePath:   rec.Metadata.WorkspacePath,
-		RuntimeHandleID: rec.Metadata.RuntimeHandleID,
-		AgentSessionID:  rec.Metadata.AgentSessionID,
-		Prompt:          rec.Metadata.Prompt,
-		PreviewURL:      rec.Metadata.PreviewURL,
-		PreviewRevision: rec.Metadata.PreviewRevision,
-		UpdatedAt:       rec.UpdatedAt,
+		ID:                       rec.ID,
+		IssueID:                  rec.IssueID,
+		Kind:                     rec.Kind,
+		Harness:                  rec.Harness,
+		DisplayName:              rec.DisplayName,
+		ActivityState:            activity.State,
+		ActivityLastAt:           activity.LastActivityAt,
+		FirstSignalAt:            timeToNullTime(rec.FirstSignalAt),
+		IsTerminated:             rec.IsTerminated,
+		Branch:                   rec.Metadata.Branch,
+		WorkspacePath:            rec.Metadata.WorkspacePath,
+		RuntimeHandleID:          rec.Metadata.RuntimeHandleID,
+		AgentSessionID:           rec.Metadata.AgentSessionID,
+		Prompt:                   rec.Metadata.Prompt,
+		PreviewURL:               rec.Metadata.PreviewURL,
+		PreviewRevision:          rec.Metadata.PreviewRevision,
+		RequestedHarness:         requestedHarness,
+		RequestedModel:           requestedModel,
+		RequestedReasoningEffort: requestedEffort,
+		LaunchModel:              launchModel,
+		LaunchReasoningEffort:    launchEffort,
+		LaunchRouteRecorded:      launchRecorded,
+		UpdatedAt:                rec.UpdatedAt,
 	}
+}
+
+func requestedRouteColumns(route *domain.AgentRoute) (harness, model, effort string) {
+	if route == nil {
+		return "", "", ""
+	}
+	return string(route.Harness), route.Model, string(route.ReasoningEffort)
+}
+
+func launchRouteColumns(route *domain.AgentLaunchRoute) (model, effort string, recorded bool) {
+	if route == nil {
+		return "", "", false
+	}
+	return route.Model, string(route.ReasoningEffort), true
 }
 
 // nullTimeToTime / timeToNullTime bridge the nullable first_signal_at column

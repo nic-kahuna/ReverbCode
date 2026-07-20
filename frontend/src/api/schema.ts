@@ -710,11 +710,13 @@ export interface components {
             isTerminated: boolean;
             issueId?: string;
             kind: string;
+            launchRoute?: components["schemas"]["DomainAgentLaunchRoute"];
             /** Format: int64 */
             previewRevision?: number;
             previewUrl?: string;
             projectId: string;
             prs: components["schemas"]["SessionPRFacts"][];
+            requestedRoute?: components["schemas"]["DomainAgentRoute"];
             /** @enum {string} */
             status: "working" | "pr_open" | "draft" | "ci_failed" | "review_pending" | "changes_requested" | "approved" | "mergeable" | "merged" | "needs_input" | "idle" | "terminated" | "no_signal";
             terminalHandleId?: string;
@@ -732,6 +734,16 @@ export interface components {
             /** Format: date-time */
             lastActivityAt: string;
             state: string;
+        };
+        DomainAgentLaunchRoute: {
+            harness: string;
+            model?: string;
+            reasoningEffort?: string;
+        };
+        DomainAgentRoute: {
+            harness: string;
+            model: string;
+            reasoningEffort: string;
         };
         DomainReviewerConfig: {
             harness: string;

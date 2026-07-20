@@ -30,6 +30,11 @@ type SessionMetadata struct {
 	RuntimeHandleID string `json:"runtimeHandleId,omitempty"`
 	AgentSessionID  string `json:"agentSessionId,omitempty"`
 	Prompt          string `json:"prompt,omitempty"`
+	// RequestedRoute is present only when the caller supplied a complete
+	// per-session route. LaunchRoute is the exact provider configuration AO
+	// resolved and must be reused on restore instead of mutable project defaults.
+	RequestedRoute *AgentRoute       `json:"requestedRoute,omitempty"`
+	LaunchRoute    *AgentLaunchRoute `json:"launchRoute,omitempty"`
 	// PreviewURL is the browser preview target the desktop app opens for this
 	// session. Set via `ao preview` (POST /sessions/{id}/preview); persisted so
 	// it survives a daemon restart. Empty means no preview has been requested.

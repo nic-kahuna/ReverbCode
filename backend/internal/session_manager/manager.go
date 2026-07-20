@@ -292,7 +292,17 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: prompt: %w", err)
 	}
 
-	rec, err := m.store.CreateSession(ctx, seedRecord(cfg, m.clock()))
+	seed := seedRecord(cfg, m.clock())
+	if cfg.Route != nil {
+		requested := *cfg.Route
+		seed.Metadata.RequestedRoute = &requested
+	}
+	seed.Metadata.LaunchRoute = &domain.AgentLaunchRoute{
+		Harness:         cfg.Harness,
+		Model:           agentConfig.Model,
+		ReasoningEffort: agentConfig.ReasoningEffort,
+	}
+	rec, err := m.store.CreateSession(ctx, seed)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: create: %w", err)
 	}
@@ -818,9 +828,25 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: system prompt: %w", rec.ID, err)
 	}
-	// Restore re-applies the project's resolved agent config so a configured
-	// model/permissions carry across a restore, matching fresh spawn.
+	// Permissions continue to follow current project policy, but model and
+	// reasoning are launch identity: new sessions persist them and restores
+	// reapply that snapshot instead of mutable project defaults. Legacy rows
+	// without a launch snapshot retain the v0.10.3 behavior.
 	agentConfig := effectiveAgentConfig(rec.Kind, project.Config, nil)
+	if route := rec.Metadata.LaunchRoute; route != nil {
+		if route.Harness != rec.Harness {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: persisted launch harness %q conflicts with session harness %q", rec.ID, route.Harness, rec.Harness)
+		}
+		agentConfig.Model = route.Model
+		agentConfig.ReasoningEffort = route.ReasoningEffort
+	}
+	if validator, ok := agent.(ports.AgentConfigValidator); ok {
+		if err := validator.ValidateAgentConfig(ctx, agentConfig); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: invalid persisted agent route: %w", rec.ID, err)
+		}
+	} else if agentConfig.ReasoningEffort != "" {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: harness %q does not support reasoning-effort routing", rec.ID, rec.Harness)
+	}
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, agentConfig); err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", rec.ID, err)
 	}

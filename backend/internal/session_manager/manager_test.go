@@ -142,6 +142,12 @@ func (l *fakeLCM) MarkSpawned(_ context.Context, id domain.SessionID, metadata d
 	rec := l.store.sessions[id]
 	rec.IsTerminated = false
 	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now()}
+	if metadata.RequestedRoute == nil {
+		metadata.RequestedRoute = rec.Metadata.RequestedRoute
+	}
+	if metadata.LaunchRoute == nil {
+		metadata.LaunchRoute = rec.Metadata.LaunchRoute
+	}
 	rec.Metadata = metadata
 	l.store.sessions[id] = rec
 	return nil
@@ -511,6 +517,12 @@ func TestSpawn_ResolvesProjectConfig(t *testing.T) {
 	if rec.Harness != domain.HarnessCodex {
 		t.Fatalf("harness = %q, want codex from role override", rec.Harness)
 	}
+	if rec.Metadata.RequestedRoute != nil {
+		t.Fatalf("requested route = %#v, want nil for defaulted spawn", rec.Metadata.RequestedRoute)
+	}
+	if rec.Metadata.LaunchRoute == nil || rec.Metadata.LaunchRoute.Harness != domain.HarnessCodex || rec.Metadata.LaunchRoute.Model != "worker-model" {
+		t.Fatalf("launch route = %#v, want resolved codex/worker-model", rec.Metadata.LaunchRoute)
+	}
 	if ws.lastCfg.BaseBranch != "develop" {
 		t.Fatalf("workspace base branch = %q, want develop", ws.lastCfg.BaseBranch)
 	}
@@ -552,6 +564,13 @@ func TestSpawn_RouteOverridesProjectAndRoleConfig(t *testing.T) {
 	}
 	if agent.lastConfig.Model != route.Model || agent.lastConfig.ReasoningEffort != route.ReasoningEffort {
 		t.Fatalf("launch config = %#v, want route %#v", agent.lastConfig, route)
+	}
+	if rec.Metadata.RequestedRoute == nil || *rec.Metadata.RequestedRoute != *route {
+		t.Fatalf("requested route = %#v, want %#v", rec.Metadata.RequestedRoute, route)
+	}
+	wantLaunch := domain.AgentLaunchRoute{Harness: route.Harness, Model: route.Model, ReasoningEffort: route.ReasoningEffort}
+	if rec.Metadata.LaunchRoute == nil || *rec.Metadata.LaunchRoute != wantLaunch {
+		t.Fatalf("launch route = %#v, want %#v", rec.Metadata.LaunchRoute, wantLaunch)
 	}
 }
 
@@ -1373,6 +1392,33 @@ func TestRestore_AppliesProjectAgentConfig(t *testing.T) {
 	}
 	if agent.lastConfig.Model != "restore-model" {
 		t.Fatalf("restore config model = %q, want restore-model (config must carry across restore)", agent.lastConfig.Model)
+	}
+}
+
+func TestRestore_ReappliesPersistedLaunchRoute(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{AgentConfig: domain.AgentConfig{
+		Model: "changed-project-model", ReasoningEffort: domain.ReasoningEffortHigh,
+	}}}
+	seedTerminal(st, "mer-1", domain.SessionMetadata{
+		WorkspacePath:  "/ws/mer-1",
+		Branch:         "b",
+		AgentSessionID: "agent-x",
+		LaunchRoute: &domain.AgentLaunchRoute{
+			Harness: domain.HarnessClaudeCode, Model: "original-model", ReasoningEffort: domain.ReasoningEffortLow,
+		},
+	})
+	rec := st.sessions["mer-1"]
+	rec.Harness = domain.HarnessClaudeCode
+	st.sessions["mer-1"] = rec
+	agent := &recordingAgent{}
+	m := New(Deps{Runtime: &fakeRuntime{}, Agents: singleAgent{agent: agent}, Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: func(string) (string, error) { return "/bin/true", nil }})
+
+	if _, err := m.Restore(ctx, "mer-1"); err != nil {
+		t.Fatal(err)
+	}
+	if agent.lastRestore.Config.Model != "original-model" || agent.lastRestore.Config.ReasoningEffort != domain.ReasoningEffortLow {
+		t.Fatalf("restore config = %#v, want persisted launch route", agent.lastRestore.Config)
 	}
 }
 

@@ -13,6 +13,16 @@ type AgentRoute struct {
 	ReasoningEffort ReasoningEffort `json:"reasoningEffort"`
 }
 
+// AgentLaunchRoute records the provider arguments AO resolved for a launch.
+// Empty model or reasoning fields mean AO intentionally left that choice to
+// the provider default; unlike AgentRoute, this is an observation rather than
+// a complete explicit request.
+type AgentLaunchRoute struct {
+	Harness         AgentHarness    `json:"harness"`
+	Model           string          `json:"model,omitempty"`
+	ReasoningEffort ReasoningEffort `json:"reasoningEffort,omitempty"`
+}
+
 // Validate requires the complete route contract used by explicit spawn and
 // native tracker intake.
 func (r AgentRoute) Validate() error {

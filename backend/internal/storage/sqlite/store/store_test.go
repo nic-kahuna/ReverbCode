@@ -34,12 +34,14 @@ func seedProject(t *testing.T, s *sqlite.Store, id string) {
 
 func sampleRecord(project string) domain.SessionRecord {
 	now := time.Now().UTC().Truncate(time.Second)
+	requested := &domain.AgentRoute{Harness: domain.HarnessClaudeCode, Model: "claude-fable-5", ReasoningEffort: domain.ReasoningEffortMedium}
+	launch := &domain.AgentLaunchRoute{Harness: domain.HarnessClaudeCode, Model: "claude-fable-5", ReasoningEffort: domain.ReasoningEffortMedium}
 	return domain.SessionRecord{
 		ProjectID: domain.ProjectID(project),
 		Kind:      domain.KindWorker,
 		Harness:   domain.HarnessClaudeCode,
 		Activity:  domain.Activity{State: domain.ActivityActive, LastActivityAt: now},
-		Metadata:  domain.SessionMetadata{Branch: "feat/x", WorkspacePath: "/ws"},
+		Metadata:  domain.SessionMetadata{Branch: "feat/x", WorkspacePath: "/ws", RequestedRoute: requested, LaunchRoute: launch},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -140,6 +142,9 @@ func TestSessionCreateAssignsPerProjectID(t *testing.T) {
 	if got.Activity.State != domain.ActivityActive || got.IsTerminated ||
 		got.Harness != domain.HarnessClaudeCode || got.Metadata.Branch != "feat/x" {
 		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	if !reflect.DeepEqual(got.Metadata.RequestedRoute, r1.Metadata.RequestedRoute) || !reflect.DeepEqual(got.Metadata.LaunchRoute, r1.Metadata.LaunchRoute) {
+		t.Fatalf("route metadata = requested:%#v launch:%#v, want requested:%#v launch:%#v", got.Metadata.RequestedRoute, got.Metadata.LaunchRoute, r1.Metadata.RequestedRoute, r1.Metadata.LaunchRoute)
 	}
 	if list, _ := s.ListSessions(ctx, "mer"); len(list) != 2 {
 		t.Fatalf("list mer = %d, want 2", len(list))

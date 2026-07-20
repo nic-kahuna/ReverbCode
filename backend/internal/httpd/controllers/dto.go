@@ -126,7 +126,9 @@ type CleanupSessionsQuery struct {
 // fields are json:"-"; these curated fields are what serialize.
 type SessionView struct {
 	domain.Session
-	Branch string `json:"branch,omitempty"`
+	Branch         string                   `json:"branch,omitempty"`
+	RequestedRoute *domain.AgentRoute       `json:"requestedRoute,omitempty"`
+	LaunchRoute    *domain.AgentLaunchRoute `json:"launchRoute,omitempty"`
 	// PreviewURL is the browser preview target the desktop app opens for this
 	// session, set via POST /sessions/{sessionId}/preview. Empty (omitted) when
 	// no preview has been requested. Pulled from the json:"-" domain Metadata.
