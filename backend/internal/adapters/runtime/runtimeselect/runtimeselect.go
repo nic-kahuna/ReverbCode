@@ -29,10 +29,12 @@ var _ Runtime = (*tmux.Runtime)(nil)
 var _ Runtime = (*conpty.Runtime)(nil)
 
 // New returns the per-platform runtime: tmux on Darwin/Linux, conpty on Windows.
+// commandDir is the stable neutral cwd used by tmux client commands; each pane
+// still starts in its session workspace via tmux new-session -c.
 // log is accepted for signature stability with callers but is currently unused.
-func New(_ *slog.Logger) Runtime {
+func New(_ *slog.Logger, commandDir string) Runtime {
 	if runtime.GOOS != "windows" {
-		return tmux.New(tmux.Options{})
+		return tmux.New(tmux.Options{CommandDir: commandDir})
 	}
 	return conpty.New(conpty.Options{})
 }

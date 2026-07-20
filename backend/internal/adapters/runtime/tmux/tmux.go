@@ -38,6 +38,7 @@ var getenv = os.Getenv
 type Options struct {
 	Binary     string        // default "tmux" (resolved via exec.LookPath)
 	Shell      string        // default $SHELL else /bin/sh
+	CommandDir string        // cwd for tmux client processes; default system temp dir
 	Timeout    time.Duration // default 5s
 	ChunkSize  int           // default 16*1024
 	EnterDelay time.Duration // pause after pasting a non-empty message before pressing Enter; default defaultEnterDelay. Conpty already does this (ptyInputEnterDelay); tmux lacked it, so a large multiline paste could absorb the trailing Enter and leave the prompt unsubmitted (issue #2342).
@@ -61,10 +62,13 @@ type runner interface {
 	Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error)
 }
 
-type execRunner struct{}
+type execRunner struct {
+	dir string
+}
 
-func (execRunner) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+func (r execRunner) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = r.dir
 	cmd.Env = append(append([]string(nil), os.Environ()...), env...)
 	return cmd.CombinedOutput()
 }
@@ -100,13 +104,17 @@ func New(opts Options) *Runtime {
 	if enterDelay <= 0 {
 		enterDelay = defaultEnterDelay
 	}
+	commandDir := opts.CommandDir
+	if commandDir == "" {
+		commandDir = os.TempDir()
+	}
 	return &Runtime{
 		binary:     binary,
 		shell:      shellPath,
 		timeout:    timeout,
 		chunkSize:  chunkSize,
 		enterDelay: enterDelay,
-		runner:     execRunner{},
+		runner:     execRunner{dir: commandDir},
 	}
 }
 

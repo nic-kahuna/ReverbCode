@@ -3,7 +3,9 @@ package tmux
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -68,6 +70,48 @@ func TestNewPicksUpShellFromEnv(t *testing.T) {
 	}
 }
 
+func TestExecRunnerStartsCommandInConfiguredDirectory(t *testing.T) {
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+
+	out, err := (execRunner{dir: dir}).Run(
+		context.Background(),
+		[]string{"AO_TMUX_CWD_TEST=1"},
+		executable,
+		"-test.run=^TestExecRunnerCWDHelper$",
+	)
+	if err != nil {
+		t.Fatalf("run cwd helper: %v\n%s", err, out)
+	}
+
+	got, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("resolve reported cwd: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve configured cwd: %v", err)
+	}
+	if got != want {
+		t.Fatalf("spawned command cwd = %q, want %q", got, want)
+	}
+}
+
+func TestExecRunnerCWDHelper(t *testing.T) {
+	if os.Getenv("AO_TMUX_CWD_TEST") != "1" {
+		return
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		os.Exit(2)
+	}
+	_, _ = os.Stdout.WriteString(cwd)
+	os.Exit(0)
+}
+
 // -- command builder tests --
 
 func TestCommandBuilders(t *testing.T) {
@@ -101,6 +145,17 @@ func TestCommandBuilders(t *testing.T) {
 	if got, want := capturePaneArgs("sess-1", 10), []string{"capture-pane", "-t", "sess-1", "-p", "-S", "-10"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("capturePaneArgs = %#v, want %#v", got, want)
 	}
+}
+
+func TestNewSessionKeepsPaneCWDInWorkspace(t *testing.T) {
+	args := newSessionArgs("sess-1", "/workspace/project", "/bin/sh", "agent")
+	want := []string{"-c", "/workspace/project"}
+	for i := 0; i+1 < len(args); i++ {
+		if reflect.DeepEqual(args[i:i+2], want) {
+			return
+		}
+	}
+	t.Fatalf("new-session args = %#v, want pane cwd %v", args, want)
 }
 
 // -- session name sanitization --
