@@ -664,6 +664,7 @@ export interface components {
         AgentConfig: {
             model?: string;
             permissions?: string;
+            reasoningEffort?: string;
         };
         AgentInfo: {
             /**
@@ -1086,8 +1087,11 @@ export interface components {
             issueId?: string;
             /** @enum {string} */
             kind?: "worker" | "orchestrator";
+            model?: string;
             projectId: string;
             prompt?: string;
+            /** @enum {string} */
+            reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
         };
         SubmitReviewInput: {
             /** @description Review body recorded by AO. Required for changes_requested. */

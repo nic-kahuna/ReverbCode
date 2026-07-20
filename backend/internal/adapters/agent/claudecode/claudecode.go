@@ -33,6 +33,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/binaryutil"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -77,6 +78,7 @@ func (p *Plugin) EmitsBlockedActivity() bool { return true }
 var _ adapters.Adapter = (*Plugin)(nil)
 var _ ports.Agent = (*Plugin)(nil)
 var _ ports.AgentAuthChecker = (*Plugin)(nil)
+var _ ports.AgentConfigValidator = (*Plugin)(nil)
 
 // Manifest returns the adapter's static self-description.
 func (p *Plugin) Manifest() adapters.Manifest {
@@ -101,6 +103,14 @@ var permissionConfigEnum = []string{
 	string(ports.PermissionModeBypassPermissions),
 }
 
+var reasoningEffortConfigEnum = []string{
+	string(domain.ReasoningEffortLow),
+	string(domain.ReasoningEffortMedium),
+	string(domain.ReasoningEffortHigh),
+	string(domain.ReasoningEffortXHigh),
+	string(domain.ReasoningEffortMax),
+}
+
 // GetConfigSpec reports the per-project agent config keys Claude Code
 // understands: a model override and a starting permission mode.
 func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
@@ -115,6 +125,12 @@ func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
 				Description: "Model override passed to `claude --model` (e.g. claude-opus-4-5).",
 			},
 			{
+				Key:         "reasoningEffort",
+				Type:        ports.ConfigFieldEnum,
+				Description: "Per-session effort passed to `claude --effort`.",
+				Enum:        reasoningEffortConfigEnum,
+			},
+			{
 				Key:         "permissions",
 				Type:        ports.ConfigFieldEnum,
 				Description: "Starting permission mode.",
@@ -122,6 +138,23 @@ func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
 			},
 		},
 	}, nil
+}
+
+// ValidateAgentConfig rejects values Claude Code cannot accept before AO
+// creates a session row or worktree.
+func (p *Plugin) ValidateAgentConfig(ctx context.Context, cfg ports.AgentConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("claude-code: %w", err)
+	}
+	switch cfg.ReasoningEffort {
+	case "", domain.ReasoningEffortLow, domain.ReasoningEffortMedium, domain.ReasoningEffortHigh, domain.ReasoningEffortXHigh, domain.ReasoningEffortMax:
+		return nil
+	default:
+		return fmt.Errorf("claude-code: reasoning effort %q is unsupported: want one of low, medium, high, xhigh, max", cfg.ReasoningEffort)
+	}
 }
 
 // GetLaunchCommand builds the argv to start an interactive Claude Code
@@ -146,8 +179,8 @@ func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
 func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (cmd []string, err error) {
 	// Defense-in-depth: the project service validates on write, but re-check
 	// here so a config written by any other path can't launch a bad command.
-	if err := cfg.Config.Validate(); err != nil {
-		return nil, fmt.Errorf("claude-code: %w", err)
+	if err := p.ValidateAgentConfig(ctx, cfg.Config); err != nil {
+		return nil, err
 	}
 
 	binary, err := p.claudeBinary(ctx)
@@ -171,6 +204,9 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 
 	if model := strings.TrimSpace(cfg.Config.Model); model != "" {
 		cmd = append(cmd, "--model", model)
+	}
+	if cfg.Config.ReasoningEffort != "" {
+		cmd = append(cmd, "--effort", string(cfg.Config.ReasoningEffort))
 	}
 
 	systemPrompt, err := resolveSystemPrompt(cfg)
@@ -243,9 +279,18 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	if err != nil {
 		return nil, false, err
 	}
-	cmd = make([]string, 0, 7)
+	if err := p.ValidateAgentConfig(ctx, cfg.Config); err != nil {
+		return nil, false, err
+	}
+	cmd = make([]string, 0, 11)
 	cmd = append(cmd, binary)
 	appendPermissionFlags(&cmd, cfg.Permissions)
+	if model := strings.TrimSpace(cfg.Config.Model); model != "" {
+		cmd = append(cmd, "--model", model)
+	}
+	if cfg.Config.ReasoningEffort != "" {
+		cmd = append(cmd, "--effort", string(cfg.Config.ReasoningEffort))
+	}
 	if cfg.SystemPrompt != "" {
 		// --resume rebuilds the system prompt from the current flags (it is
 		// not stored in the transcript), so standing instructions must be

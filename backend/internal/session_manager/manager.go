@@ -244,6 +244,15 @@ func New(d Deps) *Manager {
 // materialization fails the still-seed row is deleted outright; a later failure
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error) {
+	if cfg.Route != nil {
+		if err := cfg.Route.Validate(); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: invalid route: %w", err)
+		}
+		if cfg.Harness != "" && cfg.Harness != cfg.Route.Harness {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: harness %q conflicts with route harness %q", cfg.Harness, cfg.Route.Harness)
+		}
+		cfg.Harness = cfg.Route.Harness
+	}
 	project, err := m.loadProject(ctx, cfg.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
@@ -258,8 +267,20 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// Reject an unknown harness before any durable state is created. Doing this
 	// after CreateSession would leave a terminated orphan row and waste a
 	// worktree on a spawn that can never launch.
-	if _, ok := m.agents.Agent(cfg.Harness); !ok {
+	agent, ok := m.agents.Agent(cfg.Harness)
+	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %q", ErrUnknownHarness, cfg.Harness)
+	}
+	agentConfig := effectiveAgentConfig(cfg.Kind, project.Config, cfg.Route)
+	if err := agentConfig.Validate(); err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: invalid agent config: %w", err)
+	}
+	if validator, ok := agent.(ports.AgentConfigValidator); ok {
+		if err := validator.ValidateAgentConfig(ctx, agentConfig); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: invalid route for %s: %w", cfg.Harness, err)
+		}
+	} else if agentConfig.ReasoningEffort != "" {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: harness %q does not support reasoning-effort routing", cfg.Harness)
 	}
 
 	if err := m.validateRuntimePrerequisites(); err != nil {
@@ -298,13 +319,6 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: provision: %w", id, err)
 	}
 
-	agent, ok := m.agents.Agent(cfg.Harness)
-	if !ok {
-		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: no agent adapter for harness %q", id, cfg.Harness)
-	}
-	agentConfig := effectiveAgentConfig(cfg.Kind, project.Config)
 	if err := m.prepareWorkspace(ctx, agent, id, ws.Path, systemPrompt, agentConfig); err != nil {
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
 		m.rollbackSpawnSeedRow(ctx, id)
@@ -482,7 +496,7 @@ func roleConfigName(kind domain.SessionKind) string {
 
 // effectiveAgentConfig merges the role override's agent config over the
 // project's base agent config; set override fields win.
-func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig) ports.AgentConfig {
+func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig, route *domain.AgentRoute) ports.AgentConfig {
 	merged := cfg.AgentConfig
 	override := roleOverride(kind, cfg).AgentConfig
 	if override.Model != "" {
@@ -490,6 +504,13 @@ func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig) por
 	}
 	if override.Permissions != "" {
 		merged.Permissions = override.Permissions
+	}
+	if override.ReasoningEffort != "" {
+		merged.ReasoningEffort = override.ReasoningEffort
+	}
+	if route != nil {
+		merged.Model = route.Model
+		merged.ReasoningEffort = route.ReasoningEffort
 	}
 	return merged
 }
@@ -799,7 +820,7 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	}
 	// Restore re-applies the project's resolved agent config so a configured
 	// model/permissions carry across a restore, matching fresh spawn.
-	agentConfig := effectiveAgentConfig(rec.Kind, project.Config)
+	agentConfig := effectiveAgentConfig(rec.Kind, project.Config, nil)
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, agentConfig); err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", rec.ID, err)
 	}

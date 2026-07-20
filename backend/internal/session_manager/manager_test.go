@@ -227,6 +227,9 @@ func (fakeAgent) GetRestoreCommand(_ context.Context, cfg ports.RestoreConfig) (
 func (fakeAgent) SessionInfo(context.Context, ports.SessionRef) (ports.SessionInfo, bool, error) {
 	return ports.SessionInfo{}, false, nil
 }
+func (fakeAgent) ValidateAgentConfig(_ context.Context, cfg ports.AgentConfig) error {
+	return cfg.Validate()
+}
 
 // fakeAgents resolves every harness to the same fakeAgent.
 type fakeAgents struct{}
@@ -527,6 +530,40 @@ func TestSpawn_ResolvesProjectConfig(t *testing.T) {
 	}
 	if !agent.lastConfig.IsZero() {
 		t.Fatalf("launch config = %#v, want zero for project without config", agent.lastConfig)
+	}
+}
+
+func TestSpawn_RouteOverridesProjectAndRoleConfig(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{
+		AgentConfig: domain.AgentConfig{Model: "base-model", ReasoningEffort: domain.ReasoningEffortHigh},
+		Worker:      domain.RoleOverride{Harness: domain.HarnessCodex, AgentConfig: domain.AgentConfig{Model: "worker-model"}},
+	}}
+	agent := &recordingAgent{}
+	m := New(Deps{Runtime: &fakeRuntime{}, Agents: singleAgent{agent: agent}, Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: func(string) (string, error) { return "/bin/true", nil }})
+	route := &domain.AgentRoute{Harness: domain.HarnessClaudeCode, Model: "claude-fable-5", ReasoningEffort: domain.ReasoningEffortMedium}
+
+	rec, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Route: route})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Harness != domain.HarnessClaudeCode {
+		t.Fatalf("harness = %q, want routed claude-code", rec.Harness)
+	}
+	if agent.lastConfig.Model != route.Model || agent.lastConfig.ReasoningEffort != route.ReasoningEffort {
+		t.Fatalf("launch config = %#v, want route %#v", agent.lastConfig, route)
+	}
+}
+
+func TestSpawn_RejectsInvalidRouteBeforeDurableState(t *testing.T) {
+	m, st, rt, ws := newManager()
+	route := &domain.AgentRoute{Harness: domain.HarnessClaudeCode, Model: "claude-fable-5"}
+	_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Route: route})
+	if err == nil || !strings.Contains(err.Error(), "route reasoning effort is required") {
+		t.Fatalf("err = %v, want incomplete route error", err)
+	}
+	if len(st.sessions) != 0 || rt.created != 0 || ws.lastCfg.SessionID != "" {
+		t.Fatalf("invalid route created state: sessions=%d runtime=%d workspace=%q", len(st.sessions), rt.created, ws.lastCfg.SessionID)
 	}
 }
 

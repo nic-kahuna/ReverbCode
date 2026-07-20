@@ -29,6 +29,7 @@ type fakeSessionService struct {
 	cleanupResult   []domain.SessionID
 	cleanupSkipped  []sessionsvc.CleanupSkipped
 	spawnErr        error
+	lastSpawn       ports.SpawnConfig
 	claimErr        error
 	listPRErr       error
 }
@@ -57,6 +58,7 @@ func (f *fakeSessionService) List(_ context.Context, filter sessionsvc.ListFilte
 }
 
 func (f *fakeSessionService) Spawn(_ context.Context, cfg ports.SpawnConfig) (domain.Session, error) {
+	f.lastSpawn = cfg
 	if f.spawnErr != nil {
 		return domain.Session{}, f.spawnErr
 	}
@@ -64,6 +66,35 @@ func (f *fakeSessionService) Spawn(_ context.Context, cfg ports.SpawnConfig) (do
 	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle}
 	f.sessions[s.ID] = s
 	return s, nil
+}
+
+func TestSessionsAPI_SpawnMapsCompleteRoute(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions", `{"projectId":"ao","harness":"claude-code","model":"claude-fable-5","reasoningEffort":"medium"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("spawn = %d body=%s", status, body)
+	}
+	if svc.lastSpawn.Route == nil || svc.lastSpawn.Route.Harness != domain.HarnessClaudeCode || svc.lastSpawn.Route.Model != "claude-fable-5" || svc.lastSpawn.Route.ReasoningEffort != domain.ReasoningEffortMedium {
+		t.Fatalf("spawn route = %#v", svc.lastSpawn.Route)
+	}
+}
+
+func TestSessionsAPI_SpawnRejectsPartialOrInvalidRoute(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing effort": `{"projectId":"ao","harness":"codex","model":"gpt-5.6-terra"}`,
+		"unknown effort": `{"projectId":"ao","harness":"codex","model":"gpt-5.6-terra","reasoningEffort":"enormous"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := newFakeSessionService()
+			srv := newSessionTestServer(t, svc)
+			response, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions", body)
+			assertErrorCode(t, response, status, http.StatusBadRequest, "INVALID_AGENT_ROUTE")
+			if svc.lastSpawn.ProjectID != "" {
+				t.Fatalf("service called with %#v", svc.lastSpawn)
+			}
+		})
+	}
 }
 
 func (f *fakeSessionService) SpawnOrchestrator(ctx context.Context, projectID domain.ProjectID, clean bool) (domain.Session, error) {

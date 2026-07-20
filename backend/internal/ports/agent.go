@@ -65,6 +65,13 @@ type AgentAuthChecker interface {
 	AuthStatus(ctx context.Context) (AgentAuthStatus, error)
 }
 
+// AgentConfigValidator is the optional pre-spawn validation capability for
+// adapters with provider-specific model or reasoning-effort rules. Session
+// Manager invokes it before creating durable session state or a workspace.
+type AgentConfigValidator interface {
+	ValidateAgentConfig(ctx context.Context, cfg AgentConfig) error
+}
+
 // AgentBinaryResolver is the optional capability adapters expose when their
 // binary can be checked without constructing a real session launch command.
 type AgentBinaryResolver interface {

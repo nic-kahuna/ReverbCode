@@ -14,12 +14,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -50,6 +52,7 @@ func (p *Plugin) EmitsBlockedActivity() bool { return false }
 var _ adapters.Adapter = (*Plugin)(nil)
 var _ ports.Agent = (*Plugin)(nil)
 var _ ports.AgentAuthChecker = (*Plugin)(nil)
+var _ ports.AgentConfigValidator = (*Plugin)(nil)
 
 // Manifest returns the adapter's static self-description.
 func (p *Plugin) Manifest() adapters.Manifest {
@@ -64,12 +67,49 @@ func (p *Plugin) Manifest() adapters.Manifest {
 	}
 }
 
+var codexReasoningEffortConfigEnum = []string{
+	string(domain.ReasoningEffortLow),
+	string(domain.ReasoningEffortMedium),
+	string(domain.ReasoningEffortHigh),
+	string(domain.ReasoningEffortXHigh),
+	string(domain.ReasoningEffortMax),
+	string(domain.ReasoningEffortUltra),
+}
+
+// GetConfigSpec reports the per-project defaults Codex also accepts as
+// per-session route overrides.
+func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
+	if err := ctx.Err(); err != nil {
+		return ports.ConfigSpec{}, err
+	}
+	return ports.ConfigSpec{Fields: []ports.ConfigField{
+		{Key: "model", Type: ports.ConfigFieldString, Description: "Model override passed to `codex --model`."},
+		{Key: "reasoningEffort", Type: ports.ConfigFieldEnum, Description: "Per-session reasoning passed through `model_reasoning_effort`.", Enum: codexReasoningEffortConfigEnum},
+	}}, nil
+}
+
+// ValidateAgentConfig rejects malformed route values before AO creates durable
+// session state. Model-specific availability remains a provider capability
+// fact and is verified by the routing canary rather than a stale AO catalog.
+func (p *Plugin) ValidateAgentConfig(ctx context.Context, cfg ports.AgentConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("codex: %w", err)
+	}
+	return nil
+}
+
 // GetLaunchCommand builds the argv to start a new Codex session, applying the
 // no-update-check, hook-trust bypass, and approval flags, AO's session-flag
 // activity hooks, the workspace trust override, optional system-prompt
 // instructions, and the initial prompt (passed after `--` so a leading "-" is
 // not read as a flag).
 func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (cmd []string, err error) {
+	if err := p.ValidateAgentConfig(ctx, cfg.Config); err != nil {
+		return nil, err
+	}
 	binary, err := p.codexBinary(ctx)
 	if err != nil {
 		return nil, err
@@ -83,6 +123,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
 	appendWorkspaceTrustFlag(&cmd, cfg.WorkspacePath)
+	appendModelAndReasoningFlags(&cmd, cfg.Config)
 
 	if cfg.SystemPromptFile != "" {
 		cmd = append(cmd, "-c", "model_instructions_file="+cfg.SystemPromptFile)
@@ -109,6 +150,9 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	if agentSessionID == "" {
 		return nil, false, nil
 	}
+	if err := p.ValidateAgentConfig(ctx, cfg.Config); err != nil {
+		return nil, false, err
+	}
 
 	binary, err := p.codexBinary(ctx)
 	if err != nil {
@@ -124,8 +168,18 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
 	appendWorkspaceTrustFlag(&cmd, cfg.Session.WorkspacePath)
+	appendModelAndReasoningFlags(&cmd, cfg.Config)
 	cmd = append(cmd, agentSessionID)
 	return cmd, true, nil
+}
+
+func appendModelAndReasoningFlags(cmd *[]string, cfg ports.AgentConfig) {
+	if model := strings.TrimSpace(cfg.Model); model != "" {
+		*cmd = append(*cmd, "--model", model)
+	}
+	if cfg.ReasoningEffort != "" {
+		*cmd = append(*cmd, "-c", "model_reasoning_effort="+strconv.Quote(string(cfg.ReasoningEffort)))
+	}
 }
 
 // SessionInfo surfaces Codex hook-derived metadata. Metadata is intentionally

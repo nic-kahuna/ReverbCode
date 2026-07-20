@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hooksjson"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -392,6 +393,7 @@ func TestGetRestoreCommandReappendsSystemPrompt(t *testing.T) {
 	// (e.g. the orchestrator role) must be re-appended on restore.
 	cmd, ok, err := (&Plugin{resolvedBinary: "claude"}).GetRestoreCommand(context.Background(), ports.RestoreConfig{
 		Permissions:  ports.PermissionModeBypassPermissions,
+		Config:       ports.AgentConfig{Model: "claude-fable-5", ReasoningEffort: domain.ReasoningEffortMedium},
 		SystemPrompt: "You are an orchestrator.",
 		Session: ports.SessionRef{
 			ID:       "sess-r",
@@ -401,7 +403,7 @@ func TestGetRestoreCommandReappendsSystemPrompt(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("restore = (ok=%v, err=%v), want ok", ok, err)
 	}
-	want := []string{"claude", "--permission-mode", "bypassPermissions", "--append-system-prompt", "You are an orchestrator.", "--resume", "claude-native-1"}
+	want := []string{"claude", "--permission-mode", "bypassPermissions", "--model", "claude-fable-5", "--effort", "medium", "--append-system-prompt", "You are an orchestrator.", "--resume", "claude-native-1"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("restore cmd\nwant: %#v\n got: %#v", want, cmd)
 	}
@@ -447,8 +449,9 @@ func TestGetLaunchCommandAppliesAgentConfig(t *testing.T) {
 	p := &Plugin{resolvedBinary: "claude"}
 	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{
 		Config: ports.AgentConfig{
-			Model:       "claude-opus-4-5",
-			Permissions: ports.PermissionModeAcceptEdits,
+			Model:           "claude-opus-4-5",
+			ReasoningEffort: domain.ReasoningEffortXHigh,
+			Permissions:     ports.PermissionModeAcceptEdits,
 		},
 	})
 	if err != nil {
@@ -457,8 +460,18 @@ func TestGetLaunchCommandAppliesAgentConfig(t *testing.T) {
 	if !containsSubsequence(cmd, []string{"--model", "claude-opus-4-5"}) {
 		t.Fatalf("command %#v missing --model flag", cmd)
 	}
+	if !containsSubsequence(cmd, []string{"--effort", "xhigh"}) {
+		t.Fatalf("command %#v missing --effort flag", cmd)
+	}
 	if !containsSubsequence(cmd, []string{"--permission-mode", "acceptEdits"}) {
 		t.Fatalf("command %#v missing config-driven permission mode", cmd)
+	}
+}
+
+func TestValidateAgentConfigRejectsClaudeUltra(t *testing.T) {
+	p := &Plugin{resolvedBinary: "claude"}
+	if err := p.ValidateAgentConfig(context.Background(), ports.AgentConfig{ReasoningEffort: domain.ReasoningEffortUltra}); err == nil {
+		t.Fatal("expected Claude Code to reject ultra")
 	}
 }
 

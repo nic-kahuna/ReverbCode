@@ -24,26 +24,30 @@ import (
 const maxDisplayNameLen = 20
 
 type spawnOptions struct {
-	project        string
-	harness        string
-	branch         string
-	prompt         string
-	issue          string
-	name           string
-	claimPR        string
-	noTakeover     bool
-	skipAgentCheck bool
+	project         string
+	harness         string
+	model           string
+	reasoningEffort string
+	branch          string
+	prompt          string
+	issue           string
+	name            string
+	claimPR         string
+	noTakeover      bool
+	skipAgentCheck  bool
 }
 
 // spawnRequest mirrors the daemon's SpawnSessionRequest body for
 // POST /api/v1/sessions. The CLI keeps its own copy so it need not import httpd.
 type spawnRequest struct {
-	ProjectID   string `json:"projectId"`
-	IssueID     string `json:"issueId,omitempty"`
-	Harness     string `json:"harness,omitempty"`
-	Branch      string `json:"branch,omitempty"`
-	Prompt      string `json:"prompt,omitempty"`
-	DisplayName string `json:"displayName,omitempty"`
+	ProjectID       string `json:"projectId"`
+	IssueID         string `json:"issueId,omitempty"`
+	Harness         string `json:"harness,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	Branch          string `json:"branch,omitempty"`
+	Prompt          string `json:"prompt,omitempty"`
+	DisplayName     string `json:"displayName,omitempty"`
 }
 
 type spawnResult struct {
@@ -75,6 +79,11 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			if explicitName := strings.TrimSpace(opts.name); utf8.RuneCountInString(explicitName) > maxDisplayNameLen {
 				return usageError{fmt.Errorf("--name must be %d characters or fewer", maxDisplayNameLen)}
 			}
+			opts.model = strings.TrimSpace(opts.model)
+			opts.reasoningEffort = strings.TrimSpace(opts.reasoningEffort)
+			if (opts.model == "") != (opts.reasoningEffort == "") {
+				return usageError{fmt.Errorf("--model and --reasoning-effort must be provided together")}
+			}
 
 			project, err := ctx.resolveSpawnProject(cmd.Context(), opts.project)
 			if err != nil {
@@ -102,12 +111,14 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				}
 			}
 			req := spawnRequest{
-				ProjectID:   opts.project,
-				IssueID:     opts.issue,
-				Harness:     opts.harness,
-				Branch:      opts.branch,
-				Prompt:      opts.prompt,
-				DisplayName: name,
+				ProjectID:       opts.project,
+				IssueID:         opts.issue,
+				Harness:         opts.harness,
+				Model:           opts.model,
+				ReasoningEffort: opts.reasoningEffort,
+				Branch:          opts.branch,
+				Prompt:          opts.prompt,
+				DisplayName:     name,
 			}
 			var res spawnResult
 			if err := ctx.postJSON(cmd.Context(), "sessions", req, &res); err != nil {
@@ -158,6 +169,8 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 	})
 	f.StringVar(&opts.project, "project", "", "Project id to spawn the session in (default: AO_PROJECT_ID or current registered repo)")
 	f.StringVar(&opts.harness, "harness", "", "Agent harness / --agent: claude-code, codex, aider, opencode, grok, droid, amp, agy, crush, cursor, qwen, copilot, goose, auggie, continue, devin, cline, kimi, kiro, kilocode, vibe, pi, autohand (default: project worker.agent; required if the project has none)")
+	f.StringVar(&opts.model, "model", "", "Per-session model override (requires --reasoning-effort)")
+	f.StringVar(&opts.reasoningEffort, "reasoning-effort", "", "Per-session reasoning effort (requires --model)")
 	f.StringVar(&opts.branch, "branch", "", "Branch for the session worktree (default: ao/<session-id>/root)")
 	f.StringVar(&opts.prompt, "prompt", "", "Initial prompt for the agent")
 	f.StringVar(&opts.issue, "issue", "", "Issue id to associate with the session")

@@ -214,6 +214,8 @@ func TestE2E_SpawnAndProjectAddDTORoundTrip(t *testing.T) {
 			"spawn",
 			"--project", "mer",
 			"--harness", "codex",
+			"--model", "gpt-5.6-terra",
+			"--reasoning-effort", "medium",
 			"--branch", "feat/x",
 			"--prompt", "hi",
 			"--issue", "ISS-1",
@@ -229,6 +231,9 @@ func TestE2E_SpawnAndProjectAddDTORoundTrip(t *testing.T) {
 		}
 		if got.Harness != "codex" {
 			t.Errorf("Harness = %q, want %q", got.Harness, "codex")
+		}
+		if got.Route == nil || got.Route.Model != "gpt-5.6-terra" || got.Route.ReasoningEffort != domain.ReasoningEffortMedium {
+			t.Errorf("Route = %#v, want per-session model/reasoning round trip", got.Route)
 		}
 		if got.Branch != "feat/x" {
 			t.Errorf("Branch = %q, want %q", got.Branch, "feat/x")

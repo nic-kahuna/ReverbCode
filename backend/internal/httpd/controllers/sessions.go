@@ -134,7 +134,16 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 	if in.Kind == "" {
 		in.Kind = domain.KindWorker
 	}
-	sess, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, Prompt: in.Prompt, DisplayName: displayName})
+	var route *domain.AgentRoute
+	if in.Model != "" || in.ReasoningEffort != "" {
+		candidate := domain.AgentRoute{Harness: in.Harness, Model: in.Model, ReasoningEffort: in.ReasoningEffort}
+		if err := candidate.Validate(); err != nil {
+			envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_AGENT_ROUTE", err.Error(), nil)
+			return
+		}
+		route = &candidate
+	}
+	sess, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, Kind: in.Kind, Harness: in.Harness, Route: route, Branch: in.Branch, Prompt: in.Prompt, DisplayName: displayName})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return

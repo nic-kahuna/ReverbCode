@@ -1750,6 +1750,8 @@ components:
           type: string
         permissions:
           type: string
+        reasoningEffort:
+          type: string
       type: object
     AgentInfo:
       properties:
@@ -2880,10 +2882,21 @@ components:
           - worker
           - orchestrator
           type: string
+        model:
+          type: string
         projectId:
           type: string
         prompt:
           maxLength: 4096
+          type: string
+        reasoningEffort:
+          enum:
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          - ultra
           type: string
       required:
       - projectId

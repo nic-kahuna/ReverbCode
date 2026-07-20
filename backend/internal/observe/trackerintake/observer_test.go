@@ -45,6 +45,9 @@ func TestPollSpawnsWorkerForEligibleIssue(t *testing.T) {
 	if call.ProjectID != "demo" || call.Kind != domain.KindWorker {
 		t.Fatalf("spawn config = %+v", call)
 	}
+	if call.Route != nil {
+		t.Fatalf("unrouted issue unexpectedly produced route: %#v", call.Route)
+	}
 	if call.IssueID != "github:acme/demo#12" {
 		t.Fatalf("IssueID = %q, want canonical github id", call.IssueID)
 	}
@@ -56,6 +59,63 @@ func TestPollSpawnsWorkerForEligibleIssue(t *testing.T) {
 	}
 	if got := tracker.filters[0]; got.State != domain.ListOpen || got.Assignee != "alice" || len(got.Labels) != 0 {
 		t.Fatalf("tracker filter = %+v", got)
+	}
+}
+
+func TestPollPassesCanonicalDispatchRoute(t *testing.T) {
+	store := &fakeStore{projects: []domain.ProjectRecord{{
+		ID: "demo", RepoOriginURL: "https://github.com/acme/demo.git",
+		Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{Enabled: true, Assignee: "alice"}},
+	}}}
+	tracker := &fakeTracker{issues: []domain.Issue{{
+		ID:    domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12"},
+		Title: "Fix login", State: domain.IssueOpen, Assignees: []string{"alice"},
+		Body: "Dispatch route\n- harness: claude-code\n- model: claude-fable-5\n- reasoning-effort: medium\n- fallback: none\n\nImplement it.",
+	}}}
+	spawner := &fakeSpawner{}
+
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 1 || spawner.calls[0].Route == nil {
+		t.Fatalf("spawn calls = %#v, want one routed spawn", spawner.calls)
+	}
+	route := spawner.calls[0].Route
+	if route.Harness != domain.HarnessClaudeCode || route.Model != "claude-fable-5" || route.ReasoningEffort != domain.ReasoningEffortMedium {
+		t.Fatalf("route = %#v", route)
+	}
+}
+
+func TestPollRejectsMalformedDispatchRouteWithoutSpawning(t *testing.T) {
+	store := &fakeStore{projects: []domain.ProjectRecord{{
+		ID: "demo", RepoOriginURL: "https://github.com/acme/demo.git",
+		Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{Enabled: true, Assignee: "alice"}},
+	}}}
+	tracker := &fakeTracker{issues: []domain.Issue{{
+		ID:    domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12"},
+		State: domain.IssueOpen, Assignees: []string{"alice"},
+		Body: "Dispatch route\n- harness: claude-code\n- model: claude-fable-5\n- fallback: none",
+	}}}
+	spawner := &fakeSpawner{}
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 0 {
+		t.Fatalf("malformed route spawned: %#v", spawner.calls)
+	}
+}
+
+func TestParseDispatchRouteStrictness(t *testing.T) {
+	for name, body := range map[string]string{
+		"duplicate block": "Dispatch route\n- harness: codex\n- model: gpt-5.6-terra\n- reasoning-effort: medium\n- fallback: none\n\nDispatch route\n- harness: codex\n- model: gpt-5.6-terra\n- reasoning-effort: medium\n- fallback: none",
+		"unknown field":   "Dispatch route\n- harness: codex\n- model: gpt-5.6-terra\n- reasoning-effort: medium\n- fallback: none\n- surprise: yes",
+		"fallback":        "Dispatch route\n- harness: codex\n- model: gpt-5.6-terra\n- reasoning-effort: medium\n- fallback: claude-code",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if route, err := ParseDispatchRoute(body); err == nil || route != nil {
+				t.Fatalf("route=%#v err=%v, want strict rejection", route, err)
+			}
+		})
 	}
 }
 

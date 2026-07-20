@@ -203,10 +203,17 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		if issueID == "" || seen[issueID] {
 			continue
 		}
+		route, err := ParseDispatchRoute(issue.Body)
+		if err != nil {
+			o.logger.Error("tracker intake: invalid dispatch route", "project", project.ID, "issue", issueID, "err", err)
+			spawnFailed = true
+			continue
+		}
 		if _, err := o.spawner.Spawn(ctx, ports.SpawnConfig{
 			ProjectID: domain.ProjectID(project.ID),
 			IssueID:   issueID,
 			Kind:      domain.KindWorker,
+			Route:     route,
 			Prompt:    BuildIssuePrompt(issue),
 		}); err != nil {
 			o.logger.Error("tracker intake: spawn issue session failed", "project", project.ID, "issue", issueID, "err", err)
@@ -216,6 +223,74 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		seen[issueID] = true
 	}
 	return spawnFailed
+}
+
+// ParseDispatchRoute reads the one canonical machine-readable route block from
+// an issue body. No block preserves the project's normal default path. A
+// present block is strict and complete so native intake cannot silently fill a
+// missing route field from mutable defaults.
+func ParseDispatchRoute(body string) (*domain.AgentRoute, error) {
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	header := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "Dispatch route" {
+			continue
+		}
+		if header >= 0 {
+			return nil, fmt.Errorf("multiple Dispatch route blocks")
+		}
+		header = i
+	}
+	if header < 0 {
+		return nil, nil
+	}
+
+	values := map[string]string{}
+	for i := header + 1; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			break
+		}
+		if !strings.HasPrefix(line, "- ") {
+			break
+		}
+		parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(line, "- ")), ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid Dispatch route line %q", line)
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		switch key {
+		case "harness", "model", "reasoning-effort", "fallback":
+		default:
+			return nil, fmt.Errorf("unknown Dispatch route field %q", key)
+		}
+		if _, exists := values[key]; exists {
+			return nil, fmt.Errorf("duplicate Dispatch route field %q", key)
+		}
+		if value == "" {
+			return nil, fmt.Errorf("Dispatch route field %q is empty", key)
+		}
+		values[key] = value
+	}
+
+	for _, key := range []string{"harness", "model", "reasoning-effort", "fallback"} {
+		if values[key] == "" {
+			return nil, fmt.Errorf("Dispatch route field %q is required", key)
+		}
+	}
+	if values["fallback"] != "none" {
+		return nil, fmt.Errorf("Dispatch route fallback %q is unsupported; only none is allowed", values["fallback"])
+	}
+	route := &domain.AgentRoute{
+		Harness:         domain.AgentHarness(values["harness"]),
+		Model:           values["model"],
+		ReasoningEffort: domain.ReasoningEffort(values["reasoning-effort"]),
+	}
+	if err := route.Validate(); err != nil {
+		return nil, err
+	}
+	return route, nil
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
