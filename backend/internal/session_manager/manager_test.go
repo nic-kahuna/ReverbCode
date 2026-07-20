@@ -1729,6 +1729,49 @@ func TestSpawnOrchestrator_UsesCoordinatorPrompt(t *testing.T) {
 	}
 }
 
+func TestSpawnOrchestrator_UsesProjectRoleAgentConfig(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{
+		Orchestrator: domain.RoleOverride{
+			Harness: domain.HarnessCodex,
+			AgentConfig: domain.AgentConfig{
+				Model:           "gpt-5.6-luna",
+				ReasoningEffort: domain.ReasoningEffortLow,
+			},
+		},
+	}}
+	agent := &recordingAgent{}
+	m := New(Deps{
+		Runtime:   &fakeRuntime{},
+		Agents:    singleAgent{agent: agent},
+		Workspace: &fakeWorkspace{},
+		Store:     st,
+		Messenger: &fakeMessenger{},
+		Lifecycle: &fakeLCM{store: st},
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	rec, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindOrchestrator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Metadata.RequestedRoute != nil {
+		t.Fatalf("requested route = %#v, want nil for role-derived launch", rec.Metadata.RequestedRoute)
+	}
+	wantRoute := domain.AgentLaunchRoute{
+		Harness:         domain.HarnessCodex,
+		Model:           "gpt-5.6-luna",
+		ReasoningEffort: domain.ReasoningEffortLow,
+	}
+	if rec.Metadata.LaunchRoute == nil || *rec.Metadata.LaunchRoute != wantRoute {
+		t.Fatalf("launch route = %#v, want %#v", rec.Metadata.LaunchRoute, wantRoute)
+	}
+	wantConfig := ports.AgentConfig{Model: "gpt-5.6-luna", ReasoningEffort: domain.ReasoningEffortLow}
+	if agent.lastLaunch.Config != wantConfig {
+		t.Fatalf("launch config = %#v, want %#v", agent.lastLaunch.Config, wantConfig)
+	}
+}
+
 func TestSpawnOrchestrator_WorkspaceProjectPromptListsRepos(t *testing.T) {
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Kind: domain.ProjectKindWorkspace, Config: testRoleAgents()}

@@ -75,8 +75,9 @@ type workspaceRepoDetails struct {
 
 // agentConfig mirrors the daemon's typed domain.AgentConfig for the CLI client.
 type agentConfig struct {
-	Model       string `json:"model,omitempty"`
-	Permissions string `json:"permissions,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	Permissions     string `json:"permissions,omitempty"`
 }
 
 // roleOverride mirrors domain.RoleOverride.
@@ -93,6 +94,11 @@ type trackerIntakeConfig struct {
 	Assignee string `json:"assignee,omitempty"`
 }
 
+// reviewerConfig mirrors domain.ReviewerConfig.
+type reviewerConfig struct {
+	Harness string `json:"harness"`
+}
+
 // projectConfig mirrors the daemon's typed domain.ProjectConfig for the CLI
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
@@ -105,6 +111,7 @@ type projectConfig struct {
 	AgentConfig   agentConfig         `json:"agentConfig,omitempty"`
 	Worker        roleOverride        `json:"worker,omitempty"`
 	Orchestrator  roleOverride        `json:"orchestrator,omitempty"`
+	Reviewers     []reviewerConfig    `json:"reviewers,omitempty"`
 	TrackerIntake trackerIntakeConfig `json:"trackerIntake,omitempty"`
 }
 

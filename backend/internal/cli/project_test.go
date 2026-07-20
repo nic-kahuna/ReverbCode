@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -74,6 +75,91 @@ func TestProjectSetConfig_TrackerIntakeJSON(t *testing.T) {
 	}
 	if !got.Config.TrackerIntake.Enabled || got.Config.TrackerIntake.Provider != "github" || got.Config.TrackerIntake.Assignee != "alice" {
 		t.Fatalf("tracker intake request = %#v", got.Config.TrackerIntake)
+	}
+}
+
+func TestProjectConfigJSONRoundTripPreservesCompleteConfig(t *testing.T) {
+	cfg := setConfigEnv(t)
+	want := projectConfig{
+		DefaultBranch: "develop",
+		SessionPrefix: "demo",
+		Env:           map[string]string{"FOO": "bar"},
+		Symlinks:      []string{".env"},
+		PostCreate:    []string{"npm install"},
+		AgentConfig: agentConfig{
+			Model:           "base-model",
+			ReasoningEffort: "medium",
+			Permissions:     "auto",
+		},
+		Worker: roleOverride{
+			Agent: "claude-code",
+			AgentConfig: agentConfig{
+				Model:           "worker-model",
+				ReasoningEffort: "high",
+				Permissions:     "accept-edits",
+			},
+		},
+		Orchestrator: roleOverride{
+			Agent: "codex",
+			AgentConfig: agentConfig{
+				Model:           "gpt-5.6-luna",
+				ReasoningEffort: "low",
+				Permissions:     "bypass-permissions",
+			},
+		},
+		Reviewers: []reviewerConfig{{Harness: "codex"}, {Harness: "claude-code"}},
+		TrackerIntake: trackerIntakeConfig{
+			Enabled:  true,
+			Provider: "github",
+			Repo:     "acme/demo",
+			Assignee: "alice",
+		},
+	}
+	configJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var captured setConfigRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","path":"/repo/demo","config":`+string(configJSON)+`}}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/projects/demo/config":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Errorf("decode set-config request: %v", err)
+			}
+			_, _ = io.WriteString(w, `{"project":{"id":"demo","path":"/repo/demo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "project", "get", "demo", "--json")
+	if err != nil {
+		t.Fatalf("project get: %v\nstderr=%s", err, errOut)
+	}
+	var read projectGetResult
+	if err := json.Unmarshal([]byte(out), &read); err != nil {
+		t.Fatalf("decode project get output: %v\nout=%s", err, out)
+	}
+	if read.Project.Config == nil || !reflect.DeepEqual(*read.Project.Config, want) {
+		t.Fatalf("read config = %#v, want %#v", read.Project.Config, want)
+	}
+
+	readJSON, err := json.Marshal(read.Project.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, errOut, err = executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "project", "set-config", "demo", "--config-json", string(readJSON))
+	if err != nil {
+		t.Fatalf("project set-config: %v\nstderr=%s", err, errOut)
+	}
+	if !reflect.DeepEqual(captured.Config, want) {
+		t.Fatalf("round-tripped config = %#v, want %#v", captured.Config, want)
 	}
 }
 
