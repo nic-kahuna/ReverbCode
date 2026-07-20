@@ -8,6 +8,7 @@ import "fmt"
 // not support.
 type ReasoningEffort string
 
+// Supported provider-neutral reasoning-effort values.
 const (
 	ReasoningEffortLow    ReasoningEffort = "low"
 	ReasoningEffortMedium ReasoningEffort = "medium"

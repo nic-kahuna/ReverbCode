@@ -269,18 +269,18 @@ func ParseDispatchRoute(body string) (*domain.AgentRoute, error) {
 			return nil, fmt.Errorf("duplicate Dispatch route field %q", key)
 		}
 		if value == "" {
-			return nil, fmt.Errorf("Dispatch route field %q is empty", key)
+			return nil, fmt.Errorf("dispatch route field %q is empty", key)
 		}
 		values[key] = value
 	}
 
 	for _, key := range []string{"harness", "model", "reasoning-effort", "fallback"} {
 		if values[key] == "" {
-			return nil, fmt.Errorf("Dispatch route field %q is required", key)
+			return nil, fmt.Errorf("dispatch route field %q is required", key)
 		}
 	}
 	if values["fallback"] != "none" {
-		return nil, fmt.Errorf("Dispatch route fallback %q is unsupported; only none is allowed", values["fallback"])
+		return nil, fmt.Errorf("dispatch route fallback %q is unsupported; only none is allowed", values["fallback"])
 	}
 	route := &domain.AgentRoute{
 		Harness:         domain.AgentHarness(values["harness"]),
