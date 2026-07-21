@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -23,6 +24,10 @@ import (
 const (
 	defaultTimeout    = 5 * time.Second
 	defaultChunkBytes = 16 * 1024
+	// ControlServerVersion marks AO's separate sessionless tmux control server.
+	// External launchers must require this exact version and data-directory
+	// marker before asking the server to fork a protected-folder reader.
+	ControlServerVersion = "1"
 	// defaultEnterDelay mirrors conpty's ptyInputEnterDelay: a pause after pasting
 	// a non-empty message, before the trailing Enter, so a large multiline paste
 	// does not absorb the Enter and leave the prompt unsubmitted (issue #2342).
@@ -36,23 +41,26 @@ var getenv = os.Getenv
 // Options configures a tmux Runtime. Every field has a sensible default (see
 // New), so the zero value is usable.
 type Options struct {
-	Binary     string        // default "tmux" (resolved via exec.LookPath)
-	Shell      string        // default $SHELL else /bin/sh
-	CommandDir string        // cwd for tmux client processes; default system temp dir
-	Timeout    time.Duration // default 5s
-	ChunkSize  int           // default 16*1024
-	EnterDelay time.Duration // pause after pasting a non-empty message before pressing Enter; default defaultEnterDelay. Conpty already does this (ptyInputEnterDelay); tmux lacked it, so a large multiline paste could absorb the trailing Enter and leave the prompt unsubmitted (issue #2342).
+	Binary        string        // default "tmux" (resolved via exec.LookPath)
+	Shell         string        // default $SHELL else /bin/sh
+	CommandDir    string        // cwd for tmux client processes; default system temp dir
+	ControlSocket string        // dedicated sessionless control socket; default <CommandDir>/tmux-control.sock
+	Timeout       time.Duration // default 5s
+	ChunkSize     int           // default 16*1024
+	EnterDelay    time.Duration // pause after pasting a non-empty message before pressing Enter; default defaultEnterDelay. Conpty already does this (ptyInputEnterDelay); tmux lacked it, so a large multiline paste could absorb the trailing Enter and leave the prompt unsubmitted (issue #2342).
 }
 
 // Runtime runs agent sessions inside tmux sessions, driving them via the tmux
 // CLI. It implements ports.Runtime.
 type Runtime struct {
-	binary     string
-	shell      string
-	timeout    time.Duration
-	chunkSize  int
-	enterDelay time.Duration
-	runner     runner
+	binary         string
+	shell          string
+	timeout        time.Duration
+	chunkSize      int
+	enterDelay     time.Duration
+	controlSocket  string
+	controlDataDir string
+	runner         runner
 }
 
 var _ ports.Runtime = (*Runtime)(nil)
@@ -108,14 +116,74 @@ func New(opts Options) *Runtime {
 	if commandDir == "" {
 		commandDir = os.TempDir()
 	}
-	return &Runtime{
-		binary:     binary,
-		shell:      shellPath,
-		timeout:    timeout,
-		chunkSize:  chunkSize,
-		enterDelay: enterDelay,
-		runner:     execRunner{dir: commandDir},
+	controlDataDir := commandDir
+	if absolute, err := filepath.Abs(controlDataDir); err == nil {
+		controlDataDir = absolute
 	}
+	if resolved, err := filepath.EvalSymlinks(controlDataDir); err == nil {
+		controlDataDir = resolved
+	}
+	controlSocket := opts.ControlSocket
+	if controlSocket == "" {
+		controlSocket = filepath.Join(controlDataDir, "tmux-control.sock")
+	}
+	return &Runtime{
+		binary:         binary,
+		shell:          shellPath,
+		timeout:        timeout,
+		chunkSize:      chunkSize,
+		enterDelay:     enterDelay,
+		controlSocket:  controlSocket,
+		controlDataDir: controlDataDir,
+		runner:         execRunner{dir: commandDir},
+	}
+}
+
+// EnsureControlServer creates and retains a separate AO-owned tmux server even
+// when it has no sessions. Existing runtime sessions remain on the default
+// socket. An existing unmarked or mismatched control socket is rejected rather
+// than adopted because its macOS TCC responsibility may belong to another app.
+func (r *Runtime) EnsureControlServer(ctx context.Context) error {
+	out, err := r.run(ctx, controlShowOptionArgs(r.controlSocket, "@ao-control-version")...)
+	if err == nil {
+		version := strings.TrimSpace(string(out))
+		if version != ControlServerVersion {
+			return fmt.Errorf("tmux runtime: control server version = %q, want %q", version, ControlServerVersion)
+		}
+		if err := r.verifyControlServerDataDir(ctx); err != nil {
+			return err
+		}
+		if _, err := r.run(ctx, controlRetainArgs(r.controlSocket)...); err != nil {
+			return fmt.Errorf("tmux runtime: retain control server: %w", err)
+		}
+		return nil
+	}
+	if !sessionMissingOutput(string(out)) {
+		return fmt.Errorf("tmux runtime: inspect control server version: %w", err)
+	}
+
+	if _, err := r.run(ctx, controlCreateArgs(r.controlSocket, r.controlDataDir)...); err != nil {
+		return fmt.Errorf("tmux runtime: create control server: %w", err)
+	}
+	out, err = r.run(ctx, controlShowOptionArgs(r.controlSocket, "@ao-control-version")...)
+	if err != nil {
+		return fmt.Errorf("tmux runtime: verify control server version: %w", err)
+	}
+	if version := strings.TrimSpace(string(out)); version != ControlServerVersion {
+		return fmt.Errorf("tmux runtime: verified version = %q, want %q", version, ControlServerVersion)
+	}
+	return r.verifyControlServerDataDir(ctx)
+}
+
+func (r *Runtime) verifyControlServerDataDir(ctx context.Context) error {
+	out, err := r.run(ctx, controlShowOptionArgs(r.controlSocket, "@ao-control-data-dir")...)
+	if err != nil {
+		return fmt.Errorf("tmux runtime: inspect control server data dir: %w", err)
+	}
+	if dataDir := strings.TrimSpace(string(out)); dataDir != r.controlDataDir {
+		return fmt.Errorf("tmux runtime: control server data dir = %q, want %q", dataDir, r.controlDataDir)
+	}
+	return nil
 }
 
 // Create starts a new tmux session in the workspace, running the agent's

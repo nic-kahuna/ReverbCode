@@ -101,6 +101,13 @@ func Run() error {
 	// is handed to httpd, which mounts it at /mux. Raw PTY bytes never flow
 	// through the CDC change_log -- only session-state events do.
 	runtimeAdapter := runtimeselect.New(log, cfg.DataDir)
+	if err := ensureRuntimeControlServer(ctx, runtimeAdapter); err != nil {
+		stop()
+		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
+			log.Error("cdc pipeline shutdown", "err", cdcErr)
+		}
+		return fmt.Errorf("initialize runtime control server: %w", err)
+	}
 	termMgr := terminal.NewManager(runtimeAdapter, cdcPipe.Broadcaster, log)
 	defer termMgr.Close()
 
@@ -239,6 +246,18 @@ func Run() error {
 		log.Error("cdc pipeline shutdown", "err", err)
 	}
 	return runErr
+}
+
+type runtimeControlServerEnsurer interface {
+	EnsureControlServer(context.Context) error
+}
+
+func ensureRuntimeControlServer(ctx context.Context, runtimeAdapter runtimeselect.Runtime) error {
+	ensurer, ok := runtimeAdapter.(runtimeControlServerEnsurer)
+	if !ok {
+		return nil
+	}
+	return ensurer.EnsureControlServer(ctx)
 }
 
 // newLogger returns the daemon's slog logger. It writes to stderr so supervisors

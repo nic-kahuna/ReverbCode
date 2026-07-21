@@ -158,6 +158,108 @@ func TestNewSessionKeepsPaneCWDInWorkspace(t *testing.T) {
 	t.Fatalf("new-session args = %#v, want pane cwd %v", args, want)
 }
 
+func TestEnsureControlServerRetainsMarkedServer(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{
+		[]byte(ControlServerVersion + "\n"),
+		[]byte(r.controlDataDir + "\n"),
+		nil,
+	}
+
+	if err := r.EnsureControlServer(context.Background()); err != nil {
+		t.Fatalf("EnsureControlServer: %v", err)
+	}
+	want := [][]string{
+		controlShowOptionArgs(r.controlSocket, "@ao-control-version"),
+		controlShowOptionArgs(r.controlSocket, "@ao-control-data-dir"),
+		controlRetainArgs(r.controlSocket),
+	}
+	if len(fr.calls) != len(want) {
+		t.Fatalf("calls = %#v, want %d", fr.calls, len(want))
+	}
+	for i := range want {
+		if !reflect.DeepEqual(fr.calls[i].args, want[i]) {
+			t.Fatalf("call[%d] = %#v, want %#v", i, fr.calls[i].args, want[i])
+		}
+	}
+}
+
+func TestEnsureControlServerRejectsUnmarkedExistingServer(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{nil}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "control server version") {
+		t.Fatalf("EnsureControlServer error = %v, want version rejection", err)
+	}
+	if len(fr.calls) != 1 {
+		t.Fatalf("calls = %#v, want only marker inspection", fr.calls)
+	}
+}
+
+func TestEnsureControlServerRejectsWrongVersion(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{[]byte("99\n")}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "99") {
+		t.Fatalf("EnsureControlServer error = %v, want version rejection", err)
+	}
+}
+
+func TestEnsureControlServerRejectsWrongDataDir(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{[]byte(ControlServerVersion + "\n"), []byte("/wrong\n")}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "/wrong") {
+		t.Fatalf("EnsureControlServer error = %v, want data-dir rejection", err)
+	}
+}
+
+func TestEnsureControlServerCreatesAndVerifiesMissingServer(t *testing.T) {
+	r, _ := newTestRuntime(0)
+	fr := &fakeRunnerSelectiveErr{
+		outputs: [][]byte{
+			[]byte("error connecting to " + r.controlSocket + " (No such file or directory)"),
+			nil,
+			[]byte(ControlServerVersion + "\n"),
+			[]byte(r.controlDataDir + "\n"),
+		},
+		exitErrAt: 0,
+	}
+	r.runner = fr
+
+	if err := r.EnsureControlServer(context.Background()); err != nil {
+		t.Fatalf("EnsureControlServer: %v", err)
+	}
+	want := [][]string{
+		controlShowOptionArgs(r.controlSocket, "@ao-control-version"),
+		controlCreateArgs(r.controlSocket, r.controlDataDir),
+		controlShowOptionArgs(r.controlSocket, "@ao-control-version"),
+		controlShowOptionArgs(r.controlSocket, "@ao-control-data-dir"),
+	}
+	if len(fr.calls) != len(want) {
+		t.Fatalf("calls = %#v, want inspect/create/verify-version/verify-data-dir", fr.calls)
+	}
+	for i := range want {
+		if !reflect.DeepEqual(fr.calls[i].args, want[i]) {
+			t.Fatalf("call[%d] = %#v, want %#v", i, fr.calls[i].args, want[i])
+		}
+	}
+}
+
+func TestEnsureControlServerReportsUnexpectedInspectionFailure(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{[]byte("permission denied")}
+	fr.err = &exec.ExitError{}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "inspect control server version") {
+		t.Fatalf("EnsureControlServer error = %v, want inspection failure", err)
+	}
+}
+
 // -- session name sanitization --
 
 func TestSessionNameSanitizesSpecialChars(t *testing.T) {
