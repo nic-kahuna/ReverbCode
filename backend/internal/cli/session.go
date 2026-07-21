@@ -51,6 +51,8 @@ type sessionDTO struct {
 	CreatedAt      time.Time        `json:"createdAt"`
 	UpdatedAt      time.Time        `json:"updatedAt"`
 	Status         string           `json:"status"`
+	Branch         string           `json:"branch,omitempty"`
+	WorkspacePath  string           `json:"workspacePath,omitempty"`
 	RequestedRoute *sessionRouteDTO `json:"requestedRoute,omitempty"`
 	LaunchRoute    *sessionRouteDTO `json:"launchRoute,omitempty"`
 }
@@ -130,6 +132,8 @@ type sessionListEntry struct {
 	Status         string     `json:"status,omitempty"`
 	IssueID        string     `json:"issueId,omitempty"`
 	Harness        string     `json:"harness,omitempty"`
+	Branch         string     `json:"branch,omitempty"`
+	WorkspacePath  string     `json:"workspacePath,omitempty"`
 	IsTerminated   bool       `json:"isTerminated"`
 	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
 	CreatedAt      time.Time  `json:"createdAt"`
@@ -624,6 +628,8 @@ func sessionListEntries(sessions []sessionDTO) []sessionListEntry {
 			Status:         sess.Status,
 			IssueID:        sess.IssueID,
 			Harness:        sess.Harness,
+			Branch:         sess.Branch,
+			WorkspacePath:  sess.WorkspacePath,
 			IsTerminated:   sess.IsTerminated,
 			LastActivityAt: last,
 			CreatedAt:      sess.CreatedAt,

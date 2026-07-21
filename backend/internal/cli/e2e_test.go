@@ -62,7 +62,23 @@ type env struct {
 
 func newEnv(t *testing.T) env {
 	t.Helper()
-	dir := t.TempDir()
+	var dir string
+	if runtime.GOOS == "darwin" {
+		// Keep tmux-control.sock below Darwin's Unix socket path-length limit.
+		var err error
+		dir, err = os.MkdirTemp("/tmp", "ao-e2e-")
+		if err != nil {
+			t.Fatalf("create short state directory: %v", err)
+		}
+		// Registered before daemon cleanup: LIFO stops the daemon first.
+		t.Cleanup(func() {
+			controlSocket := filepath.Join(dir, "data", "tmux-control.sock")
+			_ = exec.Command("tmux", "-N", "-S", controlSocket, "kill-server").Run()
+			_ = os.RemoveAll(dir)
+		})
+	} else {
+		dir = t.TempDir()
+	}
 	return env{
 		runFile: filepath.Join(dir, "running.json"),
 		dataDir: filepath.Join(dir, "data"),

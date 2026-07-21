@@ -268,7 +268,7 @@ func TestSessionsRoutes_DefaultToStubsWithoutService(t *testing.T) {
 func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	svc := newFakeSessionService()
 	s := svc.sessions["ao-1"]
-	s.Metadata = domain.SessionMetadata{Branch: "qa/modal-worker", WorkspacePath: "/tmp/private-worktree", RuntimeHandleID: "runtime-1", Prompt: "private prompt"}
+	s.Metadata = domain.SessionMetadata{Branch: "qa/modal-worker", WorkspacePath: "/tmp/private-worktree", RuntimeHandleID: "runtime-1", AgentSessionID: "agent-session-1", Prompt: "private prompt"}
 	svc.sessions["ao-1"] = s
 	srv := newSessionTestServer(t, svc)
 
@@ -286,6 +286,9 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	if list.Sessions[0].Branch != "qa/modal-worker" {
 		t.Fatalf("branch = %q, want qa/modal-worker", list.Sessions[0].Branch)
 	}
+	if list.Sessions[0].WorkspacePath != "/tmp/private-worktree" {
+		t.Fatalf("workspacePath = %q, want /tmp/private-worktree", list.Sessions[0].WorkspacePath)
+	}
 	var rawList struct {
 		Sessions []map[string]any `json:"sessions"`
 	}
@@ -293,11 +296,14 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	if _, ok := rawList.Sessions[0]["metadata"]; ok {
 		t.Fatalf("list leaked metadata: %s", body)
 	}
-	if _, ok := rawList.Sessions[0]["workspacePath"]; ok {
-		t.Fatalf("list leaked workspacePath: %s", body)
-	}
 	if _, ok := rawList.Sessions[0]["prompt"]; ok {
 		t.Fatalf("list leaked prompt: %s", body)
+	}
+	if _, ok := rawList.Sessions[0]["runtimeHandleId"]; ok {
+		t.Fatalf("list leaked runtimeHandleId: %s", body)
+	}
+	if _, ok := rawList.Sessions[0]["agentSessionId"]; ok {
+		t.Fatalf("list leaked agentSessionId: %s", body)
 	}
 
 	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions", `{"projectId":"ao","issueId":"ISS-1","kind":"worker","harness":"codex","prompt":"fix","displayName":"my worker"}`)
@@ -858,6 +864,7 @@ type sessionBody struct {
 	Harness          string `json:"harness"`
 	DisplayName      string `json:"displayName"`
 	Branch           string `json:"branch"`
+	WorkspacePath    string `json:"workspacePath"`
 	Status           string `json:"status"`
 	TerminalHandleID string `json:"terminalHandleId"`
 }

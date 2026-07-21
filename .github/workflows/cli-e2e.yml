@@ -35,6 +35,10 @@ jobs:
           go-version: "1.25"
           cache: false
 
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
       - name: CLI E2E (native)
         run: go test -tags e2e -v ./internal/cli/...
 
