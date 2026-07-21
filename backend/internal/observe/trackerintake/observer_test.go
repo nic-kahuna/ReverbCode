@@ -144,6 +144,39 @@ func TestPollSkipsExistingIssueSessionsAfterRestart(t *testing.T) {
 	}
 }
 
+func TestPollReplacesTerminatedIssueSession(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "demo",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config:        domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{Enabled: true, Assignee: "alice"}},
+		}},
+		sessions: []domain.SessionRecord{{
+			ID:           "demo-1",
+			ProjectID:    "demo",
+			IssueID:      "github:acme/demo#12",
+			IsTerminated: true,
+		}},
+	}
+	tracker := &fakeTracker{issues: []domain.Issue{{
+		ID:        domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12"},
+		Title:     "Resume interrupted work",
+		State:     domain.IssueOpen,
+		Assignees: []string{"alice"},
+	}}}
+	spawner := &fakeSpawner{}
+
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(spawner.calls) != 1 {
+		t.Fatalf("spawn calls = %d, want 1 replacement", len(spawner.calls))
+	}
+	if spawner.calls[0].IssueID != "github:acme/demo#12" {
+		t.Fatalf("replacement IssueID = %q", spawner.calls[0].IssueID)
+	}
+}
+
 func TestPollSkipsSessionScanWhenIntakeDisabled(t *testing.T) {
 	store := &fakeStore{
 		projects:    []domain.ProjectRecord{{ID: "demo"}},
