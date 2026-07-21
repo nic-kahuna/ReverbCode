@@ -77,7 +77,13 @@ func TestOrchestratorList_JSONOutputDecodes(t *testing.T) {
 	if got.Data[0].ID != "demo-orch" || got.Data[0].ProjectID != "demo" || got.Data[0].Role != "orchestrator" {
 		t.Fatalf("unexpected first JSON entry: %#v", got.Data[0])
 	}
+	if got.Data[0].Branch != "ao/demo-orch/root" || got.Data[0].WorkspacePath != "/tmp/worktrees/demo-orch" {
+		t.Fatalf("first orchestrator workspace identity missing from JSON entry: %#v", got.Data[0])
+	}
 	if got.Data[1].ID != "other-orch" || got.Data[1].ProjectID != "other" || got.Data[1].Role != "orchestrator" {
 		t.Fatalf("unexpected second JSON entry: %#v", got.Data[1])
+	}
+	if got.Data[1].Branch != "ao/other-orch/root" || got.Data[1].WorkspacePath != "/tmp/worktrees/other-orch" {
+		t.Fatalf("second orchestrator workspace identity missing from JSON entry: %#v", got.Data[1])
 	}
 }

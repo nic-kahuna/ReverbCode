@@ -721,6 +721,7 @@ func sessionView(s domain.Session) SessionView {
 	return SessionView{
 		Session:         s,
 		Branch:          s.Metadata.Branch,
+		WorkspacePath:   s.Metadata.WorkspacePath,
 		RequestedRoute:  s.Metadata.RequestedRoute,
 		LaunchRoute:     s.Metadata.LaunchRoute,
 		PreviewURL:      s.Metadata.PreviewURL,
