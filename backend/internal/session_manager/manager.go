@@ -271,7 +271,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %q", ErrUnknownHarness, cfg.Harness)
 	}
-	agentConfig := effectiveAgentConfig(cfg.Kind, project.Config, cfg.Route)
+	agentConfig := effectiveAgentConfig(cfg.Kind, project.Config, cfg.Harness, cfg.Route)
 	if err := agentConfig.Validate(); err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: invalid agent config: %w", err)
 	}
@@ -279,6 +279,8 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		if err := validator.ValidateAgentConfig(ctx, agentConfig); err != nil {
 			return domain.SessionRecord{}, fmt.Errorf("spawn: invalid route for %s: %w", cfg.Harness, err)
 		}
+	} else if agentConfig.Profile != "" {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: harness %q does not support configuration profiles", cfg.Harness)
 	} else if agentConfig.ReasoningEffort != "" {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: harness %q does not support reasoning-effort routing", cfg.Harness)
 	}
@@ -506,17 +508,27 @@ func roleConfigName(kind domain.SessionKind) string {
 
 // effectiveAgentConfig merges the role override's agent config over the
 // project's base agent config; set override fields win.
-func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig, route *domain.AgentRoute) ports.AgentConfig {
+func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig, selectedHarness domain.AgentHarness, route *domain.AgentRoute) ports.AgentConfig {
 	merged := cfg.AgentConfig
-	override := roleOverride(kind, cfg).AgentConfig
+	role := roleOverride(kind, cfg)
+	override := role.AgentConfig
 	if override.Model != "" {
 		merged.Model = override.Model
+	}
+	if override.Profile != "" {
+		merged.Profile = override.Profile
 	}
 	if override.Permissions != "" {
 		merged.Permissions = override.Permissions
 	}
 	if override.ReasoningEffort != "" {
 		merged.ReasoningEffort = override.ReasoningEffort
+	}
+	// Profiles in a role override belong to that role's configured provider.
+	// Clear them when an explicit harness or route selects another provider;
+	// base profiles remain fail-closed and are validated by the selected adapter.
+	if override.Profile != "" && role.Harness != "" && selectedHarness != role.Harness {
+		merged.Profile = ""
 	}
 	if route != nil {
 		merged.Model = route.Model
@@ -832,7 +844,7 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	// reasoning are launch identity: new sessions persist them and restores
 	// reapply that snapshot instead of mutable project defaults. Legacy rows
 	// without a launch snapshot retain the v0.10.3 behavior.
-	agentConfig := effectiveAgentConfig(rec.Kind, project.Config, nil)
+	agentConfig := effectiveAgentConfig(rec.Kind, project.Config, rec.Harness, nil)
 	if route := rec.Metadata.LaunchRoute; route != nil {
 		if route.Harness != rec.Harness {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: persisted launch harness %q conflicts with session harness %q", rec.ID, route.Harness, rec.Harness)
@@ -844,6 +856,8 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		if err := validator.ValidateAgentConfig(ctx, agentConfig); err != nil {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: invalid persisted agent route: %w", rec.ID, err)
 		}
+	} else if agentConfig.Profile != "" {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: harness %q does not support configuration profiles", rec.ID, rec.Harness)
 	} else if agentConfig.ReasoningEffort != "" {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: harness %q does not support reasoning-effort routing", rec.ID, rec.Harness)
 	}

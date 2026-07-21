@@ -10,6 +10,11 @@ func TestProjectConfigValidate(t *testing.T) {
 	}{
 		{"empty ok", ProjectConfig{}, false},
 		{"good agent config", ProjectConfig{AgentConfig: AgentConfig{Model: "m", Permissions: PermissionModeAuto}}, false},
+		{"good agent profile", ProjectConfig{AgentConfig: AgentConfig{Profile: "ao-minimal"}}, false},
+		{"profile cannot start with punctuation", ProjectConfig{AgentConfig: AgentConfig{Profile: "-ao"}}, true},
+		{"profile cannot contain a path", ProjectConfig{AgentConfig: AgentConfig{Profile: "../ao"}}, true},
+		{"profile cannot contain a dot", ProjectConfig{AgentConfig: AgentConfig{Profile: "ao.minimal"}}, true},
+		{"profile cannot contain whitespace", ProjectConfig{AgentConfig: AgentConfig{Profile: "ao minimal"}}, true},
 		{"bad permission", ProjectConfig{AgentConfig: AgentConfig{Permissions: "yolo"}}, true},
 		{"good session prefix", ProjectConfig{SessionPrefix: "ao"}, false},
 		{"session prefix with slash", ProjectConfig{SessionPrefix: "ao/project"}, true},

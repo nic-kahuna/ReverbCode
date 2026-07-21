@@ -35,6 +35,14 @@ surface (`npm run sqlc`, `npm run api`).
 - Full session lifecycle over HTTP: list, get, spawn, kill, restore, rename,
   rollback, cleanup, send, activity, PR claim/list. Orchestrator routes
   (list/spawn/get) are wired too.
+- Optional per-session harness/model/reasoning routes are validated before
+  workspace creation, persisted across restore and native resume, translated by
+  the Claude Code and Codex adapters, and exposed as requested/launch route
+  metadata through the API and CLI.
+- Agent configuration can select a provider-native profile. The Codex adapter
+  emits `--profile` for launch and native resume; role overrides merge it like
+  other project policy, while cross-harness routes clear provider-specific
+  profiles instead of leaking them into another adapter.
 - Project CRUD plus per-project config (`PUT /projects/{id}/config`).
 - PR action engine wired into the API: `POST /prs/{id}/merge` and
   `/prs/{id}/resolve-comments`.

@@ -242,6 +242,27 @@ type fakeAgents struct{}
 
 func (fakeAgents) Agent(domain.AgentHarness) (ports.Agent, bool) { return fakeAgent{}, true }
 
+type nonValidatingAgent struct{}
+
+func (nonValidatingAgent) GetConfigSpec(context.Context) (ports.ConfigSpec, error) {
+	return ports.ConfigSpec{}, nil
+}
+func (nonValidatingAgent) GetLaunchCommand(context.Context, ports.LaunchConfig) ([]string, error) {
+	return []string{"launch"}, nil
+}
+func (nonValidatingAgent) GetPromptDeliveryStrategy(context.Context, ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
+	return ports.PromptDeliveryInCommand, nil
+}
+func (nonValidatingAgent) GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error {
+	return nil
+}
+func (nonValidatingAgent) GetRestoreCommand(context.Context, ports.RestoreConfig) ([]string, bool, error) {
+	return nil, false, nil
+}
+func (nonValidatingAgent) SessionInfo(context.Context, ports.SessionRef) (ports.SessionInfo, bool, error) {
+	return ports.SessionInfo{}, false, nil
+}
+
 // recordingAgent captures the LaunchConfig it is handed so a test can assert the
 // session manager resolved and forwarded a project's agent config.
 type recordingAgent struct {
@@ -497,9 +518,9 @@ func TestSpawn_ResolvesProjectConfig(t *testing.T) {
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{
 		DefaultBranch: "develop",
 		Env:           map[string]string{"FOO": "bar"},
-		AgentConfig:   domain.AgentConfig{Model: "base-model"},
+		AgentConfig:   domain.AgentConfig{Model: "base-model", Profile: "base-profile"},
 		// A worker role override wins over the base agent config for workers.
-		Worker: domain.RoleOverride{Harness: domain.HarnessCodex, AgentConfig: domain.AgentConfig{Model: "worker-model"}},
+		Worker: domain.RoleOverride{Harness: domain.HarnessCodex, AgentConfig: domain.AgentConfig{Model: "worker-model", Profile: "worker-profile"}},
 	}}
 	agent := &recordingAgent{}
 	rt := &fakeRuntime{}
@@ -513,6 +534,9 @@ func TestSpawn_ResolvesProjectConfig(t *testing.T) {
 	}
 	if agent.lastConfig.Model != "worker-model" {
 		t.Fatalf("launch model = %q, want role override worker-model", agent.lastConfig.Model)
+	}
+	if agent.lastConfig.Profile != "worker-profile" {
+		t.Fatalf("launch profile = %q, want role override worker-profile", agent.lastConfig.Profile)
 	}
 	if rec.Harness != domain.HarnessCodex {
 		t.Fatalf("harness = %q, want codex from role override", rec.Harness)
@@ -548,8 +572,8 @@ func TestSpawn_ResolvesProjectConfig(t *testing.T) {
 func TestSpawn_RouteOverridesProjectAndRoleConfig(t *testing.T) {
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{
-		AgentConfig: domain.AgentConfig{Model: "base-model", ReasoningEffort: domain.ReasoningEffortHigh},
-		Worker:      domain.RoleOverride{Harness: domain.HarnessCodex, AgentConfig: domain.AgentConfig{Model: "worker-model"}},
+		AgentConfig: domain.AgentConfig{Model: "base-model", Profile: "base-profile", ReasoningEffort: domain.ReasoningEffortHigh},
+		Worker:      domain.RoleOverride{Harness: domain.HarnessCodex, AgentConfig: domain.AgentConfig{Model: "worker-model", Profile: "ao-minimal"}},
 	}}
 	agent := &recordingAgent{}
 	m := New(Deps{Runtime: &fakeRuntime{}, Agents: singleAgent{agent: agent}, Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: func(string) (string, error) { return "/bin/true", nil }})
@@ -565,12 +589,78 @@ func TestSpawn_RouteOverridesProjectAndRoleConfig(t *testing.T) {
 	if agent.lastConfig.Model != route.Model || agent.lastConfig.ReasoningEffort != route.ReasoningEffort {
 		t.Fatalf("launch config = %#v, want route %#v", agent.lastConfig, route)
 	}
+	if agent.lastConfig.Profile != "" {
+		t.Fatalf("launch profile = %q, want cleared after codex-to-claude route", agent.lastConfig.Profile)
+	}
 	if rec.Metadata.RequestedRoute == nil || *rec.Metadata.RequestedRoute != *route {
 		t.Fatalf("requested route = %#v, want %#v", rec.Metadata.RequestedRoute, route)
 	}
 	wantLaunch := domain.AgentLaunchRoute{Harness: route.Harness, Model: route.Model, ReasoningEffort: route.ReasoningEffort}
 	if rec.Metadata.LaunchRoute == nil || *rec.Metadata.LaunchRoute != wantLaunch {
 		t.Fatalf("launch route = %#v, want %#v", rec.Metadata.LaunchRoute, wantLaunch)
+	}
+}
+
+func TestEffectiveAgentConfigPreservesProfileForSameHarnessRoute(t *testing.T) {
+	cfg := domain.ProjectConfig{
+		Worker: domain.RoleOverride{
+			Harness: domain.HarnessCodex,
+			AgentConfig: domain.AgentConfig{
+				Profile: "ao-minimal",
+			},
+		},
+	}
+	route := &domain.AgentRoute{
+		Harness:         domain.HarnessCodex,
+		Model:           "gpt-5.6-terra",
+		ReasoningEffort: domain.ReasoningEffortMedium,
+	}
+	got := effectiveAgentConfig(domain.KindWorker, cfg, domain.HarnessCodex, route)
+	if got.Profile != "ao-minimal" {
+		t.Fatalf("profile = %q, want ao-minimal for same-harness route", got.Profile)
+	}
+}
+
+func TestEffectiveAgentConfigPreservesBaseProfileForExplicitCodexRoute(t *testing.T) {
+	cfg := domain.ProjectConfig{AgentConfig: domain.AgentConfig{Profile: "ao-minimal"}}
+	route := &domain.AgentRoute{Harness: domain.HarnessCodex, Model: "gpt-5.6-terra"}
+	got := effectiveAgentConfig(domain.KindWorker, cfg, domain.HarnessCodex, route)
+	if got.Profile != "ao-minimal" {
+		t.Fatalf("profile = %q, want base profile for explicit Codex route", got.Profile)
+	}
+}
+
+func TestEffectiveAgentConfigClearsRoleProfileForExplicitHarnessSwitch(t *testing.T) {
+	cfg := domain.ProjectConfig{Worker: domain.RoleOverride{
+		Harness:     domain.HarnessCodex,
+		AgentConfig: domain.AgentConfig{Profile: "ao-minimal"},
+	}}
+	got := effectiveAgentConfig(domain.KindWorker, cfg, domain.HarnessClaudeCode, nil)
+	if got.Profile != "" {
+		t.Fatalf("profile = %q, want cleared after explicit Codex-to-Claude harness switch", got.Profile)
+	}
+}
+
+func TestSpawnRejectsProfileForAgentWithoutConfigValidation(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{
+		Worker: domain.RoleOverride{
+			Harness:     domain.HarnessAider,
+			AgentConfig: domain.AgentConfig{Profile: "ao-minimal"},
+		},
+	}}
+	m := New(Deps{
+		Runtime:   &fakeRuntime{},
+		Agents:    singleAgent{agent: nonValidatingAgent{}},
+		Workspace: &fakeWorkspace{},
+		Store:     st,
+		Messenger: &fakeMessenger{},
+		Lifecycle: &fakeLCM{store: st},
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	if _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker}); err == nil || !strings.Contains(err.Error(), "does not support configuration profiles") {
+		t.Fatalf("Spawn() error = %v, want unsupported profile", err)
 	}
 }
 
@@ -1398,18 +1488,18 @@ func TestRestore_AppliesProjectAgentConfig(t *testing.T) {
 func TestRestore_ReappliesPersistedLaunchRoute(t *testing.T) {
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{AgentConfig: domain.AgentConfig{
-		Model: "changed-project-model", ReasoningEffort: domain.ReasoningEffortHigh,
+		Model: "changed-project-model", Profile: "current-profile", ReasoningEffort: domain.ReasoningEffortHigh,
 	}}}
 	seedTerminal(st, "mer-1", domain.SessionMetadata{
 		WorkspacePath:  "/ws/mer-1",
 		Branch:         "b",
 		AgentSessionID: "agent-x",
 		LaunchRoute: &domain.AgentLaunchRoute{
-			Harness: domain.HarnessClaudeCode, Model: "original-model", ReasoningEffort: domain.ReasoningEffortLow,
+			Harness: domain.HarnessCodex, Model: "original-model", ReasoningEffort: domain.ReasoningEffortLow,
 		},
 	})
 	rec := st.sessions["mer-1"]
-	rec.Harness = domain.HarnessClaudeCode
+	rec.Harness = domain.HarnessCodex
 	st.sessions["mer-1"] = rec
 	agent := &recordingAgent{}
 	m := New(Deps{Runtime: &fakeRuntime{}, Agents: singleAgent{agent: agent}, Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: func(string) (string, error) { return "/bin/true", nil }})
@@ -1419,6 +1509,9 @@ func TestRestore_ReappliesPersistedLaunchRoute(t *testing.T) {
 	}
 	if agent.lastRestore.Config.Model != "original-model" || agent.lastRestore.Config.ReasoningEffort != domain.ReasoningEffortLow {
 		t.Fatalf("restore config = %#v, want persisted launch route", agent.lastRestore.Config)
+	}
+	if agent.lastRestore.Config.Profile != "current-profile" {
+		t.Fatalf("restore profile = %q, want current project policy", agent.lastRestore.Config.Profile)
 	}
 }
 
@@ -1736,6 +1829,7 @@ func TestSpawnOrchestrator_UsesProjectRoleAgentConfig(t *testing.T) {
 			Harness: domain.HarnessCodex,
 			AgentConfig: domain.AgentConfig{
 				Model:           "gpt-5.6-luna",
+				Profile:         "ao-minimal",
 				ReasoningEffort: domain.ReasoningEffortLow,
 			},
 		},
@@ -1766,7 +1860,7 @@ func TestSpawnOrchestrator_UsesProjectRoleAgentConfig(t *testing.T) {
 	if rec.Metadata.LaunchRoute == nil || *rec.Metadata.LaunchRoute != wantRoute {
 		t.Fatalf("launch route = %#v, want %#v", rec.Metadata.LaunchRoute, wantRoute)
 	}
-	wantConfig := ports.AgentConfig{Model: "gpt-5.6-luna", ReasoningEffort: domain.ReasoningEffortLow}
+	wantConfig := ports.AgentConfig{Model: "gpt-5.6-luna", Profile: "ao-minimal", ReasoningEffort: domain.ReasoningEffortLow}
 	if agent.lastLaunch.Config != wantConfig {
 		t.Fatalf("launch config = %#v, want %#v", agent.lastLaunch.Config, wantConfig)
 	}

@@ -1750,6 +1750,8 @@ components:
           type: string
         permissions:
           type: string
+        profile:
+          type: string
         reasoningEffort:
           type: string
       type: object

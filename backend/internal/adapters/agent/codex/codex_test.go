@@ -252,19 +252,22 @@ func TestGetConfigSpecIncludesRouteFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(spec.Fields) != 2 || spec.Fields[0].Key != "model" || spec.Fields[1].Key != "reasoningEffort" {
-		t.Fatalf("config fields = %#v, want model and reasoningEffort", spec.Fields)
+	if len(spec.Fields) != 3 || spec.Fields[0].Key != "model" || spec.Fields[1].Key != "profile" || spec.Fields[2].Key != "reasoningEffort" {
+		t.Fatalf("config fields = %#v, want model, profile, and reasoningEffort", spec.Fields)
 	}
 }
 
 func TestGetLaunchCommandAppliesModelAndReasoning(t *testing.T) {
 	plugin := &Plugin{resolvedBinary: "codex"}
-	cmd, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{Config: ports.AgentConfig{Model: "gpt-5.6-terra", ReasoningEffort: domain.ReasoningEffortMedium}})
+	cmd, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{Config: ports.AgentConfig{Model: "gpt-5.6-terra", Profile: "ao-minimal", ReasoningEffort: domain.ReasoningEffortMedium}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !containsSubsequence(cmd, []string{"--model", "gpt-5.6-terra"}) {
 		t.Fatalf("command %#v missing model", cmd)
+	}
+	if !containsSubsequence(cmd, []string{"--profile", "ao-minimal"}) {
+		t.Fatalf("command %#v missing profile", cmd)
 	}
 	if !containsSubsequence(cmd, []string{"-c", `model_reasoning_effort="medium"`}) {
 		t.Fatalf("command %#v missing reasoning effort", cmd)
@@ -446,7 +449,7 @@ func TestGetRestoreCommandReadsAgentSessionID(t *testing.T) {
 
 	cmd, ok, err := plugin.GetRestoreCommand(context.Background(), ports.RestoreConfig{
 		Permissions: ports.PermissionModeAuto,
-		Config:      ports.AgentConfig{Model: "gpt-5.6-terra", ReasoningEffort: domain.ReasoningEffortMedium},
+		Config:      ports.AgentConfig{Model: "gpt-5.6-terra", Profile: "ao-minimal", ReasoningEffort: domain.ReasoningEffortMedium},
 		Session: ports.SessionRef{
 			Metadata:      map[string]string{ports.MetadataKeyAgentSessionID: "thread-123"},
 			WorkspacePath: workspace,
@@ -472,6 +475,7 @@ func TestGetRestoreCommandReadsAgentSessionID(t *testing.T) {
 		want = append(want, "--no-alt-screen")
 	}
 	want = append(want,
+		"--profile", "ao-minimal",
 		"-c", `projects={`+codexTOMLConfigString(workspace)+`={trust_level="trusted"}}`,
 		"--model", "gpt-5.6-terra",
 		"-c", `model_reasoning_effort="medium"`,

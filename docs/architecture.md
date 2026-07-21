@@ -265,17 +265,25 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     Start([User spawns session]) --> Validate[Validate project config]
-    Validate --> CreateRow[Create session row in SQLite]
+    Validate --> Route[Validate optional complete agent route]
+    Route --> CreateRow[Create session row and persist requested route]
     CreateRow --> CreateWS[Create git worktree]
     CreateWS --> CreateRT[Launch runtime tmux/conpty]
     CreateRT --> GetCmd[Get agent launch command]
-    GetCmd --> ExecAgent[Execute agent in runtime]
+    GetCmd --> PersistLaunch[Persist exact launch route]
+    PersistLaunch --> ExecAgent[Execute agent in runtime]
     ExecAgent --> MarkSpawned[MarkSpawned in LCM]
     MarkSpawned --> Trigger1[CDC: session.created]
     Trigger1 --> Trigger2[CDC: session.updated]
     Trigger2 --> Done([Session running])
 
 ```
+
+`launchRoute` persists harness/model/reasoning launch identity. Provider-native
+configuration profiles remain mutable project and role policy: restore uses the
+current profile while retaining the persisted route tuple. A complete route
+that switches harness clears the configured role profile; a same-harness route
+retains it.
 
 ### Observation Flow
 

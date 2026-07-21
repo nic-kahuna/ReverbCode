@@ -48,6 +48,8 @@ ao session ls --include-terminated -p agent-orchestrator
 
 Fetch one session.
 
+When a session was explicitly routed, the human-readable output includes both `requested route` and `launch route`. The requested route is the complete harness/model/reasoning tuple supplied by the caller or native intake. The launch route is the exact routing tuple AO emitted; an omitted model or effort is displayed as `provider default`. JSON output exposes the same values as `requestedRoute` and `launchRoute`. Restore and native resume retain the persisted route. Provider configuration profiles are mutable project/role policy rather than route identity, so attest them separately through project config and process arguments.
+
 **Syntax:**
 ```
 ao session get <id> [flags]

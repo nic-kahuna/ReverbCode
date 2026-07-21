@@ -149,6 +149,9 @@ func (p *Plugin) ValidateAgentConfig(ctx context.Context, cfg ports.AgentConfig)
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("claude-code: %w", err)
 	}
+	if cfg.Profile != "" {
+		return fmt.Errorf("claude-code: configuration profiles are unsupported")
+	}
 	switch cfg.ReasoningEffort {
 	case "", domain.ReasoningEffortLow, domain.ReasoningEffortMedium, domain.ReasoningEffortHigh, domain.ReasoningEffortXHigh, domain.ReasoningEffortMax:
 		return nil

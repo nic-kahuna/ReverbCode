@@ -475,6 +475,13 @@ func TestValidateAgentConfigRejectsClaudeUltra(t *testing.T) {
 	}
 }
 
+func TestValidateAgentConfigRejectsCodexProfile(t *testing.T) {
+	p := &Plugin{resolvedBinary: "claude"}
+	if err := p.ValidateAgentConfig(context.Background(), ports.AgentConfig{Profile: "ao-minimal"}); err == nil {
+		t.Fatal("expected Claude Code to reject a Codex profile")
+	}
+}
+
 func TestGetLaunchCommandExplicitPermissionsOverrideConfig(t *testing.T) {
 	p := &Plugin{resolvedBinary: "claude"}
 	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{

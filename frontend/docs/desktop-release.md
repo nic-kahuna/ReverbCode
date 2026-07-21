@@ -165,3 +165,27 @@ configured; releases since v0.10.1 ship signed and notarized, and the in-app
 auto-updater (`update-electron-app` in `src/main.ts`, active only when
 `app.isPackaged`) updates installed apps from the Releases feed. Windows
 code-signing is still a follow-up (issue #401).
+
+### Private single-machine macOS signing
+
+Private local builds may use a persistent self-signed Code Signing identity when
+the app is installed only on the signing Mac and is not distributed. Set
+`AO_LOCAL_SIGNING=true` and pass the exact persistent identity through
+`APPLE_SIGNING_IDENTITY` when packaging. This path signs the app and nested
+helpers, fails closed on signing errors, preserves hardened runtime, and adds
+`com.apple.security.cs.disable-library-validation` only to the local Electron
+app processes because a self-signed identity has no Apple Team ID.
+
+Keep the certificate and private key in the user's keychain, pin and verify its
+fingerprint before replacement, and require `codesign --verify --deep --strict`
+plus a stable designated requirement across builds. `spctl` rejection is
+expected because this build is neither Developer-ID signed nor notarized. Keep
+exactly one bundle with `dev.agent-orchestrator.desktop` in an Applications
+directory so macOS privacy grants do not resolve to an obsolete copy. This local
+path must never change the official Developer-ID/notarized release flow.
+
+For managed local automation, provider profile files such as
+`$CODEX_HOME/ao-minimal.config.toml` are installed outside the application
+bundle and selected through typed project role configuration. They are runtime
+policy, not signing inputs; preserve and revalidate them independently after an
+application or Codex CLI update.

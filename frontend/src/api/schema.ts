@@ -664,6 +664,7 @@ export interface components {
         AgentConfig: {
             model?: string;
             permissions?: string;
+            profile?: string;
             reasoningEffort?: string;
         };
         AgentInfo: {

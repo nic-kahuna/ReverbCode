@@ -88,6 +88,7 @@ func TestProjectConfigJSONRoundTripPreservesCompleteConfig(t *testing.T) {
 		PostCreate:    []string{"npm install"},
 		AgentConfig: agentConfig{
 			Model:           "base-model",
+			Profile:         "base-profile",
 			ReasoningEffort: "medium",
 			Permissions:     "auto",
 		},
@@ -95,6 +96,7 @@ func TestProjectConfigJSONRoundTripPreservesCompleteConfig(t *testing.T) {
 			Agent: "claude-code",
 			AgentConfig: agentConfig{
 				Model:           "worker-model",
+				Profile:         "worker-profile",
 				ReasoningEffort: "high",
 				Permissions:     "accept-edits",
 			},
@@ -103,6 +105,7 @@ func TestProjectConfigJSONRoundTripPreservesCompleteConfig(t *testing.T) {
 			Agent: "codex",
 			AgentConfig: agentConfig{
 				Model:           "gpt-5.6-luna",
+				Profile:         "ao-minimal",
 				ReasoningEffort: "low",
 				Permissions:     "bypass-permissions",
 			},

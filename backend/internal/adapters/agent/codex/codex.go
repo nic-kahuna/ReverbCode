@@ -84,6 +84,7 @@ func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
 	}
 	return ports.ConfigSpec{Fields: []ports.ConfigField{
 		{Key: "model", Type: ports.ConfigFieldString, Description: "Model override passed to `codex --model`."},
+		{Key: "profile", Type: ports.ConfigFieldString, Description: "Named Codex configuration profile passed through `codex --profile`."},
 		{Key: "reasoningEffort", Type: ports.ConfigFieldEnum, Description: "Per-session reasoning passed through `model_reasoning_effort`.", Enum: codexReasoningEffortConfigEnum},
 	}}, nil
 }
@@ -122,6 +123,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
+	appendProfileFlag(&cmd, cfg.Config)
 	appendWorkspaceTrustFlag(&cmd, cfg.WorkspacePath)
 	appendModelAndReasoningFlags(&cmd, cfg.Config)
 
@@ -167,6 +169,7 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
+	appendProfileFlag(&cmd, cfg.Config)
 	appendWorkspaceTrustFlag(&cmd, cfg.Session.WorkspacePath)
 	appendModelAndReasoningFlags(&cmd, cfg.Config)
 	cmd = append(cmd, agentSessionID)
@@ -179,6 +182,12 @@ func appendModelAndReasoningFlags(cmd *[]string, cfg ports.AgentConfig) {
 	}
 	if cfg.ReasoningEffort != "" {
 		*cmd = append(*cmd, "-c", "model_reasoning_effort="+strconv.Quote(string(cfg.ReasoningEffort)))
+	}
+}
+
+func appendProfileFlag(cmd *[]string, cfg ports.AgentConfig) {
+	if profile := strings.TrimSpace(cfg.Profile); profile != "" {
+		*cmd = append(*cmd, "--profile", profile)
 	}
 }
 

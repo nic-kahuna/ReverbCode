@@ -76,6 +76,7 @@ type workspaceRepoDetails struct {
 // agentConfig mirrors the daemon's typed domain.AgentConfig for the CLI client.
 type agentConfig struct {
 	Model           string `json:"model,omitempty"`
+	Profile         string `json:"profile,omitempty"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 	Permissions     string `json:"permissions,omitempty"`
 }

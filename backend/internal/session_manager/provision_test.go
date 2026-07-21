@@ -119,12 +119,12 @@ func TestEffectiveHarnessAndAgentConfig(t *testing.T) {
 	}
 
 	// Role override merges over the base agent config (set fields win; unset keep base).
-	got := effectiveAgentConfig(domain.KindWorker, cfg, nil)
+	got := effectiveAgentConfig(domain.KindWorker, cfg, domain.HarnessCodex, nil)
 	if got.Model != "worker" || got.Permissions != domain.PermissionModeAuto {
 		t.Fatalf("merged worker config = %#v, want model=worker permissions=auto", got)
 	}
 	// Orchestrator has no agent-config override, so the base config is used as-is.
-	if got := effectiveAgentConfig(domain.KindOrchestrator, cfg, nil); got.Model != "base" {
+	if got := effectiveAgentConfig(domain.KindOrchestrator, cfg, domain.HarnessClaudeCode, nil); got.Model != "base" {
 		t.Fatalf("orchestrator config = %#v, want base", got)
 	}
 }

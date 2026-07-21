@@ -53,6 +53,8 @@ const (
 type AgentConfig struct {
 	// Model overrides the agent's default model (e.g. claude-opus-4-5).
 	Model string `json:"model,omitempty"`
+	// Profile selects a named provider configuration profile when supported.
+	Profile string `json:"profile,omitempty"`
 	// ReasoningEffort overrides the provider's default deliberation level.
 	ReasoningEffort ReasoningEffort `json:"reasoningEffort,omitempty"`
 	// Permissions sets the agent's starting permission mode. Empty is treated
@@ -69,6 +71,12 @@ func (c AgentConfig) IsZero() bool {
 // Validate rejects values outside the typed vocabulary so a bad config is
 // refused when it is set (CLI/API) rather than silently dropped at spawn.
 func (c AgentConfig) Validate() error {
+	if c.Profile != "" && !validAgentProfileName(c.Profile) {
+		return fmt.Errorf(
+			"invalid profile %q: use an ASCII letter or digit first, followed by letters, digits, underscore, or hyphen",
+			c.Profile,
+		)
+	}
 	if err := c.ReasoningEffort.Validate(); err != nil {
 		return err
 	}
@@ -78,4 +86,18 @@ func (c AgentConfig) Validate() error {
 	default:
 		return fmt.Errorf("invalid permissions %q: want one of default, accept-edits, auto, bypass-permissions", c.Permissions)
 	}
+}
+
+func validAgentProfileName(value string) bool {
+	for index, char := range value {
+		isAlphaNumeric := char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9'
+		if isAlphaNumeric {
+			continue
+		}
+		if index > 0 && (char == '_' || char == '-') {
+			continue
+		}
+		return false
+	}
+	return value != ""
 }

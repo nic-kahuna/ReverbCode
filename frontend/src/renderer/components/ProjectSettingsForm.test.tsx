@@ -119,11 +119,12 @@ describe("ProjectSettingsForm", () => {
 				postCreate: ["npm install"],
 				worker: {
 					agent: "codex",
-					agentConfig: { model: "worker-model" },
+					agentConfig: { model: "worker-model", profile: "ao-minimal" },
 				},
 				orchestrator: { agent: "claude-code" },
 				agentConfig: {
 					model: "claude-opus-4-5",
+					profile: "base-profile",
 					permissions: "auto",
 				},
 				reviewers: [{ harness: "claude-code" }],
@@ -170,11 +171,12 @@ describe("ProjectSettingsForm", () => {
 					postCreate: ["npm install"],
 					worker: {
 						agent: "opencode",
-						agentConfig: { model: "worker-model" },
+						agentConfig: { model: "worker-model", profile: "ao-minimal" },
 					},
 					orchestrator: { agent: "goose" },
 					agentConfig: {
 						model: "gpt-5-codex",
+						profile: "base-profile",
 						permissions: "bypass-permissions",
 					},
 					reviewers: [{ harness: "claude-code" }],
