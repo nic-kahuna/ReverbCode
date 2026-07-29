@@ -2,6 +2,24 @@ package tmux
 
 import "fmt"
 
+func controlShowOptionArgs(socket, option string) []string {
+	return []string{"-N", "-S", socket, "show-options", "-s", "-v", option}
+}
+
+func controlRetainArgs(socket string) []string {
+	return []string{"-N", "-S", socket, "set-option", "-s", "exit-empty", "off"}
+}
+
+func controlCreateArgs(socket, dataDir string) []string {
+	return []string{
+		"-S", socket, "-f", "/dev/null",
+		"start-server", ";",
+		"set-option", "-s", "exit-empty", "off", ";",
+		"set-option", "-s", "@ao-control-version", ControlServerVersion, ";",
+		"set-option", "-s", "@ao-control-data-dir", dataDir,
+	}
+}
+
 // newSessionArgs builds args for `tmux new-session -d -s <id> -x 220 -y 50
 // -c <cwd> <shell> -c <launchCmd>`. The shell -c form runs the launch command
 // inside the configured shell so exported env vars and quoting work correctly.
@@ -62,6 +80,12 @@ func sendKeysLiteralArgs(id, chunk string) []string {
 // queued input.
 func sendEnterArgs(id string) []string {
 	return []string{"send-keys", "-t", id, "Enter"}
+}
+
+// sendInterruptArgs builds args for `tmux send-keys -t <id> C-c` to interrupt
+// the foreground process without killing the terminal session.
+func sendInterruptArgs(id string) []string {
+	return []string{"send-keys", "-t", id, "C-c"}
 }
 
 // capturePaneArgs builds args for `tmux capture-pane -t <id> -p -S -<lines>`.

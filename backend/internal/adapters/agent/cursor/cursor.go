@@ -18,17 +18,15 @@ import (
 	"sync"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hookutil"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
-)
-
-const (
-	cursorTitleMetadataKey   = "title"
-	cursorSummaryMetadataKey = "summary"
 )
 
 // Plugin is the Cursor agent adapter. It is safe for concurrent use; the binary
 // path is resolved once and cached under binaryMu.
 type Plugin struct {
+	agentbase.Base
 	binaryMu       sync.Mutex
 	resolvedBinary string
 }
@@ -54,22 +52,20 @@ func (p *Plugin) Manifest() adapters.Manifest {
 	}
 }
 
-// GetConfigSpec reports the agent-specific config keys. Cursor exposes none yet.
-func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
-	if err := ctx.Err(); err != nil {
-		return ports.ConfigSpec{}, err
-	}
-	return ports.ConfigSpec{}, nil
-}
-
 // GetLaunchCommand builds the argv to start a new Cursor CLI session:
 //
-//	cursor-agent -p --output-format stream-json --trust [permission flags] <prompt>
+//	cursor-agent [permission flags] <prompt>
 //
-// `-p` runs print/non-interactive mode, `--output-format stream-json` emits the
-// machine-readable event stream AO consumes, and `--trust` skips the
-// workspace-trust prompt. The prompt is positional and must come last, so a
-// leading "-" is not read as a flag.
+// This runs cursor-agent in its normal interactive TUI mode (no -p/
+// --output-format, which are cursor-agent's headless/scripting flags and
+// would silence the interactive UI AO's terminal pane is meant to show).
+// `--trust` is deliberately NOT appended here: cursor-agent rejects it outside
+// print/headless mode ("--trust can only be used with --print/headless
+// mode"). Cursor has no interactive-mode equivalent to auto-skip the
+// workspace-trust prompt (open cursor-agent feature request), so a new
+// workspace's first interactive launch will show that prompt in the terminal
+// pane for the user to accept manually. The prompt is positional and must
+// come last, so a leading "-" is not read as a flag.
 //
 // Cursor has no inline/file system-prompt flag: it reads workspace rule files
 // (AGENTS.md, .cursor/rules, CLAUDE.md). SystemPrompt/SystemPromptFile are
@@ -80,7 +76,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 		return nil, err
 	}
 
-	cmd = []string{binary, "-p", "--output-format", "stream-json", "--trust"}
+	cmd = []string{binary}
 	appendApprovalFlags(&cmd, cfg.Permissions)
 
 	// Prompt is positional and must be last. The `--` sentinel ends option
@@ -92,23 +88,16 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	return cmd, nil
 }
 
-// GetPromptDeliveryStrategy reports that Cursor receives its prompt in the
-// launch command itself.
-func (p *Plugin) GetPromptDeliveryStrategy(ctx context.Context, cfg ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	return ports.PromptDeliveryInCommand, nil
-}
-
 // GetRestoreCommand rebuilds the argv that continues an existing Cursor CLI
 // session:
 //
-//	cursor-agent -p --output-format stream-json --trust [perm flags] --resume <id>
+//	cursor-agent [perm flags] --resume <id>
 //
-// ok is false when the hook-derived native session id has not landed yet, so
-// callers can fall back to fresh launch behavior. ports.RestoreConfig carries no
-// prompt, so none is appended.
+// Like GetLaunchCommand, this runs interactively (no -p/--output-format,
+// no --trust — see GetLaunchCommand for why) so resumed sessions render the
+// normal Cursor Agent TUI. ok is false when the hook-derived native session id
+// has not landed yet, so callers can fall back to fresh launch behavior.
+// ports.RestoreConfig carries no prompt, so none is appended.
 func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig) (cmd []string, ok bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -123,8 +112,8 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 		return nil, false, err
 	}
 
-	cmd = make([]string, 0, 10)
-	cmd = append(cmd, binary, "-p", "--output-format", "stream-json", "--trust")
+	cmd = make([]string, 0, 5)
+	cmd = append(cmd, binary)
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	cmd = append(cmd, "--resume", agentSessionID)
 	return cmd, true, nil
@@ -136,15 +125,8 @@ func (p *Plugin) SessionInfo(ctx context.Context, session ports.SessionRef) (por
 	if err := ctx.Err(); err != nil {
 		return ports.SessionInfo{}, false, err
 	}
-	info := ports.SessionInfo{
-		AgentSessionID: session.Metadata[ports.MetadataKeyAgentSessionID],
-		Title:          session.Metadata[cursorTitleMetadataKey],
-		Summary:        session.Metadata[cursorSummaryMetadataKey],
-	}
-	if info.AgentSessionID == "" && info.Title == "" && info.Summary == "" {
-		return ports.SessionInfo{}, false, nil
-	}
-	return info, true, nil
+	info, ok := agentbase.StandardSessionInfo(session)
+	return info, ok, nil
 }
 
 // ResolveCursorBinary returns the path to the cursor-agent binary on this
@@ -183,7 +165,7 @@ func ResolveCursorBinary(ctx context.Context) (string, error) {
 	)
 
 	for _, candidate := range candidates {
-		if fileExists(candidate) {
+		if hookutil.FileExists(candidate) {
 			return candidate, nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -211,7 +193,7 @@ func (p *Plugin) cursorBinary(ctx context.Context) (string, error) {
 }
 
 func appendApprovalFlags(cmd *[]string, permissions ports.PermissionMode) {
-	switch normalizePermissionMode(permissions) {
+	switch ports.NormalizePermissionMode(permissions) {
 	case ports.PermissionModeDefault:
 		// No flag: defer to the user's Cursor config approvalMode.
 	case ports.PermissionModeAcceptEdits:
@@ -220,23 +202,9 @@ func appendApprovalFlags(cmd *[]string, permissions ports.PermissionMode) {
 	case ports.PermissionModeAuto:
 		*cmd = append(*cmd, "--force")
 	case ports.PermissionModeBypassPermissions:
+		// --yolo is cursor-agent's documented alias for --force, not a
+		// stronger bypass: Cursor has no separate "full bypass" tier, so
+		// Auto and BypassPermissions are behaviorally identical here.
 		*cmd = append(*cmd, "--yolo")
 	}
-}
-
-func normalizePermissionMode(mode ports.PermissionMode) ports.PermissionMode {
-	switch mode {
-	case ports.PermissionModeDefault,
-		ports.PermissionModeAcceptEdits,
-		ports.PermissionModeAuto,
-		ports.PermissionModeBypassPermissions:
-		return mode
-	default:
-		return ports.PermissionModeDefault
-	}
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

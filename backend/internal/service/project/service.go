@@ -2,8 +2,9 @@ package project
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -11,9 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 // Manager is the controller-facing contract for the /api/v1/projects surface.
@@ -27,6 +30,9 @@ type Manager interface {
 
 	// Add registers a new project from a git repository path.
 	Add(ctx context.Context, in AddInput) (Project, error)
+
+	// InitializeRepository prepares a selected folder for project registration.
+	InitializeRepository(ctx context.Context, in InitializeRepositoryInput) (InitializeRepositoryResult, error)
 
 	// SetConfig replaces a project's per-project config, returning the updated
 	// read-model.
@@ -45,10 +51,11 @@ type SessionTeardowner interface {
 
 // Service implements project registration and lookup use-cases for controllers.
 type Service struct {
-	store     Store
-	sessions  SessionTeardowner
-	clock     func() time.Time
-	telemetry ports.EventSink
+	store          Store
+	sessions       SessionTeardowner
+	clock          func() time.Time
+	telemetry      ports.EventSink
+	defaultHarness domain.AgentHarness
 	// addMu serialises the whole body of Add. Workspace registration performs
 	// filesystem mutations (git init, .gitignore writes, commits) that are not
 	// covered by the store's own writeMu, so path/id conflict checks plus the
@@ -60,10 +67,13 @@ var _ Manager = (*Service)(nil)
 
 // Deps captures optional collaborators for project use-cases.
 type Deps struct {
-	Store     Store
-	Sessions  SessionTeardowner
-	Clock     func() time.Time
-	Telemetry ports.EventSink
+	// DefaultHarness is the daemon's configured default agent (AO_AGENT).
+	// When empty, the service falls back to config.DefaultAgent.
+	DefaultHarness domain.AgentHarness
+	Store          Store
+	Sessions       SessionTeardowner
+	Clock          func() time.Time
+	Telemetry      ports.EventSink
 }
 
 // New returns a project service backed by the given durable store.
@@ -73,7 +83,17 @@ func New(store Store) *Service {
 
 // NewWithDeps returns a project service with optional teardown dependencies.
 func NewWithDeps(d Deps) *Service {
-	s := &Service{store: d.Store, sessions: d.Sessions, clock: d.Clock, telemetry: d.Telemetry}
+	defaultHarness := d.DefaultHarness
+	if defaultHarness == "" {
+		defaultHarness = domain.AgentHarness(config.DefaultAgent)
+	}
+	s := &Service{
+		store:          d.Store,
+		sessions:       d.Sessions,
+		clock:          d.Clock,
+		telemetry:      d.Telemetry,
+		defaultHarness: defaultHarness,
+	}
 	if s.clock == nil {
 		s.clock = time.Now
 	}
@@ -89,11 +109,12 @@ func (m *Service) List(ctx context.Context) ([]Summary, error) {
 	out := make([]Summary, 0, len(projects))
 	for _, row := range projects {
 		out = append(out, Summary{
-			ID:            domain.ProjectID(row.ID),
-			Name:          displayName(row),
-			Path:          row.Path,
-			Kind:          row.Kind.WithDefault(),
-			SessionPrefix: resolveSessionPrefix(row),
+			ID:                domain.ProjectID(row.ID),
+			Name:              displayName(row),
+			Path:              row.Path,
+			Kind:              row.Kind.WithDefault(),
+			SessionPrefix:     resolveSessionPrefix(row),
+			OrchestratorAgent: row.Config.Orchestrator.Harness,
 		})
 	}
 	return out, nil
@@ -111,7 +132,7 @@ func (m *Service) Get(ctx context.Context, id domain.ProjectID) (GetResult, erro
 	if !ok || !row.ArchivedAt.IsZero() {
 		return GetResult{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
 	}
-	p := projectFromRow(row)
+	p := m.projectFromRow(row)
 	if row.Kind.WithDefault() == domain.ProjectKindWorkspace {
 		repos, err := m.store.ListWorkspaceRepos(ctx, row.ID)
 		if err != nil {
@@ -174,12 +195,12 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 		})
 	}
 
-	var config domain.ProjectConfig
+	var projectConfig domain.ProjectConfig
 	if in.Config != nil {
 		if err := in.Config.Validate(); err != nil {
 			return Project{}, apierr.Invalid("INVALID_PROJECT_CONFIG", err.Error(), nil)
 		}
-		config = *in.Config
+		projectConfig = *in.Config
 	}
 
 	registeredAt := time.Now()
@@ -189,7 +210,7 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 		DisplayName:  name,
 		RegisteredAt: registeredAt,
 		Kind:         domain.ProjectKindSingleRepo,
-		Config:       config,
+		Config:       projectConfig,
 	}
 	if in.AsWorkspace {
 		repos, err := prepareWorkspaceProject(ctx, path, domain.ProjectID(row.ID), registeredAt)
@@ -202,12 +223,18 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 			return Project{}, apierr.Internal("PROJECT_ADD_FAILED", "Failed to register workspace project")
 		}
 		m.emitProjectAdded(row, projectCountBefore == 0)
-		p := projectFromRow(row)
+		p := m.projectFromRow(row)
 		p.WorkspaceRepos = workspaceReposFromRecords(repos)
 		return p, nil
 	}
 	if !isGitRepo(path) {
-		return Project{}, apierr.Invalid("NOT_A_GIT_REPO", "Repository path must point to a git repository", nil)
+		return Project{}, apierr.Invalid("NOT_A_GIT_REPO", "AO needs a Git repository with an initial commit before it can create agent workspaces.", nil)
+	}
+	if !repoHasCommit(ctx, path) {
+		return Project{}, apierr.Invalid("PROJECT_UNBORN", "AO needs a Git repository with an initial commit before it can create agent workspaces.", map[string]any{
+			"path":         path,
+			"suggestedFix": "Run `git commit --allow-empty -m \"initial commit\"` in this folder, then try again.",
+		})
 	}
 	// Record the repo's actual checked-out branch as the project default so
 	// session worktrees base off a branch that exists. Without this a repo on
@@ -224,7 +251,224 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 		return Project{}, apierr.Internal("PROJECT_ADD_FAILED", "Failed to register project")
 	}
 	m.emitProjectAdded(row, projectCountBefore == 0)
-	return projectFromRow(row), nil
+	return m.projectFromRow(row), nil
+}
+
+type repositorySetupTarget int
+
+const (
+	repositorySetupPlainFolder repositorySetupTarget = iota
+	repositorySetupUnbornRepo
+)
+
+// InitializeRepository prepares a selected folder for project registration by ensuring it has an initial Git commit.
+func (m *Service) InitializeRepository(ctx context.Context, in InitializeRepositoryInput) (result InitializeRepositoryResult, retErr error) {
+	path, err := normalizePath(in.Path)
+	if err != nil {
+		return InitializeRepositoryResult{}, err
+	}
+	if err := ensureDirectoryPath(path); err != nil {
+		return InitializeRepositoryResult{}, err
+	}
+	if err := validateRepositorySetupPathSafety(path); err != nil {
+		return InitializeRepositoryResult{}, err
+	}
+
+	m.addMu.Lock()
+	defer m.addMu.Unlock()
+
+	target, err := classifyRepositorySetupTarget(ctx, path)
+	if err != nil {
+		return InitializeRepositoryResult{}, err
+	}
+
+	if err := rejectNestedGitRepositories(path); err != nil {
+		return InitializeRepositoryResult{}, err
+	}
+
+	if target == repositorySetupPlainFolder {
+		rollback := snapshotPlainFolderRepositorySetup(path)
+		defer func() {
+			if retErr != nil {
+				rollback()
+			}
+		}()
+		if _, err := gitOutput(ctx, path, "init", "-b", domain.DefaultBranchName); err != nil {
+			return InitializeRepositoryResult{}, apierr.Invalid("GIT_INIT_FAILED", "Could not initialize a Git repository in this folder.", map[string]any{"error": err.Error()})
+		}
+	}
+
+	if _, err := gitOutput(ctx, path, "add", "-A"); err != nil {
+		return InitializeRepositoryResult{}, apierr.Invalid("GIT_ADD_FAILED", "Could not stage files for the initial commit.", map[string]any{"error": err.Error()})
+	}
+	if _, err := gitOutput(ctx, path, "-c", "user.name=Agent Orchestrator", "-c", "user.email=ao@example.com", "commit", "--allow-empty", "-m", "initial commit"); err != nil {
+		return InitializeRepositoryResult{}, apierr.Invalid("INITIAL_COMMIT_FAILED", "Could not create the initial commit.", map[string]any{"error": err.Error()})
+	}
+	return InitializeRepositoryResult{Path: path}, nil
+}
+
+func classifyRepositorySetupTarget(ctx context.Context, path string) (repositorySetupTarget, error) {
+	if isBareGitRepository(ctx, path) {
+		return repositorySetupPlainFolder, apierr.Invalid("PROJECT_BARE_REPOSITORY", "Selected folder must be a non-bare Git repository or a plain folder.", map[string]any{
+			"path":         path,
+			"suggestedFix": "Use a normal checkout, or select a plain folder for AO to initialize.",
+		})
+	}
+
+	if isGitRepo(path) {
+		if repoHasCommit(ctx, path) {
+			return repositorySetupUnbornRepo, apierr.Conflict("PROJECT_ALREADY_INITIALIZED", "This repository already has commits.", map[string]any{"path": path})
+		}
+		return repositorySetupUnbornRepo, nil
+	}
+
+	if top, err := gitOutput(ctx, path, "rev-parse", "--show-toplevel"); err == nil {
+		root := normalizeGitReportedPath(path, strings.TrimSpace(top))
+		selected := comparablePath(path)
+		if !samePath(root, selected) {
+			return repositorySetupPlainFolder, apierr.Invalid("PROJECT_PATH_NOT_REPO_ROOT", "Selected folder is inside a Git repository. Select the repository root instead.", map[string]any{
+				"path":         path,
+				"repoRoot":     root,
+				"suggestedFix": "Select the repository root folder, then try again.",
+			})
+		}
+		return repositorySetupPlainFolder, apierr.Invalid("UNSUPPORTED_GIT_REPO", "Selected folder contains an unsupported Git repository layout.", map[string]any{"path": path})
+	}
+
+	if hasGitMetadata(path) {
+		return repositorySetupPlainFolder, apierr.Invalid("UNSUPPORTED_GIT_REPO", "Selected folder contains Git metadata that AO could not inspect.", map[string]any{
+			"path":         path,
+			"suggestedFix": "Repair the Git repository or select a plain folder.",
+		})
+	}
+
+	return repositorySetupPlainFolder, nil
+}
+
+func validateRepositorySetupPathSafety(path string) error {
+	clean := comparablePath(path)
+	if isFilesystemRoot(clean) {
+		return unsafeRepositorySetupPathError(path, "filesystem root")
+	}
+
+	home, _ := os.UserHomeDir()
+	if strings.TrimSpace(home) == "" {
+		return nil
+	}
+	home = comparablePath(home)
+	if samePath(clean, home) {
+		return unsafeRepositorySetupPathError(path, "home directory")
+	}
+
+	for _, broadName := range []string{"Desktop", "Documents", "Downloads"} {
+		if samePath(clean, comparablePath(filepath.Join(home, broadName))) {
+			return unsafeRepositorySetupPathError(path, strings.ToLower(broadName)+" directory")
+		}
+	}
+
+	aoState := comparablePath(filepath.Join(home, ".ao"))
+	if samePath(clean, aoState) || isDescendantPath(clean, aoState) {
+		return unsafeRepositorySetupPathError(path, "AO state directory")
+	}
+	return nil
+}
+
+func unsafeRepositorySetupPathError(path, reason string) error {
+	return apierr.Invalid("PROJECT_SETUP_PATH_UNSAFE", "Selected folder is too broad for automatic Git setup.", map[string]any{
+		"path":         path,
+		"reason":       reason,
+		"suggestedFix": "Select a specific project folder instead.",
+	})
+}
+
+func isFilesystemRoot(path string) bool {
+	clean := filepath.Clean(path)
+	return filepath.Dir(clean) == clean
+}
+
+func isDescendantPath(path, parent string) bool {
+	rel, err := filepath.Rel(parent, path)
+	if err != nil || rel == "." || rel == "" || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func snapshotPlainFolderRepositorySetup(path string) func() {
+	gitignorePath := filepath.Join(path, ".gitignore")
+	originalGitignore, readErr := os.ReadFile(gitignorePath)
+	gitignoreExisted := readErr == nil
+	gitignoreMissing := errors.Is(readErr, os.ErrNotExist)
+	gitignoreMode := fs.FileMode(0o600)
+	if gitignoreExisted {
+		if info, err := os.Stat(gitignorePath); err == nil {
+			gitignoreMode = info.Mode().Perm()
+		}
+	}
+
+	return func() {
+		_ = os.RemoveAll(filepath.Join(path, ".git"))
+		if gitignoreExisted {
+			_ = os.WriteFile(gitignorePath, originalGitignore, gitignoreMode)
+		} else if gitignoreMissing {
+			_ = os.Remove(gitignorePath)
+		}
+	}
+}
+
+func rejectNestedGitRepositories(path string) error {
+	nested, err := nestedGitRepositoryPaths(path)
+	if err != nil {
+		return apierr.Invalid("PROJECT_NESTED_REPO_SCAN_FAILED", "Selected folder could not be inspected for nested Git repositories.", map[string]any{
+			"path":  path,
+			"error": err.Error(),
+		})
+	}
+	if len(nested) == 0 {
+		return nil
+	}
+	return apierr.Invalid("PROJECT_NESTED_GIT_REPOSITORY", "Selected folder contains nested Git repositories. Select the project repository directly or import the parent folder as a workspace.", map[string]any{
+		"path":               path,
+		"nestedRepositories": nested,
+		"suggestedFix":       "Select one nested repository directly, or import the parent folder as a workspace.",
+	})
+}
+
+func nestedGitRepositoryPaths(root string) ([]string, error) {
+	root = filepath.Clean(root)
+	rootGitPath := filepath.Join(root, ".git")
+	var nested []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root || entry.Name() != ".git" {
+			return nil
+		}
+
+		clean := filepath.Clean(path)
+		if samePath(comparablePath(clean), comparablePath(rootGitPath)) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		repoPath := filepath.Dir(clean)
+		rel, err := filepath.Rel(root, repoPath)
+		if err != nil {
+			rel = repoPath
+		}
+		nested = append(nested, filepath.ToSlash(rel))
+		if entry.IsDir() {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return nested, nil
 }
 
 func (m *Service) activeProjectCount(ctx context.Context) (int, error) {
@@ -286,7 +530,7 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 	if err := m.store.UpsertProject(ctx, row); err != nil {
 		return Project{}, apierr.Internal("PROJECT_CONFIG_UPDATE_FAILED", "Failed to update project config")
 	}
-	return projectFromRow(row), nil
+	return m.projectFromRow(row), nil
 }
 
 // resolveGitOriginURL returns the project's `origin` remote URL via
@@ -294,7 +538,7 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 // other git error returns an empty string — `project add` must not fail just
 // because no origin is configured (the SCM observer skips such projects).
 func resolveGitOriginURL(path string) string {
-	out, err := exec.Command("git", "-C", path, "remote", "get-url", "origin").Output()
+	out, err := aoprocess.Command("git", "-C", path, "remote", "get-url", "origin").Output()
 	if err != nil {
 		return ""
 	}
@@ -313,14 +557,14 @@ func resolveGitOriginURL(path string) string {
 // returns an empty string — `project add` must not fail just because the branch
 // can't be resolved (the caller falls back to DefaultBranchName).
 func resolveDefaultBranch(path string) string {
-	if out, err := exec.Command(
+	if out, err := aoprocess.Command(
 		"git", "-C", path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD",
 	).Output(); err == nil {
 		if ref := strings.TrimSpace(string(out)); ref != "" {
 			return strings.TrimPrefix(ref, "origin/")
 		}
 	}
-	out, err := exec.Command("git", "-C", path, "symbolic-ref", "--short", "HEAD").Output()
+	out, err := aoprocess.Command("git", "-C", path, "symbolic-ref", "--short", "HEAD").Output()
 	if err != nil {
 		return ""
 	}
@@ -365,7 +609,7 @@ func (m *Service) suggestID(ctx context.Context, base domain.ProjectID) domain.P
 	}
 }
 
-func projectFromRow(row domain.ProjectRecord) Project {
+func (m *Service) projectFromRow(row domain.ProjectRecord) Project {
 	p := Project{
 		ID:            domain.ProjectID(row.ID),
 		Name:          displayName(row),
@@ -373,12 +617,18 @@ func projectFromRow(row domain.ProjectRecord) Project {
 		Path:          row.Path,
 		Repo:          row.RepoOriginURL,
 		DefaultBranch: row.Config.WithDefaults().DefaultBranch,
+		Agent:         string(m.defaultHarness),
 	}
-	if !row.Config.IsZero() {
-		cfg := row.Config
-		p.Config = &cfg
-	}
+	p.Config = projectConfigPtr(row.Config)
 	return p
+}
+
+func projectConfigPtr(projectConfig domain.ProjectConfig) *domain.ProjectConfig {
+	if projectConfig.IsZero() {
+		return nil
+	}
+	cfg := projectConfig
+	return &cfg
 }
 
 func displayName(row domain.ProjectRecord) string {
@@ -411,8 +661,59 @@ func normalizePath(raw string) (string, error) {
 	return filepath.Clean(abs), nil
 }
 
+func ensureDirectoryPath(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return apierr.Invalid("INVALID_PATH", "Selected folder could not be read", map[string]any{"path": path})
+	}
+	if !info.IsDir() {
+		return apierr.Invalid("INVALID_PATH", "Selected path must be a folder", map[string]any{"path": path})
+	}
+	return nil
+}
+
+func repoHasCommit(ctx context.Context, path string) bool {
+	_, err := gitOutput(ctx, path, "rev-parse", "--verify", "HEAD")
+	return err == nil
+}
+
+func isBareGitRepository(ctx context.Context, path string) bool {
+	out, err := gitOutput(ctx, path, "rev-parse", "--is-bare-repository")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+func hasGitMetadata(path string) bool {
+	_, err := os.Lstat(filepath.Join(path, ".git"))
+	return err == nil || !errors.Is(err, os.ErrNotExist)
+}
+
+func normalizeGitReportedPath(base, reported string) string {
+	if reported == "" {
+		return comparablePath(reported)
+	}
+	if !filepath.IsAbs(reported) {
+		reported = filepath.Join(base, reported)
+	}
+	return comparablePath(reported)
+}
+
+func comparablePath(path string) string {
+	clean := filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		clean = resolved
+	}
+	return filepath.Clean(clean)
+}
+
+func samePath(a, b string) bool {
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	return a == b
+}
+
 func isGitRepo(path string) bool {
-	cmd := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel")
+	cmd := aoprocess.Command("git", "-C", path, "rev-parse", "--show-toplevel")
 	out, err := cmd.Output()
 	if err != nil {
 		return false

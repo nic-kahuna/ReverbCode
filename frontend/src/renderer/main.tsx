@@ -1,3 +1,4 @@
+import "./lib/apply-initial-theme";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
@@ -8,9 +9,11 @@ import { queryClient } from "./lib/query-client";
 import { createAppRouter } from "./router";
 import { TelemetryBoundary } from "./components/TelemetryBoundary";
 import { initTelemetry } from "./lib/telemetry";
+import { startDaemonFailureTelemetry } from "./lib/daemon-telemetry";
 
 const router = createAppRouter(queryClient);
 void initTelemetry();
+startDaemonFailureTelemetry();
 
 declare module "@tanstack/react-router" {
 	interface Register {

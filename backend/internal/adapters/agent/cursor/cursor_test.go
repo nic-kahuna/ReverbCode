@@ -30,7 +30,6 @@ func TestGetLaunchCommandBuildsArgv(t *testing.T) {
 	// leading "-" is not parsed as a flag.
 	want := []string{
 		"cursor-agent",
-		"-p", "--output-format", "stream-json", "--trust",
 		"--yolo",
 		"--", "-fix this",
 	}
@@ -49,7 +48,7 @@ func TestGetLaunchCommandOmitsPromptWhenEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"cursor-agent", "-p", "--output-format", "stream-json", "--trust"}
+	want := []string{"cursor-agent"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("unexpected command\nwant: %#v\n got: %#v", want, cmd)
 	}
@@ -113,7 +112,7 @@ func TestGetLaunchCommandMapsApprovalModes(t *testing.T) {
 }
 
 func TestGetPromptDeliveryStrategyIsInCommand(t *testing.T) {
-	plugin := &Plugin{resolvedBinary: "cursor-agent"}
+	plugin := &Plugin{}
 
 	got, err := plugin.GetPromptDeliveryStrategy(context.Background(), ports.LaunchConfig{})
 	if err != nil {
@@ -125,7 +124,7 @@ func TestGetPromptDeliveryStrategyIsInCommand(t *testing.T) {
 }
 
 func TestGetConfigSpecHasNoCustomFieldsYet(t *testing.T) {
-	plugin := &Plugin{resolvedBinary: "cursor-agent"}
+	plugin := &Plugin{}
 
 	spec, err := plugin.GetConfigSpec(context.Background())
 	if err != nil {
@@ -153,7 +152,6 @@ func TestGetRestoreCommandReadsAgentSessionID(t *testing.T) {
 	}
 	want := []string{
 		"cursor-agent",
-		"-p", "--output-format", "stream-json", "--trust",
 		"--force",
 		"--resume", "chat-123",
 	}
@@ -200,8 +198,8 @@ func TestSessionInfoReadsHookMetadata(t *testing.T) {
 		WorkspacePath: "/some/path",
 		Metadata: map[string]string{
 			ports.MetadataKeyAgentSessionID: "chat-123",
-			cursorTitleMetadataKey:          "Fix login redirect",
-			cursorSummaryMetadataKey:        "Updated the auth callback and tests.",
+			ports.MetadataKeyTitle:          "Fix login redirect",
+			ports.MetadataKeySummary:        "Updated the auth callback and tests.",
 			"ignored":                       "not returned",
 		},
 	})

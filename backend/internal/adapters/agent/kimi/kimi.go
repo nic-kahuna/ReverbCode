@@ -1,11 +1,13 @@
 // Package kimi implements the Kimi CLI (Moonshot AI) agent adapter: launching
-// new non-interactive sessions and resuming sessions when a native Kimi session
-// id is known.
+// new interactive sessions and resuming sessions when a native Kimi session id
+// is known.
 //
 // Kimi CLI (binary "kimi") is Moonshot AI's terminal-native agentic coding
-// agent. A new task is run non-interactively with `kimi -p <prompt>`, which
-// streams the assistant output to stdout without opening the TUI. Sessions are
-// resumed by id with `kimi --session <id>`.
+// agent. AO launches Kimi sessions interactively as `kimi [--auto|-y]` and
+// delivers prompted worker tasks after startup through the runtime pane. Kimi's
+// `-p/--prompt` mode is intentionally avoided for AO workers because it is
+// non-interactive and streams transcript output without opening the TUI.
+// Sessions are resumed by id with `kimi --session <id>`.
 //
 // Kimi exposes no native lifecycle/hook system and is not documented as
 // Claude Code hook-compatible, so this is a Tier C adapter: hook installation
@@ -17,15 +19,13 @@ package kimi
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/binaryutil"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -34,6 +34,7 @@ const adapterID = "kimi"
 // Plugin is the Kimi CLI agent adapter. It is safe for concurrent use; the
 // binary path is resolved once and cached under binaryMu.
 type Plugin struct {
+	agentbase.Base
 	binaryMu       sync.Mutex
 	resolvedBinary string
 }
@@ -59,26 +60,14 @@ func (p *Plugin) Manifest() adapters.Manifest {
 	}
 }
 
-// GetConfigSpec reports no agent-specific config keys yet.
-func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
-	if err := ctx.Err(); err != nil {
-		return ports.ConfigSpec{}, err
-	}
-	return ports.ConfigSpec{}, nil
-}
-
 // GetLaunchCommand builds the argv to start a new Kimi session:
 //
-//	kimi -p <prompt>                            (non-interactive, default)
-//	kimi [--yolo|--auto]                        (interactive, no prompt)
+//	kimi [--auto|-y]                            (interactive)
 //
-// When a prompt is supplied, it is delivered via `-p` (in command), which runs
-// a single prompt without opening the TUI. Per Kimi docs, `--prompt` cannot be
-// combined with `--yolo`, `--auto`, or `--plan` — non-interactive mode already
-// uses the `auto` permission policy by default, so approval flags would be
-// rejected at startup. They are only emitted on the (interactive) path with no
-// prompt. Kimi has no documented system-prompt flag, so cfg.SystemPrompt /
-// cfg.SystemPromptFile are not injected.
+// Prompted tasks are delivered after startup by the session manager rather than
+// via `-p`, so the dashboard keeps the interactive Kimi TUI instead of a plain
+// transcript stream. Kimi has no documented system-prompt flag, so
+// cfg.SystemPrompt / cfg.SystemPromptFile are not injected.
 func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (cmd []string, err error) {
 	binary, err := p.kimiBinary(ctx)
 	if err != nil {
@@ -86,29 +75,33 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	}
 
 	cmd = []string{binary}
-
-	if cfg.Prompt != "" {
-		cmd = append(cmd, "-p", cfg.Prompt)
-		return cmd, nil
-	}
-
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	return cmd, nil
 }
 
-// GetPromptDeliveryStrategy reports that Kimi receives its prompt in the launch
-// command itself.
-func (p *Plugin) GetPromptDeliveryStrategy(ctx context.Context, cfg ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
+// GetPromptDeliveryStrategy reports that AO should inject prompted Kimi tasks
+// into the interactive terminal after startup. Kimi's `-p/--prompt` mode is
+// non-interactive and does not open the TUI.
+func (p *Plugin) GetPromptDeliveryStrategy(ctx context.Context, _ ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return ports.PromptDeliveryInCommand, nil
+	return ports.PromptDeliveryAfterStart, nil
 }
 
-// GetAgentHooks is intentionally a no-op: Kimi CLI exposes no native hook system
-// and is not documented as Claude Code hook-compatible.
-func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfig) error {
-	return ctx.Err()
+// PromptReadinessHints waits for Kimi's interactive prompt before AO injects
+// the worker's first task.
+func (p *Plugin) PromptReadinessHints(ctx context.Context, _ ports.LaunchConfig) (ports.PromptReadinessHints, error) {
+	if err := ctx.Err(); err != nil {
+		return ports.PromptReadinessHints{}, err
+	}
+	return ports.PromptReadinessHints{
+		InitialDelay: 750 * time.Millisecond,
+		Patterns:     []string{"│ >"},
+		PollInterval: 200 * time.Millisecond,
+		Timeout:      8 * time.Second,
+		Lines:        80,
+	}, nil
 }
 
 // GetRestoreCommand rebuilds the argv that continues an existing Kimi session
@@ -118,8 +111,8 @@ func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfi
 //
 // ok is false when no native session id has been captured, so callers fall back
 // to fresh launch behavior. Per Kimi docs, `--yolo` and `--auto` cannot be
-// combined with `--session` (or `--continue`) — resumed sessions inherit the
-// approval settings of the original session — so cfg.Permissions is
+// combined with `--session` (or `--continue`) -- resumed sessions inherit the
+// approval settings of the original session -- so cfg.Permissions is
 // intentionally ignored here. Kimi has no lifecycle hook for AO to capture the
 // native session id from yet, so in practice this returns ok=false today.
 func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig) (cmd []string, ok bool, err error) {
@@ -137,15 +130,6 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	}
 	cmd = []string{binary, "--session", agentSessionID}
 	return cmd, true, nil
-}
-
-// SessionInfo is intentionally a no-op until Kimi exposes a way to capture its
-// native session id and display metadata.
-func (p *Plugin) SessionInfo(ctx context.Context, session ports.SessionRef) (ports.SessionInfo, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return ports.SessionInfo{}, false, err
-	}
-	return ports.SessionInfo{}, false, nil
 }
 
 // appendApprovalFlags maps AO's permission modes onto Kimi's approval flags
@@ -181,72 +165,25 @@ func normalizePermissionMode(mode ports.PermissionMode) ports.PermissionMode {
 	}
 }
 
+var kimiBinarySpec = binaryutil.BinarySpec{
+	Label:         "kimi",
+	Names:         []string{"kimi"},
+	WinNames:      []string{"kimi.cmd", "kimi.exe", "kimi"},
+	UnixPaths:     []string{"/usr/local/bin/kimi", "/opt/homebrew/bin/kimi"},
+	UnixHomePaths: [][]string{{".local", "bin", "kimi"}, {".cargo", "bin", "kimi"}},
+	WinPaths: []binaryutil.WinPath{
+		{Base: binaryutil.WinAppData, Parts: []string{"npm", "kimi.cmd"}},
+		{Base: binaryutil.WinAppData, Parts: []string{"npm", "kimi.exe"}},
+		{Base: binaryutil.WinHome, Parts: []string{".local", "bin", "kimi.exe"}},
+	},
+}
+
 // ResolveKimiBinary finds the `kimi` binary, searching PATH then common install
 // locations (the uv tool/curl installer drops it in ~/.local/bin, plus Homebrew
 // and ~/.cargo/bin). It returns "kimi" as a last resort so callers get the
 // shell's normal command-not-found behavior if Kimi is absent.
 func ResolveKimiBinary(ctx context.Context) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	if runtime.GOOS == "windows" {
-		for _, name := range []string{"kimi.cmd", "kimi.exe", "kimi"} {
-			if path, err := exec.LookPath(name); err == nil && path != "" {
-				return path, nil
-			}
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-		candidates := []string{}
-		if appData := os.Getenv("APPDATA"); appData != "" {
-			candidates = append(candidates,
-				filepath.Join(appData, "npm", "kimi.cmd"),
-				filepath.Join(appData, "npm", "kimi.exe"),
-			)
-		}
-		if home, err := os.UserHomeDir(); err == nil {
-			candidates = append(candidates,
-				filepath.Join(home, ".local", "bin", "kimi.exe"),
-			)
-		}
-		for _, candidate := range candidates {
-			if fileExists(candidate) {
-				return candidate, nil
-			}
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-		return "", fmt.Errorf("kimi: %w", ports.ErrAgentBinaryNotFound)
-	}
-
-	if path, err := exec.LookPath("kimi"); err == nil && path != "" {
-		return path, nil
-	}
-
-	candidates := []string{
-		"/usr/local/bin/kimi",
-		"/opt/homebrew/bin/kimi",
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(home, ".local", "bin", "kimi"),
-			filepath.Join(home, ".cargo", "bin", "kimi"),
-		)
-	}
-
-	for _, candidate := range candidates {
-		if fileExists(candidate) {
-			return candidate, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-	}
-
-	return "", fmt.Errorf("kimi: %w", ports.ErrAgentBinaryNotFound)
+	return binaryutil.ResolveBinary(ctx, kimiBinarySpec)
 }
 
 func (p *Plugin) kimiBinary(ctx context.Context) (string, error) {
@@ -263,9 +200,4 @@ func (p *Plugin) kimiBinary(ctx context.Context) (string, error) {
 	}
 	p.resolvedBinary = binary
 	return binary, nil
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

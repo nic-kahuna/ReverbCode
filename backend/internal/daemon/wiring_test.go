@@ -150,7 +150,7 @@ func TestWiring_StartSessionBuildsSessionService(t *testing.T) {
 	lcm := lifecycle.New(store, nil)
 	cfg := config.Config{DataDir: t.TempDir()}
 
-	rt := runtimeselect.New(nil)
+	rt := runtimeselect.New(nil, cfg.DataDir)
 	messenger := newSessionMessenger(store, rt, log)
 	svc, reviewSvc, lc, err := startSession(cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
 	if err != nil {
@@ -164,6 +164,58 @@ func TestWiring_StartSessionBuildsSessionService(t *testing.T) {
 	}
 	if lc == nil {
 		t.Fatal("startSession returned nil session lifecycle")
+	}
+}
+
+// TestStartTrackerIntake_RunsEvenWithoutEnabledProjects is a regression test:
+// startTrackerIntake used to scan projects once at call time and skip starting
+// the observer loop entirely when none had intake enabled yet. Poll() itself
+// already re-reads project config on every tick, so a project enabling
+// intake after daemon boot was silently never picked up until a restart. The
+// loop must always start; Poll is what decides whether there's work to do.
+func TestStartTrackerIntake_RunsEvenWithoutEnabledProjects(t *testing.T) {
+	store, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	lcm := lifecycle.New(store, nil)
+	cfg := config.Config{DataDir: t.TempDir()}
+	rt := runtimeselect.New(nil, cfg.DataDir)
+	messenger := newSessionMessenger(store, rt, log)
+	svc, _, _, err := startSession(cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
+	if err != nil {
+		t.Fatalf("startSession: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTrackerIntake(ctx, store, svc, log)
+
+	select {
+	case <-done:
+		t.Fatal("startTrackerIntake returned an already-closed channel; observer loop did not start")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("observer did not stop after context cancellation")
+	}
+}
+
+func TestTrackerTokenSourcePrefersAOGitHubToken(t *testing.T) {
+	t.Setenv("AO_GITHUB_TOKEN", "ao-token")
+	t.Setenv("GITHUB_TOKEN", "github-token")
+	token, err := (&trackerTokenSource{}).Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "ao-token" {
+		t.Fatalf("token = %q, want AO_GITHUB_TOKEN", token)
 	}
 }
 
@@ -381,16 +433,14 @@ func TestProjectRepoResolver_ResolvesRegisteredProject(t *testing.T) {
 	}
 }
 
-// fakeSessionLifecycle records calls to Reconcile, RestoreAll, and
-// SaveAndTeardownAll so tests can assert the daemon wiring invokes the correct
-// methods without needing a real runtime or worktree.
+// fakeSessionLifecycle records calls to Reconcile and RestoreAll so tests can
+// assert the daemon wiring invokes the correct methods without needing a real
+// runtime or worktree.
 type fakeSessionLifecycle struct {
-	reconcileCalled       bool
-	restoreAllCalled      bool
-	saveAndTeardownCalled bool
-	reconcileErr          error
-	restoreErr            error
-	saveErr               error
+	reconcileCalled  bool
+	restoreAllCalled bool
+	reconcileErr     error
+	restoreErr       error
 }
 
 func (f *fakeSessionLifecycle) Reconcile(_ context.Context) error {
@@ -403,16 +453,10 @@ func (f *fakeSessionLifecycle) RestoreAll(_ context.Context) error {
 	return f.restoreErr
 }
 
-func (f *fakeSessionLifecycle) SaveAndTeardownAll(_ context.Context) error {
-	f.saveAndTeardownCalled = true
-	return f.saveErr
-}
-
 // TestWiring_SessionLifecycleInterfaceInvokedByDaemon asserts the
 // sessionLifecycle interface is satisfied by *sessionmanager.Manager (compile
-// check) and that Reconcile, RestoreAll, and SaveAndTeardownAll dispatch
-// correctly through the interface, matching what daemon.go wires at
-// boot/shutdown.
+// check) and that Reconcile and RestoreAll dispatch correctly through the
+// interface, matching what daemon.go wires at boot.
 func TestWiring_SessionLifecycleInterfaceInvokedByDaemon(t *testing.T) {
 	// Verify *sessionmanager.Manager satisfies the interface at compile time.
 	var _ sessionLifecycle = (*sessionmanager.Manager)(nil)
@@ -436,12 +480,5 @@ func TestWiring_SessionLifecycleInterfaceInvokedByDaemon(t *testing.T) {
 	}
 	if !fake.restoreAllCalled {
 		t.Fatal("RestoreAll was not called through the interface")
-	}
-
-	if err := sl.SaveAndTeardownAll(ctx); err != nil {
-		t.Fatalf("SaveAndTeardownAll: %v", err)
-	}
-	if !fake.saveAndTeardownCalled {
-		t.Fatal("SaveAndTeardownAll was not called through the interface")
 	}
 }

@@ -5,8 +5,8 @@
 // hook installation (which writes .claude/settings.local.json with AO
 // hook commands). Grok will pick them up via its compat layer.
 //
-// Launch uses `-p <prompt>` for the initial task (in-command delivery).
-// Permission bypass uses `--always-approve`. We also pass `--no-auto-update`
+// Launch uses a positional prompt for the initial task (in-command delivery).
+// Permission handling uses `--permission-mode`. We also pass `--no-auto-update`
 // for headless/scripted use (parity with Codex no-update).
 // Restore prefers the hook-captured native session id via `-r <id>`.
 //
@@ -16,21 +16,32 @@ package grok
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/binaryutil"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/claudecode"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+var grokBinarySpec = binaryutil.BinarySpec{
+	Label:         "grok",
+	Names:         []string{"grok"},
+	WinNames:      []string{"grok.cmd", "grok.exe", "grok"},
+	UnixPaths:     []string{"/usr/local/bin/grok", "/opt/homebrew/bin/grok"},
+	UnixHomePaths: [][]string{{".grok", "bin", "grok"}, {".local", "bin", "grok"}},
+	WinPaths: []binaryutil.WinPath{
+		{Base: binaryutil.WinAppData, Parts: []string{"npm", "grok.cmd"}},
+		{Base: binaryutil.WinAppData, Parts: []string{"npm", "grok.exe"}},
+		{Base: binaryutil.WinHome, Parts: []string{".grok", "bin", "grok.exe"}},
+	},
+}
+
 // Plugin is the Grok Build agent adapter.
 type Plugin struct {
+	agentbase.Base
 	binaryMu       sync.Mutex
 	resolvedBinary string
 }
@@ -56,16 +67,8 @@ func (p *Plugin) Manifest() adapters.Manifest {
 	}
 }
 
-// GetConfigSpec reports no agent-specific config keys yet.
-func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
-	if err := ctx.Err(); err != nil {
-		return ports.ConfigSpec{}, err
-	}
-	return ports.ConfigSpec{}, nil
-}
-
-// GetLaunchCommand builds `grok --no-auto-update [--permission-mode <mode>] -p <prompt>`.
-// Prompt is delivered via -p (in command).
+// GetLaunchCommand builds `grok --no-auto-update [--permission-mode <mode>] [-- prompt]`.
+// Prompt is delivered positionally so Grok starts an interactive coding session.
 //
 // Uses --permission-mode (acceptEdits / auto / bypassPermissions) to match
 // `grok -h` output. Default omits the flag so Grok uses its config.
@@ -79,18 +82,10 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	appendApprovalFlags(&cmd, cfg.Permissions)
 
 	if cfg.Prompt != "" {
-		cmd = append(cmd, "-p", cfg.Prompt)
+		cmd = append(cmd, "--", cfg.Prompt)
 	}
 
 	return cmd, nil
-}
-
-// GetPromptDeliveryStrategy reports that the prompt is delivered in the launch command.
-func (p *Plugin) GetPromptDeliveryStrategy(ctx context.Context, cfg ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	return ports.PromptDeliveryInCommand, nil
 }
 
 // GetAgentHooks reuses the Claude Code hook installer because Grok Build
@@ -166,81 +161,13 @@ func (p *Plugin) SessionInfo(ctx context.Context, session ports.SessionRef) (por
 	if err := ctx.Err(); err != nil {
 		return ports.SessionInfo{}, false, err
 	}
-	// The keys written by claude hooks (which we install for grok too).
-	info := ports.SessionInfo{
-		AgentSessionID: session.Metadata[ports.MetadataKeyAgentSessionID],
-		Title:          session.Metadata[ports.MetadataKeyTitle],
-		Summary:        session.Metadata[ports.MetadataKeySummary],
-	}
-	if info.AgentSessionID == "" && info.Title == "" && info.Summary == "" {
-		return ports.SessionInfo{}, false, nil
-	}
-	return info, true, nil
+	info, ok := agentbase.StandardSessionInfo(session)
+	return info, ok, nil
 }
 
 // ResolveGrokBinary finds the `grok` binary (xAI Grok Build CLI).
 func ResolveGrokBinary(ctx context.Context) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	if runtime.GOOS == "windows" {
-		for _, name := range []string{"grok.cmd", "grok.exe", "grok"} {
-			if path, err := exec.LookPath(name); err == nil && path != "" {
-				return path, nil
-			}
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-		candidates := []string{}
-		if appData := os.Getenv("APPDATA"); appData != "" {
-			candidates = append(candidates,
-				filepath.Join(appData, "npm", "grok.cmd"),
-				filepath.Join(appData, "npm", "grok.exe"),
-			)
-		}
-		if home, err := os.UserHomeDir(); err == nil {
-			candidates = append(candidates,
-				filepath.Join(home, ".grok", "bin", "grok.exe"),
-			)
-		}
-		for _, candidate := range candidates {
-			if fileExists(candidate) {
-				return candidate, nil
-			}
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-		return "", fmt.Errorf("grok: %w", ports.ErrAgentBinaryNotFound)
-	}
-
-	if path, err := exec.LookPath("grok"); err == nil && path != "" {
-		return path, nil
-	}
-
-	candidates := []string{
-		"/usr/local/bin/grok",
-		"/opt/homebrew/bin/grok",
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(home, ".grok", "bin", "grok"),
-			filepath.Join(home, ".local", "bin", "grok"),
-		)
-	}
-
-	for _, candidate := range candidates {
-		if fileExists(candidate) {
-			return candidate, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-	}
-
-	return "", fmt.Errorf("grok: %w", ports.ErrAgentBinaryNotFound)
+	return binaryutil.ResolveBinary(ctx, grokBinarySpec)
 }
 
 func (p *Plugin) grokBinary(ctx context.Context) (string, error) {
@@ -260,7 +187,7 @@ func (p *Plugin) grokBinary(ctx context.Context) (string, error) {
 }
 
 func appendApprovalFlags(cmd *[]string, permissions ports.PermissionMode) {
-	switch normalizePermissionMode(permissions) {
+	switch ports.NormalizePermissionMode(permissions) {
 	case ports.PermissionModeDefault:
 		// No flag: defer to the user's ~/.grok/config.toml (or default behavior).
 	case ports.PermissionModeAcceptEdits:
@@ -270,21 +197,4 @@ func appendApprovalFlags(cmd *[]string, permissions ports.PermissionMode) {
 	case ports.PermissionModeBypassPermissions:
 		*cmd = append(*cmd, "--permission-mode", "bypassPermissions")
 	}
-}
-
-func normalizePermissionMode(mode ports.PermissionMode) ports.PermissionMode {
-	switch mode {
-	case ports.PermissionModeDefault,
-		ports.PermissionModeAcceptEdits,
-		ports.PermissionModeAuto,
-		ports.PermissionModeBypassPermissions:
-		return mode
-	default:
-		return ports.PermissionModeDefault
-	}
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

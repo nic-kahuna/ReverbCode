@@ -55,6 +55,8 @@ func Build() ([]byte, error) {
 		*(&openapi31.Server{URL: "http://127.0.0.1:3001"}).WithDescription("Local daemon (loopback only)"),
 	}
 	r.Spec.Tags = []openapi31.Tag{
+		*(&openapi31.Tag{Name: "agents"}).WithDescription(
+			"Supported and locally runnable agent adapters"),
 		*(&openapi31.Tag{Name: "projects"}).WithDescription(
 			"Project registry, configuration, and lifecycle administration"),
 		*(&openapi31.Tag{Name: "sessions"}).WithDescription(
@@ -67,6 +69,10 @@ func Build() ([]byte, error) {
 			"Durable dashboard notifications"),
 		*(&openapi31.Tag{Name: "events"}).WithDescription(
 			"Server-sent CDC event stream with durable replay"),
+		*(&openapi31.Tag{Name: "import"}).WithDescription(
+			"Legacy AO project import (availability probe and run)"),
+		*(&openapi31.Tag{Name: "mobile"}).WithDescription(
+			"Connect Mobile LAN bridge control (loopback/desktop only)"),
 	}
 
 	for _, op := range operations() {
@@ -122,16 +128,18 @@ var schemaNames = map[string]string{
 	// httpd/envelope
 	"EnvelopeAPIError": "APIError",
 	// domain
-	"DomainProjectID":     "ProjectID",
-	"DomainSessionID":     "SessionID",
-	"DomainIssueID":       "IssueID",
-	"DomainSession":       "Session",
-	"DomainProjectConfig": "ProjectConfig",
-	"DomainAgentConfig":   "AgentConfig",
-	"DomainRoleOverride":  "RoleOverride",
+	"DomainProjectID":           "ProjectID",
+	"DomainSessionID":           "SessionID",
+	"DomainIssueID":             "IssueID",
+	"DomainSession":             "Session",
+	"DomainProjectConfig":       "ProjectConfig",
+	"DomainTrackerIntakeConfig": "TrackerIntakeConfig",
+	"DomainAgentConfig":         "AgentConfig",
+	"DomainRoleOverride":        "RoleOverride",
 	// httpd/controllers (wire envelopes)
 	"ControllersListProjectsResponse":             "ListProjectsResponse",
 	"ControllersProjectResponse":                  "ProjectResponse",
+	"ControllersAgentIDParam":                     "AgentIDParam",
 	"ControllersGetProjectResponse":               "ProjectGetResponse",
 	"ControllersProjectOrDegraded":                "ProjectOrDegraded",
 	"ControllersListSessionsQuery":                "ListSessionsQuery",
@@ -167,6 +175,9 @@ var schemaNames = map[string]string{
 	"ControllersSpawnOrchestratorRequest":         "SpawnOrchestratorRequest",
 	"ControllersSpawnOrchestratorResponse":        "SpawnOrchestratorResponse",
 	"ControllersOrchestratorResponse":             "OrchestratorResponse",
+	"AgentInventory":                              "ListAgentsResponse",
+	"AgentInfo":                                   "AgentInfo",
+	"AgentProbeResult":                            "ProbeAgentResponse",
 	"ControllersListNotificationsQuery":           "ListNotificationsQuery",
 	"ControllersNotificationStreamQuery":          "NotificationStreamQuery",
 	"ControllersNotificationIDParam":              "NotificationIDParam",
@@ -181,19 +192,32 @@ var schemaNames = map[string]string{
 	"ControllersResolveCommentsRequest":  "ResolveCommentsRequest",
 	"ControllersResolveCommentsResponse": "ResolveCommentsResponse",
 	// httpd/controllers — review wire envelopes
-	"ControllersListReviewsResponse": "ListReviewsResponse",
-	"ControllersReviewRunResponse":   "ReviewRunResponse",
-	"ControllersSubmitReviewInput":   "SubmitReviewInput",
+	"ControllersListReviewsResponse":   "ListReviewsResponse",
+	"ControllersReviewRunResponse":     "ReviewRunResponse",
+	"ControllersTriggerReviewResponse": "TriggerReviewResponse",
+	"ControllersCancelReviewResponse":  "CancelReviewResponse",
+	"ControllersSubmitReviewItem":      "SubmitReviewItem",
+	"ControllersSubmitReviewInput":     "SubmitReviewInput",
 	// domain review entities
-	"DomainReviewRun": "ReviewRun",
+	"DomainReviewRun":     "ReviewRun",
+	"ReviewPRReviewState": "PRReviewState",
+	// httpd/controllers: import wire envelopes
+	"ControllersImportStatusResponse": "ImportStatusResponse",
+	"ControllersImportRunResponse":    "ImportRunResponse",
+	// httpd/controllers: mobile wire envelopes
+	"ControllersMobileStatusResponse": "MobileStatusResponse",
+	// legacyimport report
+	"LegacyimportReport": "ImportReport",
 	// service/project entities + DTOs
-	"ProjectProject":        "Project",
-	"ProjectSummary":        "ProjectSummary",
-	"ProjectDegraded":       "DegradedProject",
-	"ProjectAddInput":       "AddProjectInput",
-	"ProjectRemoveResult":   "RemoveProjectResult",
-	"ProjectSetConfigInput": "SetProjectConfigInput",
-	"ProjectWorkspaceRepo":  "WorkspaceRepo",
+	"ProjectProject":                    "Project",
+	"ProjectSummary":                    "ProjectSummary",
+	"ProjectDegraded":                   "DegradedProject",
+	"ProjectAddInput":                   "AddProjectInput",
+	"ProjectInitializeRepositoryInput":  "InitializeRepositoryInput",
+	"ProjectInitializeRepositoryResult": "InitializeRepositoryResult",
+	"ProjectRemoveResult":               "RemoveProjectResult",
+	"ProjectSetConfigInput":             "SetProjectConfigInput",
+	"ProjectWorkspaceRepo":              "WorkspaceRepo",
 }
 
 // markRequestBodyRequired sets requestBody.required: true on the operation's
@@ -268,12 +292,119 @@ type operation struct {
 
 func operations() []operation {
 	ops := append([]operation{}, eventOperations()...)
+	ops = append(ops, agentOperations()...)
 	ops = append(ops, projectOperations()...)
 	ops = append(ops, sessionOperations()...)
 	ops = append(ops, prOperations()...)
 	ops = append(ops, reviewOperations()...)
 	ops = append(ops, notificationOperations()...)
+	ops = append(ops, importOperations()...)
+	ops = append(ops, mobileOperations()...)
 	return ops
+}
+
+func agentOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodGet, path: "/api/v1/agents", id: "listAgents", tag: "agents",
+			summary: "Return cached supported and locally installed agent adapters",
+			resps: []respUnit{
+				{http.StatusOK, controllers.ListAgentsResponse{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/agents/refresh", id: "refreshAgents", tag: "agents",
+			summary: "Refresh the cached local agent adapter catalog",
+			resps: []respUnit{
+				{http.StatusOK, controllers.RefreshAgentsResponse{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/agents/{agent}/probe", id: "probeAgent", tag: "agents",
+			summary:    "Run a fresh local readiness probe for one agent adapter",
+			pathParams: []any{controllers.AgentIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.ProbeAgentResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+	}
+}
+
+// mobileOperations declares the 4 /mobile control operations. These are
+// mounted on the loopback router (mountMobile in router.go), not the REST
+// /api/v1 group — only the desktop/CLI may enable, disable, or regenerate the
+// phone's LAN access; the phone never toggles its own connection. Must stay
+// 1:1 with the routes mountMobile registers (enforced by the parity test).
+func mobileOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodGet, path: "/api/v1/mobile/status", id: "getMobileStatus", tag: "mobile",
+			summary: "Check whether Connect Mobile's LAN bridge is enabled",
+			resps: []respUnit{
+				{http.StatusOK, controllers.MobileStatusResponse{}},
+				{http.StatusForbidden, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/mobile/enable", id: "enableMobile", tag: "mobile",
+			summary: "Enable the Connect Mobile LAN bridge and issue a fresh password",
+			resps: []respUnit{
+				{http.StatusOK, controllers.MobileStatusResponse{}},
+				{http.StatusForbidden, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/mobile/disable", id: "disableMobile", tag: "mobile",
+			summary: "Disable the Connect Mobile LAN bridge",
+			resps: []respUnit{
+				{http.StatusOK, controllers.MobileStatusResponse{}},
+				{http.StatusForbidden, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/mobile/regenerate", id: "regenerateMobile", tag: "mobile",
+			summary: "Rotate the Connect Mobile password, dropping any connected phone",
+			resps: []respUnit{
+				{http.StatusOK, controllers.MobileStatusResponse{}},
+				{http.StatusForbidden, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+	}
+}
+
+// importOperations declares the 2 /import operations. Must stay 1:1 with
+// the routes ImportController.Register mounts (enforced by the parity test).
+func importOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodGet, path: "/api/v1/import", id: "getImportStatus", tag: "import",
+			summary: "Check whether a legacy AO install is available to import",
+			resps: []respUnit{
+				{http.StatusOK, controllers.ImportStatusResponse{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/import", id: "runImport", tag: "import",
+			summary: "Run the legacy AO project import through the daemon store",
+			resps: []respUnit{
+				{http.StatusOK, controllers.ImportRunResponse{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+	}
 }
 
 func notificationOperations() []operation {
@@ -345,8 +476,19 @@ func reviewOperations() []operation {
 			summary:    "Trigger a code review of a worker's PR",
 			pathParams: []any{controllers.SessionIDParam{}},
 			resps: []respUnit{
-				{http.StatusOK, controllers.ReviewRunResponse{}},
-				{http.StatusCreated, controllers.ReviewRunResponse{}},
+				{http.StatusOK, controllers.TriggerReviewResponse{}},
+				{http.StatusCreated, controllers.TriggerReviewResponse{}},
+				{http.StatusUnprocessableEntity, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/reviews/cancel", id: "cancelReview", tag: "reviews",
+			summary:    "Cancel a running code review",
+			pathParams: []any{controllers.SessionIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.CancelReviewResponse{}},
 				{http.StatusUnprocessableEntity, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusNotImplemented, envelope.APIError{}},
@@ -414,6 +556,16 @@ func projectOperations() []operation {
 			},
 		},
 		{
+			method: http.MethodPost, path: "/api/v1/projects/initialize", id: "initializeProjectRepository", tag: "projects",
+			summary: "Initialize a selected folder as a Git repository with an initial commit",
+			reqBody: projectsvc.InitializeRepositoryInput{},
+			resps: []respUnit{
+				{http.StatusOK, projectsvc.InitializeRepositoryResult{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		}, {
 			method: http.MethodGet, path: "/api/v1/projects/{id}", id: "getProject", tag: "projects",
 			summary:    "Fetch one project; discriminates ok vs degraded",
 			pathParams: []any{controllers.ProjectIDParam{}},
@@ -620,6 +772,10 @@ func sessionOperations() []operation {
 				{http.StatusOK, controllers.SendSessionMessageResponse{}},
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
+				// Conflict: the session is terminated, or paused on a permission
+				// decision (SESSION_AWAITING_DECISION) — the guarded send refuses
+				// to paste into a pending dialog.
+				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},
 		},

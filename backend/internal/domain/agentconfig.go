@@ -2,6 +2,34 @@ package domain
 
 import "fmt"
 
+// ReasoningEffort is the provider-neutral deliberation level AO can pass to a
+// supported agent adapter. The vocabulary is the union exposed by the current
+// Claude Code and Codex CLIs; adapters may reject values their provider does
+// not support.
+type ReasoningEffort string
+
+// Supported provider-neutral reasoning-effort values.
+const (
+	ReasoningEffortLow    ReasoningEffort = "low"
+	ReasoningEffortMedium ReasoningEffort = "medium"
+	ReasoningEffortHigh   ReasoningEffort = "high"
+	ReasoningEffortXHigh  ReasoningEffort = "xhigh"
+	ReasoningEffortMax    ReasoningEffort = "max"
+	ReasoningEffortUltra  ReasoningEffort = "ultra"
+)
+
+// Validate rejects misspelled or unknown effort values before a session row or
+// workspace is created. Provider-specific compatibility is checked by the
+// selected adapter.
+func (e ReasoningEffort) Validate() error {
+	switch e {
+	case "", ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh, ReasoningEffortXHigh, ReasoningEffortMax, ReasoningEffortUltra:
+		return nil
+	default:
+		return fmt.Errorf("invalid reasoning effort %q: want one of low, medium, high, xhigh, max, ultra", e)
+	}
+}
+
 // PermissionMode controls how much review an agent requires before acting. It
 // lives in domain (not ports) so the typed AgentConfig can carry it; ports
 // re-exports it as a type alias so agent adapters keep referring to
@@ -25,6 +53,10 @@ const (
 type AgentConfig struct {
 	// Model overrides the agent's default model (e.g. claude-opus-4-5).
 	Model string `json:"model,omitempty"`
+	// Profile selects a named provider configuration profile when supported.
+	Profile string `json:"profile,omitempty"`
+	// ReasoningEffort overrides the provider's default deliberation level.
+	ReasoningEffort ReasoningEffort `json:"reasoningEffort,omitempty"`
 	// Permissions sets the agent's starting permission mode. Empty is treated
 	// like the adapter's default mode.
 	Permissions PermissionMode `json:"permissions,omitempty"`
@@ -39,10 +71,33 @@ func (c AgentConfig) IsZero() bool {
 // Validate rejects values outside the typed vocabulary so a bad config is
 // refused when it is set (CLI/API) rather than silently dropped at spawn.
 func (c AgentConfig) Validate() error {
+	if c.Profile != "" && !validAgentProfileName(c.Profile) {
+		return fmt.Errorf(
+			"invalid profile %q: use an ASCII letter or digit first, followed by letters, digits, underscore, or hyphen",
+			c.Profile,
+		)
+	}
+	if err := c.ReasoningEffort.Validate(); err != nil {
+		return err
+	}
 	switch c.Permissions {
 	case "", PermissionModeDefault, PermissionModeAcceptEdits, PermissionModeAuto, PermissionModeBypassPermissions:
 		return nil
 	default:
 		return fmt.Errorf("invalid permissions %q: want one of default, accept-edits, auto, bypass-permissions", c.Permissions)
 	}
+}
+
+func validAgentProfileName(value string) bool {
+	for index, char := range value {
+		isAlphaNumeric := char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9'
+		if isAlphaNumeric {
+			continue
+		}
+		if index > 0 && (char == '_' || char == '-') {
+			continue
+		}
+		return false
+	}
+	return value != ""
 }

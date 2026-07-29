@@ -3,6 +3,7 @@ package ports
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
@@ -10,9 +11,25 @@ import (
 // ErrAgentBinaryNotFound is returned by agent adapters when neither PATH nor
 // any well-known install location holds the agent's binary. The session
 // manager surfaces this BEFORE creating the runtime so a missing CLI doesn't
-// silently launch into an empty zellij pane that the reaper later mistakes
+// silently launch into an empty tmux pane that the reaper later mistakes
 // for a live session.
 var ErrAgentBinaryNotFound = errors.New("agent: binary not found on PATH")
+
+// AgentAuthStatus describes the result of a short local auth probe for an
+// installed agent. It is advisory only: credentials, quota, selected model
+// availability, or CLI state can still fail at session spawn/model-call time.
+type AgentAuthStatus string
+
+const (
+	// AgentAuthStatusAuthorized means the local auth probe recently passed.
+	// It does not guarantee that a later spawn or model call will succeed.
+	AgentAuthStatusAuthorized AgentAuthStatus = "authorized"
+	// AgentAuthStatusUnauthorized means the agent is installed but its local
+	// auth probe reported missing or invalid authentication.
+	AgentAuthStatusUnauthorized AgentAuthStatus = "unauthorized"
+	// AgentAuthStatusUnknown means the daemon could not determine auth status.
+	AgentAuthStatusUnknown AgentAuthStatus = "unknown"
+)
 
 // Agent is the contract every CLI coding agent adapter (claude-code, codex, …)
 // must satisfy. It supplies the argv and process configuration the Session
@@ -42,12 +59,82 @@ type Agent interface {
 	SessionInfo(ctx context.Context, session SessionRef) (info SessionInfo, ok bool, err error)
 }
 
+// AgentAuthChecker is the optional capability for adapters whose native CLI has
+// a cheap local authentication status probe.
+type AgentAuthChecker interface {
+	AuthStatus(ctx context.Context) (AgentAuthStatus, error)
+}
+
+// AgentConfigValidator is the optional pre-spawn validation capability for
+// adapters with provider-specific model or reasoning-effort rules. Session
+// Manager invokes it before creating durable session state or a workspace.
+type AgentConfigValidator interface {
+	ValidateAgentConfig(ctx context.Context, cfg AgentConfig) error
+}
+
+// AgentBinaryResolver is the optional capability adapters expose when their
+// binary can be checked without constructing a real session launch command.
+type AgentBinaryResolver interface {
+	ResolveBinary(ctx context.Context) (path string, err error)
+}
+
+// AgentPromptReadinessProvider is an optional capability for interactive
+// adapters that receive their first task after startup. It lets AO wait until a
+// terminal UI is ready before injecting text through the runtime.
+type AgentPromptReadinessProvider interface {
+	PromptReadinessHints(ctx context.Context, cfg LaunchConfig) (PromptReadinessHints, error)
+}
+
+// PromptReadinessHints describes when an after-start prompt should be sent.
+// Empty hints mean "send immediately" to preserve existing adapter behavior.
+type PromptReadinessHints struct {
+	InitialDelay time.Duration
+	Patterns     []string
+	PollInterval time.Duration
+	Timeout      time.Duration
+	Lines        int
+}
+
 // AgentResolver maps a session's harness onto the Agent adapter that drives it,
 // so the Session Manager can spawn (and restore) a different agent per session
 // without depending on the concrete adapter registry. ok=false means no adapter
 // is registered for that harness.
 type AgentResolver interface {
 	Agent(harness domain.AgentHarness) (Agent, bool)
+}
+
+// ActivitySignaler is an OPTIONAL capability an Agent adapter may implement to
+// describe which durable activity signals its harness actually produces under
+// AO's headless launch. The Session Manager gates best-effort post-send
+// confirmation on it — see the two methods.
+//
+// EmitsSubmitActivity reports whether the harness emits a prompt-submit signal
+// (one that flips Activity.State to active). Without it the confirm loop could
+// never observe active and would only burn its budget on spurious Enter nudges.
+//
+// EmitsBlockedActivity reports whether the harness emits a decision-pause
+// signal (a permission/approval prompt that flips Activity.State to blocked)
+// AND can clear that state before the turn ends — which requires the
+// pre/post-tool-use trio so lifecycle can correlate the approved tool's post
+// with the dialog that blocked the session. The Enter-only nudge is only SAFE
+// when this is true: a harness that submits but cannot report blocked leaves
+// the confirm loop unable to tell an unsubmitted draft from a pending
+// permission dialog, so an Enter meant to resubmit the draft could instead
+// answer the dialog. confirmActive therefore requires BOTH signals before it
+// will nudge.
+//
+// Only claude-code satisfies both halves: it installs the pre/post-tool-use
+// trio that lets lifecycle correlate the approved tool's post with the dialog
+// and clear blocked before the turn ends. codex maps permission-request to
+// waiting_input and opts out (no tool trio → blocked could not be cleared).
+// Every other harness simply does not implement this interface; it maps its
+// permission signal to waiting_input via the shared deriver and gets the
+// paste settle delay but no confirm loop. Adapters that later gain a
+// correlatable blocked signal implement this interface to opt in; see the
+// fork/archive/blocked-mappings branch for the prior 13-harness mapping set.
+type ActivitySignaler interface {
+	EmitsSubmitActivity() bool
+	EmitsBlockedActivity() bool
 }
 
 // MetadataKeyAgentSessionID is the SessionRef.Metadata key that carries an
@@ -100,11 +187,21 @@ const (
 
 // LaunchConfig carries inputs needed to build a new agent launch command.
 type LaunchConfig struct {
-	Config           AgentConfig
-	IssueID          string
-	Permissions      PermissionMode
-	Prompt           string
-	SessionID        string
+	Config      AgentConfig
+	DataDir     string
+	IssueID     string
+	Kind        domain.SessionKind
+	Permissions PermissionMode
+	Prompt      string
+	SessionID   string
+	// AllowedTools and DisallowedTools scope the agent to a tool allowlist when
+	// it runs in a non-bypass permission mode (allow rules auto-approve, deny
+	// rules auto-reject). They are the enforced read-only guarantee the reviewer
+	// relies on: bypassPermissions ignores both lists, so a restricted launch
+	// must leave Permissions off bypass. Empty means no restriction, so worker
+	// sessions are unaffected.
+	AllowedTools     []string
+	DisallowedTools  []string
 	SystemPrompt     string
 	SystemPromptFile string
 	WorkspacePath    string
@@ -115,12 +212,14 @@ type WorkspaceHookConfig struct {
 	Config        AgentConfig
 	DataDir       string
 	SessionID     string
+	SystemPrompt  string
 	WorkspacePath string
 }
 
 // RestoreConfig carries inputs needed to continue an existing native agent session.
 type RestoreConfig struct {
 	Config      AgentConfig
+	Kind        domain.SessionKind
 	Permissions PermissionMode
 	Session     SessionRef
 	// SystemPrompt carries the session's standing instructions (e.g. the
@@ -160,11 +259,28 @@ const (
 	PermissionModeBypassPermissions = domain.PermissionModeBypassPermissions
 )
 
+// NormalizePermissionMode collapses an empty or unrecognized mode to
+// PermissionModeDefault, leaving the four known modes unchanged. Adapters call
+// it so a stored value they don't recognize defers to the agent's own config
+// (usually by emitting no flag) rather than mapping onto a bogus one.
+func NormalizePermissionMode(mode PermissionMode) PermissionMode {
+	switch mode {
+	case PermissionModeDefault,
+		PermissionModeAcceptEdits,
+		PermissionModeAuto,
+		PermissionModeBypassPermissions:
+		return mode
+	default:
+		return PermissionModeDefault
+	}
+}
+
 // PromptDeliveryStrategy describes how AO should deliver the initial prompt.
 type PromptDeliveryStrategy string
 
 // How the orchestrator hands the initial prompt to a freshly launched agent.
 const (
-	PromptDeliveryInCommand  PromptDeliveryStrategy = "in_command"
-	PromptDeliveryAfterStart PromptDeliveryStrategy = "after_start"
+	PromptDeliveryInCommand   PromptDeliveryStrategy = "in_command"
+	PromptDeliveryAfterStart  PromptDeliveryStrategy = "after_start"
+	PromptDeliveryCustomAgent PromptDeliveryStrategy = "custom_agent"
 )

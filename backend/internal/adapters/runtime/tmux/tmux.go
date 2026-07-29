@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -23,6 +24,14 @@ import (
 const (
 	defaultTimeout    = 5 * time.Second
 	defaultChunkBytes = 16 * 1024
+	// ControlServerVersion marks AO's separate sessionless tmux control server.
+	// External launchers must require this exact version and data-directory
+	// marker before asking the server to fork a protected-folder reader.
+	ControlServerVersion = "1"
+	// defaultEnterDelay mirrors conpty's ptyInputEnterDelay: a pause after pasting
+	// a non-empty message, before the trailing Enter, so a large multiline paste
+	// does not absorb the Enter and leave the prompt unsubmitted (issue #2342).
+	defaultEnterDelay = 300 * time.Millisecond
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -32,20 +41,26 @@ var getenv = os.Getenv
 // Options configures a tmux Runtime. Every field has a sensible default (see
 // New), so the zero value is usable.
 type Options struct {
-	Binary    string        // default "tmux" (resolved via exec.LookPath)
-	Shell     string        // default $SHELL else /bin/sh
-	Timeout   time.Duration // default 5s
-	ChunkSize int           // default 16*1024
+	Binary        string        // default "tmux" (resolved via exec.LookPath)
+	Shell         string        // default $SHELL else /bin/sh
+	CommandDir    string        // cwd for tmux client processes; default system temp dir
+	ControlSocket string        // dedicated sessionless control socket; default <CommandDir>/tmux-control.sock
+	Timeout       time.Duration // default 5s
+	ChunkSize     int           // default 16*1024
+	EnterDelay    time.Duration // pause after pasting a non-empty message before pressing Enter; default defaultEnterDelay. Conpty already does this (ptyInputEnterDelay); tmux lacked it, so a large multiline paste could absorb the trailing Enter and leave the prompt unsubmitted (issue #2342).
 }
 
 // Runtime runs agent sessions inside tmux sessions, driving them via the tmux
 // CLI. It implements ports.Runtime.
 type Runtime struct {
-	binary    string
-	shell     string
-	timeout   time.Duration
-	chunkSize int
-	runner    runner
+	binary         string
+	shell          string
+	timeout        time.Duration
+	chunkSize      int
+	enterDelay     time.Duration
+	controlSocket  string
+	controlDataDir string
+	runner         runner
 }
 
 var _ ports.Runtime = (*Runtime)(nil)
@@ -55,10 +70,13 @@ type runner interface {
 	Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error)
 }
 
-type execRunner struct{}
+type execRunner struct {
+	dir string
+}
 
-func (execRunner) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+func (r execRunner) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = r.dir
 	cmd.Env = append(append([]string(nil), os.Environ()...), env...)
 	return cmd.CombinedOutput()
 }
@@ -90,13 +108,82 @@ func New(opts Options) *Runtime {
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkBytes
 	}
-	return &Runtime{
-		binary:    binary,
-		shell:     shellPath,
-		timeout:   timeout,
-		chunkSize: chunkSize,
-		runner:    execRunner{},
+	enterDelay := opts.EnterDelay
+	if enterDelay <= 0 {
+		enterDelay = defaultEnterDelay
 	}
+	commandDir := opts.CommandDir
+	if commandDir == "" {
+		commandDir = os.TempDir()
+	}
+	controlDataDir := commandDir
+	if absolute, err := filepath.Abs(controlDataDir); err == nil {
+		controlDataDir = absolute
+	}
+	if resolved, err := filepath.EvalSymlinks(controlDataDir); err == nil {
+		controlDataDir = resolved
+	}
+	controlSocket := opts.ControlSocket
+	if controlSocket == "" {
+		controlSocket = filepath.Join(controlDataDir, "tmux-control.sock")
+	}
+	return &Runtime{
+		binary:         binary,
+		shell:          shellPath,
+		timeout:        timeout,
+		chunkSize:      chunkSize,
+		enterDelay:     enterDelay,
+		controlSocket:  controlSocket,
+		controlDataDir: controlDataDir,
+		runner:         execRunner{dir: commandDir},
+	}
+}
+
+// EnsureControlServer creates and retains a separate AO-owned tmux server even
+// when it has no sessions. Existing runtime sessions remain on the default
+// socket. An existing unmarked or mismatched control socket is rejected rather
+// than adopted because its macOS TCC responsibility may belong to another app.
+func (r *Runtime) EnsureControlServer(ctx context.Context) error {
+	out, err := r.run(ctx, controlShowOptionArgs(r.controlSocket, "@ao-control-version")...)
+	if err == nil {
+		version := strings.TrimSpace(string(out))
+		if version != ControlServerVersion {
+			return fmt.Errorf("tmux runtime: control server version = %q, want %q", version, ControlServerVersion)
+		}
+		if err := r.verifyControlServerDataDir(ctx); err != nil {
+			return err
+		}
+		if _, err := r.run(ctx, controlRetainArgs(r.controlSocket)...); err != nil {
+			return fmt.Errorf("tmux runtime: retain control server: %w", err)
+		}
+		return nil
+	}
+	if !sessionMissingOutput(string(out)) {
+		return fmt.Errorf("tmux runtime: inspect control server version: %w", err)
+	}
+
+	if _, err := r.run(ctx, controlCreateArgs(r.controlSocket, r.controlDataDir)...); err != nil {
+		return fmt.Errorf("tmux runtime: create control server: %w", err)
+	}
+	out, err = r.run(ctx, controlShowOptionArgs(r.controlSocket, "@ao-control-version")...)
+	if err != nil {
+		return fmt.Errorf("tmux runtime: verify control server version: %w", err)
+	}
+	if version := strings.TrimSpace(string(out)); version != ControlServerVersion {
+		return fmt.Errorf("tmux runtime: verified version = %q, want %q", version, ControlServerVersion)
+	}
+	return r.verifyControlServerDataDir(ctx)
+}
+
+func (r *Runtime) verifyControlServerDataDir(ctx context.Context) error {
+	out, err := r.run(ctx, controlShowOptionArgs(r.controlSocket, "@ao-control-data-dir")...)
+	if err != nil {
+		return fmt.Errorf("tmux runtime: inspect control server data dir: %w", err)
+	}
+	if dataDir := strings.TrimSpace(string(out)); dataDir != r.controlDataDir {
+		return fmt.Errorf("tmux runtime: control server data dir = %q, want %q", dataDir, r.controlDataDir)
+	}
+	return nil
 }
 
 // Create starts a new tmux session in the workspace, running the agent's
@@ -190,7 +277,8 @@ func (r *Runtime) IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool
 }
 
 // SendMessage sends literal text to the session (chunked via send-keys -l) then
-// presses Enter to submit.
+// presses Enter to submit. An empty message presses Enter alone (the nudge
+// contract on ports.AgentMessenger).
 //
 // ponytail: send-keys -l chunked is simpler than load-buffer/paste-buffer; the
 // ceiling is very large messages may be slower, but chunk size defaults to 16 KB
@@ -200,13 +288,49 @@ func (r *Runtime) SendMessage(ctx context.Context, handle ports.RuntimeHandle, m
 	if err != nil {
 		return err
 	}
-	for _, chunk := range chunks(message, r.chunkSize) {
-		if _, err := r.run(ctx, sendKeysLiteralArgs(id, chunk)...); err != nil {
-			return fmt.Errorf("tmux runtime: send message %s: %w", id, err)
+	enterCtx := ctx
+	if message != "" {
+		for _, chunk := range chunks(message, r.chunkSize) {
+			if _, err := r.run(ctx, sendKeysLiteralArgs(id, chunk)...); err != nil {
+				return fmt.Errorf("tmux runtime: send message %s: %w", id, err)
+			}
+		}
+		// Give the target TUI a moment to accept the pasted text before the
+		// trailing Enter, mirroring conpty's ptyInputEnterDelay. Without it a
+		// large multiline paste can absorb the Enter and leave the prompt
+		// unsubmitted (issue #2342). Empty-message nudges skip this — there is
+		// no paste ahead of a catch-up Enter.
+		//
+		// From here on the chunks are already in the pane, so the pause and
+		// the Enter are detached from the caller's cancellation (bounded by
+		// their own timeout instead): abandoning mid-pause would strand an
+		// unsubmitted draft that a retried send would then double-paste.
+		var cancel context.CancelFunc
+		enterCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), r.enterDelay+5*time.Second)
+		defer cancel()
+		if r.enterDelay > 0 {
+			select {
+			case <-enterCtx.Done():
+				return enterCtx.Err()
+			case <-time.After(r.enterDelay):
+			}
 		}
 	}
-	if _, err := r.run(ctx, sendEnterArgs(id)...); err != nil {
+	if _, err := r.run(enterCtx, sendEnterArgs(id)...); err != nil {
 		return fmt.Errorf("tmux runtime: send enter %s: %w", id, err)
+	}
+	return nil
+}
+
+// Interrupt sends Ctrl-C to the foreground process without destroying the tmux
+// session, keeping the terminal available for inspection and reuse.
+func (r *Runtime) Interrupt(ctx context.Context, handle ports.RuntimeHandle) error {
+	id, err := handleID(handle)
+	if err != nil {
+		return err
+	}
+	if _, err := r.run(ctx, sendInterruptArgs(id)...); err != nil {
+		return fmt.Errorf("tmux runtime: interrupt session %s: %w", id, err)
 	}
 	return nil
 }
@@ -236,17 +360,44 @@ func (r *Runtime) Attach(ctx context.Context, handle ports.RuntimeHandle, rows, 
 	if err != nil {
 		return nil, err
 	}
-	return ptyexec.Spawn(ctx, argv, nil, rows, cols)
+	return ptyexec.Spawn(ctx, argv, attachEnv(os.Environ()), rows, cols)
 }
 
 // attachCommand returns the argv to attach a terminal to the session.
 // tmux needs no per-session env block.
+//
+// -u forces tmux's client-side CLIENT_UTF8 flag on. Without it, tmux infers
+// UTF-8 capability from LC_ALL/LC_CTYPE/LANG in the attaching process's env
+// (see tmux's main()); AO's daemon is typically started without an
+// interactive shell's locale, so that inference silently fails. A non-UTF8
+// client makes tmux's tty_check_codeset (tty.c) replace any character it
+// can't map through the legacy ACS table with underscores matching the
+// glyph's display width. Box-drawing glyphs are in that ACS table so they
+// still looked fine; agent CLI status icons outside it (e.g. Claude Code's
+// spinner "✻" U+273B, its "⎿" U+23BF continuation marker) were silently
+// rewritten to "_", which is the underscore corruption reported in #2484.
+// Confirmed byte-for-byte: attaching with a stripped, locale-less env
+// reproduces "_ _ _" for those glyphs; adding -u fixes it, with no observable
+// difference for the still-correct box-drawing case. AO already treats the
+// PTY byte stream as UTF-8 end to end, so forcing the flag is always
+// correct here regardless of the daemon's own environment.
 func (r *Runtime) attachCommand(handle ports.RuntimeHandle) ([]string, error) {
 	id, err := handleID(handle)
 	if err != nil {
 		return nil, err
 	}
-	return []string{r.binary, "attach-session", "-t", id}, nil
+	return []string{r.binary, "-u", "attach-session", "-t", id}, nil
+}
+
+func attachEnv(base []string) []string {
+	env := append([]string(nil), base...)
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "TERM=") {
+			env[i] = "TERM=xterm-256color"
+			return env
+		}
+	}
+	return append(env, "TERM=xterm-256color")
 }
 
 // run wraps runner.Run with a per-call timeout context.

@@ -2,7 +2,9 @@ package tmux
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,81 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+func TestControlServerIntegration(t *testing.T) {
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux unavailable")
+	}
+
+	dataDir := t.TempDir()
+	socketFile, err := os.CreateTemp("", "ao-control-*.sock")
+	if err != nil {
+		t.Fatalf("reserve control socket path: %v", err)
+	}
+	socket := socketFile.Name()
+	if err := socketFile.Close(); err != nil {
+		t.Fatalf("close control socket placeholder: %v", err)
+	}
+	if err := os.Remove(socket); err != nil {
+		t.Fatalf("remove control socket placeholder: %v", err)
+	}
+	r := New(Options{Binary: tmuxPath, CommandDir: dataDir, ControlSocket: socket, Timeout: 5 * time.Second})
+	t.Cleanup(func() {
+		_ = exec.Command(tmuxPath, "-N", "-S", socket, "kill-server").Run()
+	})
+
+	if err := r.EnsureControlServer(context.Background()); err != nil {
+		t.Fatalf("EnsureControlServer: %v", err)
+	}
+	for option, want := range map[string]string{
+		"@ao-control-version":  ControlServerVersion,
+		"@ao-control-data-dir": r.controlDataDir,
+		"exit-empty":           "off",
+	} {
+		out, err := exec.Command(tmuxPath, controlShowOptionArgs(socket, option)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("show %s: %v\n%s", option, err, out)
+		}
+		if got := strings.TrimSpace(string(out)); got != want {
+			t.Fatalf("%s = %q, want %q", option, got, want)
+		}
+	}
+
+	outputPath := filepath.Join(dataDir, "run-shell-cwd")
+	command := "pwd > " + shellQuote(outputPath)
+	if out, err := exec.Command(tmuxPath, "-N", "-S", socket, "run-shell", "-b", "-c", dataDir, command).CombinedOutput(); err != nil {
+		t.Fatalf("run-shell: %v\n%s", err, out)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out, err := os.ReadFile(outputPath)
+		if err == nil {
+			got := strings.TrimSpace(string(out))
+			if resolved, resolveErr := filepath.EvalSymlinks(got); resolveErr == nil {
+				got = resolved
+			}
+			if got != r.controlDataDir {
+				t.Fatalf("run-shell cwd = %q, want %q", got, r.controlDataDir)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("read run-shell output: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("run-shell did not produce output")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// No hidden session is needed to retain the server.
+	if out, err := exec.Command(tmuxPath, "-N", "-S", socket, "list-sessions").CombinedOutput(); err != nil {
+		t.Fatalf("list sessionless control server: %v\n%s", err, out)
+	} else if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("control server unexpectedly has sessions: %s", out)
+	}
+}
 
 func TestRuntimeIntegration(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {

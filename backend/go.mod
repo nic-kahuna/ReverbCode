@@ -3,6 +3,7 @@ module github.com/aoagents/agent-orchestrator/backend
 go 1.25.7
 
 require (
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/aymanbagabas/go-pty v0.2.3
 	github.com/coder/websocket v1.8.14
 	github.com/creack/pty v1.1.24
@@ -13,6 +14,7 @@ require (
 	github.com/spf13/pflag v1.0.9
 	github.com/swaggest/jsonschema-go v0.3.79
 	github.com/swaggest/openapi-go v0.2.61
+	github.com/yuin/goldmark v1.8.2
 	golang.org/x/sys v0.44.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.51.0

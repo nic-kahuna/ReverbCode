@@ -3,6 +3,8 @@ package vibe
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -39,6 +41,91 @@ func TestGetConfigSpecEmpty(t *testing.T) {
 	}
 }
 
+func TestAuthStatusAuthorizedFromEnv(t *testing.T) {
+	clearVibeAuthEnv(t, vibeDefaultAPIKeyEnvVar, "VIBE_CODE_API_KEY")
+	t.Setenv(vibeDefaultAPIKeyEnvVar, "test-key")
+	p := &Plugin{resolvedBinary: "vibe"}
+
+	got, err := p.AuthStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("AuthStatus = %q, want %q", got, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func TestVibeAPIKeyEnvVarsReadsConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[[providers]]\napi_key_env_var = \"CUSTOM_VIBE_KEY\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := vibeAPIKeyEnvVars(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(got, vibeDefaultAPIKeyEnvVar) || !containsString(got, "CUSTOM_VIBE_KEY") {
+		t.Fatalf("vibeAPIKeyEnvVars = %#v, want default and custom key", got)
+	}
+}
+
+func TestVibeEnvFileAuthStatusAuthorized(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("MISTRAL_API_KEY=test-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, ok, err := vibeEnvFileAuthStatus(envPath, vibeDefaultAPIKeyEnvVar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func TestVibeEnvFileAuthStatusUnauthorizedForEmptyValue(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("MISTRAL_API_KEY=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, ok, err := vibeEnvFileAuthStatus(envPath, vibeDefaultAPIKeyEnvVar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || status != ports.AgentAuthStatusUnauthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusUnauthorized)
+	}
+}
+
+func TestVibeSessionLogAuthStatusAuthorizedWithAssistantMessage(t *testing.T) {
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "session_20260625_071829_d5e8a6eb")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "messages.jsonl"), []byte(`{"role":"assistant","content":"Hello"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, ok, err := vibeSessionLogAuthStatus(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func clearVibeAuthEnv(t *testing.T, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		t.Setenv(name, "")
+	}
+}
+
 func TestGetPromptDeliveryStrategy(t *testing.T) {
 	s, err := (&Plugin{}).GetPromptDeliveryStrategy(context.Background(), ports.LaunchConfig{})
 	if err != nil {
@@ -52,16 +139,36 @@ func TestGetPromptDeliveryStrategy(t *testing.T) {
 func TestGetLaunchCommandWithPrompt(t *testing.T) {
 	p := &Plugin{resolvedBinary: "vibe"}
 	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{
-		Permissions: ports.PermissionModeBypassPermissions,
-		Prompt:      "add a health check",
+		Permissions:   ports.PermissionModeBypassPermissions,
+		Prompt:        "add a health check",
+		WorkspacePath: "/work/repo",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want := []string{"vibe", "--trust", "--output", "text", "--agent", "auto-approve", "-p", "add a health check"}
+	want := []string{"vibe", "--trust", "--workdir", "/work/repo", "--agent", "auto-approve", "--", "add a health check"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("unexpected command\nwant: %#v\n got: %#v", want, cmd)
+	}
+}
+
+func TestGetLaunchCommandUsesInteractiveTUI(t *testing.T) {
+	p := &Plugin{resolvedBinary: "vibe"}
+	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{Prompt: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, arg := range cmd {
+		switch arg {
+		case "--output", "-p", "--prompt":
+			t.Fatalf("cmd = %#v must not use programmatic output mode", cmd)
+		case "--":
+			if i+1 >= len(cmd) || cmd[i+1] != "task" {
+				t.Fatalf("cmd = %#v must pass prompt as positional initial prompt", cmd)
+			}
+		}
 	}
 }
 
@@ -72,17 +179,17 @@ func TestGetLaunchCommandMapsPermissionModes(t *testing.T) {
 		want       []string
 		wantAbsent string
 	}{
-		{"default omits flag", ports.PermissionModeDefault, []string{"vibe", "--trust", "--output", "text"}, "--agent"},
-		{"empty omits flag", "", []string{"vibe", "--trust", "--output", "text"}, "--agent"},
-		{"accept edits", ports.PermissionModeAcceptEdits, []string{"vibe", "--trust", "--output", "text", "--agent", "accept-edits"}, ""},
-		{"auto", ports.PermissionModeAuto, []string{"vibe", "--trust", "--output", "text", "--agent", "auto-approve"}, ""},
-		{"bypass", ports.PermissionModeBypassPermissions, []string{"vibe", "--trust", "--output", "text", "--agent", "auto-approve"}, ""},
+		{"default omits flag", ports.PermissionModeDefault, []string{"vibe", "--trust", "--", "task"}, "--agent"},
+		{"empty omits flag", "", []string{"vibe", "--trust", "--", "task"}, "--agent"},
+		{"accept edits", ports.PermissionModeAcceptEdits, []string{"vibe", "--trust", "--agent", "accept-edits", "--", "task"}, ""},
+		{"auto", ports.PermissionModeAuto, []string{"vibe", "--trust", "--agent", "auto-approve", "--", "task"}, ""},
+		{"bypass", ports.PermissionModeBypassPermissions, []string{"vibe", "--trust", "--agent", "auto-approve", "--", "task"}, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := &Plugin{resolvedBinary: "vibe"}
-			cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{Permissions: tt.mode})
+			cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{Permissions: tt.mode, Prompt: "task"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -100,23 +207,33 @@ func TestGetLaunchCommandMapsPermissionModes(t *testing.T) {
 	}
 }
 
-func TestGetLaunchCommandOmitsPromptWhenEmpty(t *testing.T) {
+func TestGetLaunchCommandPromptlessLaunchStaysInteractive(t *testing.T) {
 	p := &Plugin{resolvedBinary: "vibe"}
 	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{
-		Permissions: ports.PermissionModeAuto,
+		Permissions:   ports.PermissionModeAuto,
+		WorkspacePath: "/work/repo",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	want := []string{"vibe", "--trust", "--output", "text", "--agent", "auto-approve"}
+	want := []string{"vibe", "--trust", "--workdir", "/work/repo", "--agent", "auto-approve"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}
-	for _, arg := range cmd {
-		if arg == "-p" {
-			t.Fatalf("cmd = %#v unexpectedly contains %q", cmd, "-p")
-		}
+}
+
+func TestGetLaunchCommandWhitespacePromptStaysInteractive(t *testing.T) {
+	p := &Plugin{resolvedBinary: "vibe"}
+	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{
+		Prompt:      " \t\n",
+		Permissions: ports.PermissionModeAcceptEdits,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"vibe", "--trust", "--agent", "accept-edits"}
+	if !reflect.DeepEqual(cmd, want) {
+		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}
 }
 
@@ -124,7 +241,8 @@ func TestGetRestoreCommand(t *testing.T) {
 	p := &Plugin{resolvedBinary: "vibe"}
 	cmd, ok, err := p.GetRestoreCommand(context.Background(), ports.RestoreConfig{
 		Session: ports.SessionRef{
-			Metadata: map[string]string{ports.MetadataKeyAgentSessionID: "abcd1234-5678-90ab-cdef-1234567890ab"},
+			Metadata:      map[string]string{ports.MetadataKeyAgentSessionID: "abcd1234-5678-90ab-cdef-1234567890ab"},
+			WorkspacePath: "/work/repo",
 		},
 		Permissions: ports.PermissionModeBypassPermissions,
 	})
@@ -135,7 +253,7 @@ func TestGetRestoreCommand(t *testing.T) {
 		t.Fatal("ok=false, want true")
 	}
 
-	want := []string{"vibe", "--trust", "--output", "text", "--agent", "auto-approve", "--resume", "abcd1234-5678-90ab-cdef-1234567890ab"}
+	want := []string{"vibe", "--trust", "--workdir", "/work/repo", "--agent", "auto-approve", "--resume", "abcd1234-5678-90ab-cdef-1234567890ab"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}

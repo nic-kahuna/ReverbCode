@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hooksjson"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -183,8 +185,8 @@ func TestGetAgentHooksInstallsClaudeHooks(t *testing.T) {
 		t.Fatal(err)
 	}
 	var config struct {
-		Hooks       map[string][]claudeMatcherGroup `json:"hooks"`
-		Permissions json.RawMessage                 `json:"permissions"`
+		Hooks       map[string][]hooksjson.MatcherGroup `json:"hooks"`
+		Permissions json.RawMessage                     `json:"permissions"`
 	}
 	if err := json.Unmarshal(data, &config); err != nil {
 		t.Fatal(err)
@@ -260,8 +262,8 @@ func TestUninstallHooksRemovesClaudeHooks(t *testing.T) {
 		t.Fatal(err)
 	}
 	var config struct {
-		Hooks       map[string][]claudeMatcherGroup `json:"hooks"`
-		Permissions json.RawMessage                 `json:"permissions"`
+		Hooks       map[string][]hooksjson.MatcherGroup `json:"hooks"`
+		Permissions json.RawMessage                     `json:"permissions"`
 	}
 	if err := json.Unmarshal(data, &config); err != nil {
 		t.Fatal(err)
@@ -343,7 +345,7 @@ func TestSessionInfoFalseWhenNoHookMetadata(t *testing.T) {
 
 // countClaudeHookCommand counts how many hook entries under one event register
 // the given command — used to prove no duplicate AO hooks.
-func countClaudeHookCommand(groups []claudeMatcherGroup, command string) int {
+func countClaudeHookCommand(groups []hooksjson.MatcherGroup, command string) int {
 	count := 0
 	for _, group := range groups {
 		for _, hook := range group.Hooks {
@@ -357,7 +359,7 @@ func countClaudeHookCommand(groups []claudeMatcherGroup, command string) int {
 
 // matcherForCommand returns the matcher on the group that registers the given
 // command (nil if the group has no matcher).
-func matcherForCommand(groups []claudeMatcherGroup, command string) *string {
+func matcherForCommand(groups []hooksjson.MatcherGroup, command string) *string {
 	for _, group := range groups {
 		for _, hook := range group.Hooks {
 			if hook.Command == command {
@@ -391,6 +393,7 @@ func TestGetRestoreCommandReappendsSystemPrompt(t *testing.T) {
 	// (e.g. the orchestrator role) must be re-appended on restore.
 	cmd, ok, err := (&Plugin{resolvedBinary: "claude"}).GetRestoreCommand(context.Background(), ports.RestoreConfig{
 		Permissions:  ports.PermissionModeBypassPermissions,
+		Config:       ports.AgentConfig{Model: "claude-fable-5", ReasoningEffort: domain.ReasoningEffortMedium},
 		SystemPrompt: "You are an orchestrator.",
 		Session: ports.SessionRef{
 			ID:       "sess-r",
@@ -400,7 +403,7 @@ func TestGetRestoreCommandReappendsSystemPrompt(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("restore = (ok=%v, err=%v), want ok", ok, err)
 	}
-	want := []string{"claude", "--permission-mode", "bypassPermissions", "--append-system-prompt", "You are an orchestrator.", "--resume", "claude-native-1"}
+	want := []string{"claude", "--permission-mode", "bypassPermissions", "--model", "claude-fable-5", "--effort", "medium", "--append-system-prompt", "You are an orchestrator.", "--resume", "claude-native-1"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("restore cmd\nwant: %#v\n got: %#v", want, cmd)
 	}
@@ -446,8 +449,9 @@ func TestGetLaunchCommandAppliesAgentConfig(t *testing.T) {
 	p := &Plugin{resolvedBinary: "claude"}
 	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{
 		Config: ports.AgentConfig{
-			Model:       "claude-opus-4-5",
-			Permissions: ports.PermissionModeAcceptEdits,
+			Model:           "claude-opus-4-5",
+			ReasoningEffort: domain.ReasoningEffortXHigh,
+			Permissions:     ports.PermissionModeAcceptEdits,
 		},
 	})
 	if err != nil {
@@ -456,8 +460,25 @@ func TestGetLaunchCommandAppliesAgentConfig(t *testing.T) {
 	if !containsSubsequence(cmd, []string{"--model", "claude-opus-4-5"}) {
 		t.Fatalf("command %#v missing --model flag", cmd)
 	}
+	if !containsSubsequence(cmd, []string{"--effort", "xhigh"}) {
+		t.Fatalf("command %#v missing --effort flag", cmd)
+	}
 	if !containsSubsequence(cmd, []string{"--permission-mode", "acceptEdits"}) {
 		t.Fatalf("command %#v missing config-driven permission mode", cmd)
+	}
+}
+
+func TestValidateAgentConfigRejectsClaudeUltra(t *testing.T) {
+	p := &Plugin{resolvedBinary: "claude"}
+	if err := p.ValidateAgentConfig(context.Background(), ports.AgentConfig{ReasoningEffort: domain.ReasoningEffortUltra}); err == nil {
+		t.Fatal("expected Claude Code to reject ultra")
+	}
+}
+
+func TestValidateAgentConfigRejectsCodexProfile(t *testing.T) {
+	p := &Plugin{resolvedBinary: "claude"}
+	if err := p.ValidateAgentConfig(context.Background(), ports.AgentConfig{Profile: "ao-minimal"}); err == nil {
+		t.Fatal("expected Claude Code to reject a Codex profile")
 	}
 }
 
@@ -487,6 +508,97 @@ func TestGetLaunchCommandRejectsInvalidConfig(t *testing.T) {
 func TestManifestID(t *testing.T) {
 	if got := New().Manifest().ID; got != "claude-code" {
 		t.Fatalf("manifest id = %q, want claude-code", got)
+	}
+}
+
+func TestClaudeConfigAuthStatusAuthorizedWithOAuthSubscription(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	content := `{
+		"hasAvailableSubscription": true,
+		"oauthAccount": {
+			"accountUuid": "account-1",
+			"subscriptionCreatedAt": "2026-01-01T00:00:00Z"
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, ok, err := claudeConfigAuthStatus(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func TestClaudeConfigAuthStatusAuthorizedWithOAuthAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	content := `{"oauthAccount":{"accountUuid":"account-1"}}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, ok, err := claudeConfigAuthStatus(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func TestClaudeConfigAuthStatusAuthorizedWithUserID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	if err := os.WriteFile(path, []byte(`{"userID":"user-1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, ok, err := claudeConfigAuthStatus(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func TestClaudeConfigAuthStatusUnknownWithoutOAuthIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	content := `{"oauthAccount":{}}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, ok, err := claudeConfigAuthStatus(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || status != ports.AgentAuthStatusUnknown {
+		t.Fatalf("status = (%q, %v), want (%q, false)", status, ok, ports.AgentAuthStatusUnknown)
+	}
+}
+
+func TestClaudeAuthStatusFromOutputAuthorizedWithCleanJSON(t *testing.T) {
+	status, ok := claudeAuthStatusFromOutput([]byte(`{"loggedIn":true,"authMethod":"oauth_token"}`))
+	if !ok || status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func TestClaudeAuthStatusFromOutputAuthorizedWithPrefixedWarning(t *testing.T) {
+	output := []byte("warning: ignored config line\n{\"loggedIn\":true,\"authMethod\":\"oauth_token\"}\n")
+	status, ok := claudeAuthStatusFromOutput(output)
+	if !ok || status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusAuthorized)
+	}
+}
+
+func TestClaudeAuthStatusFromOutputUnauthorized(t *testing.T) {
+	status, ok := claudeAuthStatusFromOutput([]byte(`{"loggedIn":false}`))
+	if !ok || status != ports.AgentAuthStatusUnauthorized {
+		t.Fatalf("status = (%q, %v), want (%q, true)", status, ok, ports.AgentAuthStatusUnauthorized)
 	}
 }
 
@@ -578,6 +690,38 @@ func readJSON(t *testing.T, path string) map[string]any {
 		t.Fatalf("parse %s: %v", path, err)
 	}
 	return m
+}
+
+func TestGetLaunchCommandEmitsToolAllowlist(t *testing.T) {
+	p := &Plugin{resolvedBinary: "claude"}
+
+	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{
+		AllowedTools:    []string{"Read", "Grep", "Bash(git diff:*)"},
+		DisallowedTools: []string{"Edit", "Write", "Bash(git push:*)"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Each list is one comma-joined value so a rule with spaces stays intact.
+	if !containsSubsequence(cmd, []string{"--allowedTools", "Read,Grep,Bash(git diff:*)"}) {
+		t.Fatalf("missing joined --allowedTools value; got %#v", cmd)
+	}
+	if !containsSubsequence(cmd, []string{"--disallowedTools", "Edit,Write,Bash(git push:*)"}) {
+		t.Fatalf("missing joined --disallowedTools value; got %#v", cmd)
+	}
+}
+
+func TestGetLaunchCommandOmitsToolFlagsWhenUnset(t *testing.T) {
+	p := &Plugin{resolvedBinary: "claude"}
+
+	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{Prompt: "do it"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(cmd, "--allowedTools") || contains(cmd, "--disallowedTools") {
+		t.Fatalf("unrestricted launch should emit no tool flags; got %#v", cmd)
+	}
 }
 
 func contains(values []string, needle string) bool {

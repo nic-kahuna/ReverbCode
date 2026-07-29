@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -87,6 +88,38 @@ func TestGetLaunchCommandWithoutWorkspaceOmitsTrustFlag(t *testing.T) {
 	}
 	if !containsSubsequence(cmd, sessionHookFlags()) {
 		t.Fatalf("command %#v missing session hook flags", cmd)
+	}
+}
+
+func TestResolveCodexBinaryFindsNVMInstallWhenPathIsSparse(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("NVM install discovery is Unix-specific")
+	}
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".nvm", "versions", "node", "v20.19.4", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(want, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	origFileExists := fileExists
+	fileExists = func(path string) bool {
+		return strings.HasPrefix(path, home+string(os.PathSeparator)) && origFileExists(path)
+	}
+	t.Cleanup(func() {
+		fileExists = origFileExists
+	})
+
+	got, err := ResolveCodexBinary(context.Background())
+	if err != nil {
+		t.Fatalf("ResolveCodexBinary: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveCodexBinary = %q, want %q", got, want)
 	}
 }
 
@@ -201,7 +234,7 @@ func TestCodexTOMLBasicStringEscapes(t *testing.T) {
 }
 
 func TestGetPromptDeliveryStrategyIsInCommand(t *testing.T) {
-	plugin := &Plugin{resolvedBinary: "codex"}
+	plugin := &Plugin{}
 
 	got, err := plugin.GetPromptDeliveryStrategy(context.Background(), ports.LaunchConfig{})
 	if err != nil {
@@ -212,15 +245,32 @@ func TestGetPromptDeliveryStrategyIsInCommand(t *testing.T) {
 	}
 }
 
-func TestGetConfigSpecHasNoCustomFieldsYet(t *testing.T) {
-	plugin := &Plugin{resolvedBinary: "codex"}
+func TestGetConfigSpecIncludesRouteFields(t *testing.T) {
+	plugin := &Plugin{}
 
 	spec, err := plugin.GetConfigSpec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(spec.Fields) != 0 {
-		t.Fatalf("unexpected config fields: %#v", spec.Fields)
+	if len(spec.Fields) != 3 || spec.Fields[0].Key != "model" || spec.Fields[1].Key != "profile" || spec.Fields[2].Key != "reasoningEffort" {
+		t.Fatalf("config fields = %#v, want model, profile, and reasoningEffort", spec.Fields)
+	}
+}
+
+func TestGetLaunchCommandAppliesModelAndReasoning(t *testing.T) {
+	plugin := &Plugin{resolvedBinary: "codex"}
+	cmd, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{Config: ports.AgentConfig{Model: "gpt-5.6-terra", Profile: "ao-minimal", ReasoningEffort: domain.ReasoningEffortMedium}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubsequence(cmd, []string{"--model", "gpt-5.6-terra"}) {
+		t.Fatalf("command %#v missing model", cmd)
+	}
+	if !containsSubsequence(cmd, []string{"--profile", "ao-minimal"}) {
+		t.Fatalf("command %#v missing profile", cmd)
+	}
+	if !containsSubsequence(cmd, []string{"-c", `model_reasoning_effort="medium"`}) {
+		t.Fatalf("command %#v missing reasoning effort", cmd)
 	}
 }
 
@@ -399,6 +449,7 @@ func TestGetRestoreCommandReadsAgentSessionID(t *testing.T) {
 
 	cmd, ok, err := plugin.GetRestoreCommand(context.Background(), ports.RestoreConfig{
 		Permissions: ports.PermissionModeAuto,
+		Config:      ports.AgentConfig{Model: "gpt-5.6-terra", Profile: "ao-minimal", ReasoningEffort: domain.ReasoningEffortMedium},
 		Session: ports.SessionRef{
 			Metadata:      map[string]string{ports.MetadataKeyAgentSessionID: "thread-123"},
 			WorkspacePath: workspace,
@@ -424,7 +475,10 @@ func TestGetRestoreCommandReadsAgentSessionID(t *testing.T) {
 		want = append(want, "--no-alt-screen")
 	}
 	want = append(want,
+		"--profile", "ao-minimal",
 		"-c", `projects={`+codexTOMLConfigString(workspace)+`={trust_level="trusted"}}`,
+		"--model", "gpt-5.6-terra",
+		"-c", `model_reasoning_effort="medium"`,
 		"thread-123",
 	)
 	if !reflect.DeepEqual(cmd, want) {

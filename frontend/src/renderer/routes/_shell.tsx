@@ -1,19 +1,26 @@
-import { createFileRoute, Outlet, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Outlet, useMatchRoute, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { type CSSProperties, useCallback, useEffect } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef } from "react";
+import { NotificationRuntime } from "../components/NotificationCenter";
 import { ShellTopbar } from "../components/ShellTopbar";
+import { OrchestratorReplacementDialog } from "../components/OrchestratorReplacementDialog";
 import { Sidebar } from "../components/Sidebar";
 import { SidebarProvider } from "../components/ui/sidebar";
 import { TitlebarNav } from "../components/TitlebarNav";
+import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
 import { useDaemonStatus } from "../hooks/useDaemonStatus";
 import { useWorkspaceQuery, workspaceQueryKey, workspaceQueryOptions } from "../hooks/useWorkspaceQuery";
-import { apiClient, apiErrorMessage } from "../lib/api-client";
+import { apiClient, apiErrorCode, apiErrorMessage } from "../lib/api-client";
 import { refreshDaemonStatus } from "../lib/daemon-status";
 import { addRendererExceptionStep, captureRendererEvent, captureRendererException } from "../lib/telemetry";
 import { ShellProvider } from "../lib/shell-context";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
-import { readStoredTheme, type Theme, useUiStore } from "../stores/ui-store";
+import { restartProjectOrchestrator } from "../lib/restart-orchestrator";
+import { captureOrchestratorReplacementFailure } from "../lib/orchestrator-replacement-telemetry";
+import { applyDocumentTheme, readStoredTheme, systemTheme } from "../lib/theme";
+import { useUiStore } from "../stores/ui-store";
 import type { WorkspaceSummary } from "../types/workspace";
+import type { components } from "../../api/schema";
 
 export const Route = createFileRoute("/_shell")({
 	// Prefetch the workspace list for the whole shell (parent loaders run before
@@ -26,13 +33,15 @@ export const Route = createFileRoute("/_shell")({
 	component: ShellLayout,
 });
 
-function systemTheme(): Theme {
-	return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-}
-
 function errorMessage(error: unknown) {
 	return error instanceof Error ? error.message : "Could not load projects";
 }
+
+const isLinux =
+	typeof navigator !== "undefined" &&
+	((navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ?? navigator.platform)
+		.toLowerCase()
+		.includes("linux");
 
 // Persistent app shell: the Sidebar + shared state survive route changes; only
 // the <Outlet> content (board / session / settings / …) swaps. Lifted out of
@@ -40,11 +49,21 @@ function errorMessage(error: unknown) {
 // instead of Zustand. The daemon-status effect runs here exactly once.
 function ShellLayout() {
 	const navigate = useNavigate();
+	const matchRoute = useMatchRoute();
 	const queryClient = useQueryClient();
 	const workspaceQuery = useWorkspaceQuery();
 	const workspaces = workspaceQuery.data ?? [];
 	const daemonStatus = useDaemonStatus(queryClient);
+	const agentCatalogPortRef = useRef<number | undefined>(undefined);
 	const { theme, setTheme, isSidebarOpen, toggleSidebar } = useUiStore();
+	const isSessionRoute =
+		Boolean(matchRoute({ to: "/projects/$projectId/sessions/$sessionId", fuzzy: true })) ||
+		Boolean(matchRoute({ to: "/sessions/$sessionId", fuzzy: true }));
+	const setProjectRestarting = useUiStore((state) => state.setProjectRestarting);
+	const orchestratorReplacementErrors = useUiStore((state) => state.orchestratorReplacementErrors);
+	const setOrchestratorReplacementError = useUiStore((state) => state.setOrchestratorReplacementError);
+	const setOrchestratorStartupError = useUiStore((state) => state.setOrchestratorStartupError);
+	const replacementErrorProjectId = Object.keys(orchestratorReplacementErrors)[0] ?? null;
 
 	const updateWorkspaces = useCallback(
 		(updater: (workspaces: WorkspaceSummary[]) => WorkspaceSummary[]) => {
@@ -54,24 +73,37 @@ function ShellLayout() {
 	);
 
 	const createProject = useCallback(
-		async (input: { path: string; workerAgent: string; orchestratorAgent: string }) => {
+		async (input: {
+			path: string;
+			workerAgent: string;
+			orchestratorAgent: string;
+			trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
+			asWorkspace?: boolean;
+		}) => {
 			void addRendererExceptionStep("Project add requested", {
 				source: "project-add",
 				operation: "project_add",
 				surface: "project_board",
 			});
 			void captureRendererEvent("ao.renderer.project_add_requested");
+			const status = await refreshDaemonStatus();
+			if (status.state !== "ready" || !status.port) {
+				throw new Error(status.message || "AO daemon is not ready.");
+			}
 			const { data, error } = await apiClient.POST("/api/v1/projects", {
 				body: {
 					path: input.path,
+					asWorkspace: input.asWorkspace || undefined,
 					config: {
 						worker: { agent: input.workerAgent },
 						orchestrator: { agent: input.orchestratorAgent },
+						trackerIntake: input.trackerIntake,
 					},
 				},
 			});
 			if (error) {
-				const failure = new Error(apiErrorMessage(error));
+				const failure = new Error(apiErrorMessage(error)) as Error & { code?: string };
+				failure.code = apiErrorCode(error);
 				void captureRendererException(failure, {
 					source: "project-add",
 					operation: "project_add",
@@ -84,14 +116,18 @@ function ShellLayout() {
 			const workspace: WorkspaceSummary = {
 				id: data.project.id,
 				name: data.project.name,
+				kind: data.project.kind === "workspace" ? "workspace" : "single_repo",
 				path: data.project.path,
+				workspaceRepos: data.project.workspaceRepos,
 				type: "main",
+				orchestratorAgent: input.orchestratorAgent as WorkspaceSummary["orchestratorAgent"],
 				sessions: [],
 			};
 			void captureRendererEvent("ao.renderer.project_add_succeeded", { project_id: workspace.id });
 			updateWorkspaces((current) => [workspace, ...current.filter((item) => item.id !== workspace.id)]);
+			setOrchestratorStartupError(workspace.id, null);
 			try {
-				const sessionId = await spawnOrchestrator(workspace.id);
+				const sessionId = await spawnOrchestrator(workspace.id, "project_add");
 				await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
 				void navigate({
 					to: "/projects/$projectId/sessions/$sessionId",
@@ -100,11 +136,23 @@ function ShellLayout() {
 			} catch (spawnError) {
 				void navigate({ to: "/projects/$projectId", params: { projectId: workspace.id } });
 				const message = spawnError instanceof Error ? spawnError.message : "Could not start orchestrator";
-				throw new Error(`Project added, but orchestrator did not start: ${message}`);
+				const startupMessage = `Project added, but orchestrator did not start: ${message}`;
+				setOrchestratorStartupError(workspace.id, startupMessage);
 			}
 		},
-		[navigate, queryClient, updateWorkspaces],
+		[navigate, queryClient, setOrchestratorStartupError, updateWorkspaces],
 	);
+
+	const initializeProjectRepository = useCallback(async (path: string) => {
+		const { error } = await apiClient.POST("/api/v1/projects/initialize", {
+			body: { path },
+		});
+		if (error) {
+			const failure = new Error(apiErrorMessage(error)) as Error & { code?: string };
+			failure.code = apiErrorCode(error);
+			throw failure;
+		}
+	}, []);
 
 	const removeProject = useCallback(
 		async (projectId: string) => {
@@ -118,7 +166,8 @@ function ShellLayout() {
 				params: { path: { id: projectId } },
 			});
 			if (error) {
-				const failure = new Error(apiErrorMessage(error));
+				const failure = new Error(apiErrorMessage(error)) as Error & { code?: string };
+				failure.code = apiErrorCode(error);
 				void captureRendererException(failure, {
 					source: "project-remove",
 					operation: "project_remove",
@@ -133,10 +182,35 @@ function ShellLayout() {
 		[updateWorkspaces],
 	);
 
+	const restartOrchestrator = useCallback(
+		async (projectId: string) => {
+			await restartProjectOrchestrator({
+				projectId,
+				queryClient,
+				navigate,
+				setProjectRestarting,
+				setOrchestratorReplacementError,
+				onError: (error) => {
+					captureOrchestratorReplacementFailure(error, projectId);
+				},
+			});
+		},
+		[navigate, queryClient, setOrchestratorReplacementError, setProjectRestarting],
+	);
+
 	useEffect(() => {
-		document.documentElement.dataset.theme = theme;
-		document.documentElement.style.colorScheme = theme;
+		applyDocumentTheme(theme);
 	}, [theme]);
+
+	useEffect(() => {
+		if (daemonStatus.state !== "ready" || !daemonStatus.port) return;
+		if (agentCatalogPortRef.current === daemonStatus.port) return;
+
+		agentCatalogPortRef.current = daemonStatus.port;
+		void queryClient.invalidateQueries({ queryKey: agentsQueryKey });
+		void queryClient.fetchQuery({ ...agentsQueryOptions, queryFn: refreshAgents });
+		void queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
+	}, [daemonStatus.port, daemonStatus.state, queryClient]);
 
 	// Follow OS appearance only until the user picks a theme explicitly.
 	useEffect(() => {
@@ -165,7 +239,8 @@ function ShellLayout() {
 	}, [navigate, workspaces]);
 
 	return (
-		<ShellProvider value={{ daemonStatus, createProject }}>
+		<ShellProvider value={{ daemonStatus, createProject, initializeProjectRepository }}>
+			<NotificationRuntime />
 			{/* The topbar spans the full window width above the sidebar row (the
           macOS traffic lights + TitlebarNav cluster sit in its left inset),
           and the sidebar hangs below it — so the sidebar border stops at the
@@ -178,21 +253,27 @@ function ShellLayout() {
             call the store directly) stay in sync. --sidebar-width chains to
             the drag-resizable --ao-sidebar-w set on :root by useResizable. */}
 				<SidebarProvider
-					className="min-h-0 flex-1"
+					className="min-h-0 flex-1 overflow-x-hidden"
 					onOpenChange={(open) => open !== isSidebarOpen && toggleSidebar()}
 					open={isSidebarOpen}
-					style={{ "--sidebar-width": "var(--ao-sidebar-w, 240px)", "--sidebar-width-icon": "48px" } as CSSProperties}
+					style={
+						{
+							"--sidebar-width": "var(--ao-sidebar-w, var(--size-sidebar-default))",
+							"--sidebar-width-icon": "var(--size-sidebar-icon)",
+						} as CSSProperties
+					}
 				>
 					<Sidebar
 						daemonStatus={daemonStatus}
-						underTopbar
+						underTopbar={isLinux ? isSessionRoute : true}
 						onCreateProject={createProject}
+						onInitializeProject={initializeProjectRepository}
 						onRemoveProject={removeProject}
 						workspaceError={workspaceQuery.isError ? errorMessage(workspaceQuery.error) : undefined}
 						workspaces={workspaces}
 					/>
-					<main className="flex min-w-0 flex-1 flex-col">
-						<div className="min-h-0 flex-1">
+					<main className="flex min-w-0 flex-1 flex-col overflow-x-hidden">
+						<div className="min-h-0 flex-1 overflow-x-hidden">
 							<Outlet />
 						</div>
 					</main>
@@ -206,6 +287,15 @@ function ShellLayout() {
               by window-drag even though DOM hit-testing looks correct. */}
 					<TitlebarNav />
 				</SidebarProvider>
+				<OrchestratorReplacementDialog
+					error={replacementErrorProjectId ? orchestratorReplacementErrors[replacementErrorProjectId] : undefined}
+					onOpenChange={(open) => {
+						if (!open && replacementErrorProjectId) setOrchestratorReplacementError(replacementErrorProjectId, null);
+					}}
+					onRetry={(projectId) => void restartOrchestrator(projectId)}
+					projectId={replacementErrorProjectId}
+					workspaces={workspaces}
+				/>
 			</div>
 		</ShellProvider>
 	);

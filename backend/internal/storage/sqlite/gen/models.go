@@ -101,6 +101,16 @@ type PRComment struct {
 	IsBot     int64
 }
 
+type PRReview struct {
+	PRURL       string
+	ReviewID    string
+	Author      string
+	State       string
+	URL         string
+	IsBot       int64
+	SubmittedAt time.Time
+}
+
 type PRReviewThread struct {
 	PRURL        string
 	ThreadID     string
@@ -147,29 +157,36 @@ type ReviewRun struct {
 	CreatedAt      time.Time
 	GithubReviewID string
 	DeliveredAt    sql.NullTime
+	BatchID        string
 }
 
 type Session struct {
-	ID              domain.SessionID
-	ProjectID       domain.ProjectID
-	Num             int64
-	IssueID         domain.IssueID
-	Kind            domain.SessionKind
-	Harness         domain.AgentHarness
-	ActivityState   domain.ActivityState
-	ActivityLastAt  time.Time
-	IsTerminated    bool
-	Branch          string
-	WorkspacePath   string
-	RuntimeHandleID string
-	AgentSessionID  string
-	Prompt          string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	DisplayName     string
-	FirstSignalAt   sql.NullTime
-	PreviewURL      string
-	PreviewRevision int64
+	ID                       domain.SessionID
+	ProjectID                domain.ProjectID
+	Num                      int64
+	IssueID                  domain.IssueID
+	Kind                     domain.SessionKind
+	Harness                  domain.AgentHarness
+	ActivityState            domain.ActivityState
+	ActivityLastAt           time.Time
+	IsTerminated             bool
+	Branch                   string
+	WorkspacePath            string
+	RuntimeHandleID          string
+	AgentSessionID           string
+	Prompt                   string
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	DisplayName              string
+	FirstSignalAt            sql.NullTime
+	PreviewURL               string
+	PreviewRevision          int64
+	RequestedHarness         string
+	RequestedModel           string
+	RequestedReasoningEffort string
+	LaunchModel              string
+	LaunchReasoningEffort    string
+	LaunchRouteRecorded      bool
 }
 
 type SessionWorktree struct {

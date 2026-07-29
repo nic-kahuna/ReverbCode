@@ -21,6 +21,28 @@ type Reviewer interface {
 	ReviewMessage(ctx context.Context, inv ReviewInvocation) (string, error)
 }
 
+// ReviewCancelMode names how AO should stop a running reviewer.
+type ReviewCancelMode string
+
+const (
+	// ReviewCancelInterrupt sends the terminal interrupt key sequence to the
+	// reviewer process while preserving the terminal pane.
+	ReviewCancelInterrupt ReviewCancelMode = "interrupt"
+)
+
+// ReviewCancelSpec is the adapter-selected cancellation behavior for a running
+// reviewer.
+type ReviewCancelSpec struct {
+	Mode       ReviewCancelMode
+	Interrupts int
+}
+
+// ReviewerCanceller is implemented by reviewer adapters that explicitly define
+// how their running CLI should be cancelled.
+type ReviewerCanceller interface {
+	ReviewCancel(ctx context.Context) (ReviewCancelSpec, error)
+}
+
 // ReviewInvocation describes one review pass for a reviewer to act on. All ids
 // the reviewer needs are passed explicitly here (and embedded in the prompt /
 // message), never through environment variables.
@@ -37,6 +59,11 @@ type ReviewInvocation struct {
 	PRURL string
 	// TargetSHA is the PR head commit under review.
 	TargetSHA string
+	// ReviewQueue lists all review tasks created by the same trigger so a shared
+	// reviewer pane can review multiple PRs and submit the results together.
+	ReviewQueue []ReviewTask
+	// ReviewIndex is this invocation's zero-based position in ReviewQueue.
+	ReviewIndex int
 	// WorkspacePath is the worker's checkout the reviewer reads.
 	WorkspacePath string
 	// Prompt and SystemPrompt are the review instructions AO authored centrally,
@@ -46,6 +73,13 @@ type ReviewInvocation struct {
 	// ignore them.
 	Prompt       string
 	SystemPrompt string
+}
+
+// ReviewTask is one PR/run in a multi-PR review trigger queue.
+type ReviewTask struct {
+	RunID     string
+	PRURL     string
+	TargetSHA string
 }
 
 // ReviewCommandSpec is how to launch a reviewer: the argv and any extra env the

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -12,6 +13,7 @@ import (
 type projectCapture struct {
 	method string
 	path   string
+	body   []byte
 }
 
 func projectServer(t *testing.T, status int, respBody string) (*httptest.Server, *projectCapture) {
@@ -20,6 +22,7 @@ func projectServer(t *testing.T, status int, respBody string) (*httptest.Server,
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capture.method = r.Method
 		capture.path = r.URL.Path
+		capture.body, _ = io.ReadAll(r.Body)
 		if !strings.HasPrefix(r.URL.Path, "/api/v1/projects") {
 			http.NotFound(w, r)
 			return
@@ -30,6 +33,151 @@ func projectServer(t *testing.T, status int, respBody string) (*httptest.Server,
 	}))
 	t.Cleanup(srv.Close)
 	return srv, capture
+}
+
+func TestProjectSetConfig_TrackerIntakeFlags(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := projectServer(t, http.StatusOK, `{"project":{"id":"demo","path":"/repo/demo"}}`)
+	writeRunFileFor(t, cfg, srv)
+
+	_, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "set-config", "demo", "--tracker-intake", "--tracker-repo", "acme/demo", "--tracker-assignee", "alice")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	if capture.method != http.MethodPut || capture.path != "/api/v1/projects/demo/config" {
+		t.Fatalf("request = %s %s, want PUT /api/v1/projects/demo/config", capture.method, capture.path)
+	}
+	var got setConfigRequest
+	if err := json.Unmarshal(capture.body, &got); err != nil {
+		t.Fatalf("decode request: %v\nbody=%s", err, capture.body)
+	}
+	if !got.Config.TrackerIntake.Enabled || got.Config.TrackerIntake.Provider != "github" || got.Config.TrackerIntake.Repo != "acme/demo" || got.Config.TrackerIntake.Assignee != "alice" {
+		t.Fatalf("tracker intake request = %#v", got.Config.TrackerIntake)
+	}
+}
+
+func TestProjectSetConfig_TrackerIntakeJSON(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := projectServer(t, http.StatusOK, `{"project":{"id":"demo","path":"/repo/demo"}}`)
+	writeRunFileFor(t, cfg, srv)
+
+	_, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "set-config", "demo", "--config-json", `{"trackerIntake":{"enabled":true,"provider":"github","assignee":"alice"}}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	var got setConfigRequest
+	if err := json.Unmarshal(capture.body, &got); err != nil {
+		t.Fatalf("decode request: %v\nbody=%s", err, capture.body)
+	}
+	if !got.Config.TrackerIntake.Enabled || got.Config.TrackerIntake.Provider != "github" || got.Config.TrackerIntake.Assignee != "alice" {
+		t.Fatalf("tracker intake request = %#v", got.Config.TrackerIntake)
+	}
+}
+
+func TestProjectConfigJSONRoundTripPreservesCompleteConfig(t *testing.T) {
+	cfg := setConfigEnv(t)
+	want := projectConfig{
+		DefaultBranch: "develop",
+		SessionPrefix: "demo",
+		Env:           map[string]string{"FOO": "bar"},
+		Symlinks:      []string{".env"},
+		PostCreate:    []string{"npm install"},
+		AgentConfig: agentConfig{
+			Model:           "base-model",
+			Profile:         "base-profile",
+			ReasoningEffort: "medium",
+			Permissions:     "auto",
+		},
+		Worker: roleOverride{
+			Agent: "claude-code",
+			AgentConfig: agentConfig{
+				Model:           "worker-model",
+				Profile:         "worker-profile",
+				ReasoningEffort: "high",
+				Permissions:     "accept-edits",
+			},
+		},
+		Orchestrator: roleOverride{
+			Agent: "codex",
+			AgentConfig: agentConfig{
+				Model:           "gpt-5.6-luna",
+				Profile:         "ao-minimal",
+				ReasoningEffort: "low",
+				Permissions:     "bypass-permissions",
+			},
+		},
+		Reviewers: []reviewerConfig{{Harness: "codex"}, {Harness: "claude-code"}},
+		TrackerIntake: trackerIntakeConfig{
+			Enabled:  true,
+			Provider: "github",
+			Repo:     "acme/demo",
+			Assignee: "alice",
+		},
+	}
+	configJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var captured setConfigRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","path":"/repo/demo","config":`+string(configJSON)+`}}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/projects/demo/config":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Errorf("decode set-config request: %v", err)
+			}
+			_, _ = io.WriteString(w, `{"project":{"id":"demo","path":"/repo/demo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "project", "get", "demo", "--json")
+	if err != nil {
+		t.Fatalf("project get: %v\nstderr=%s", err, errOut)
+	}
+	var read projectGetResult
+	if err := json.Unmarshal([]byte(out), &read); err != nil {
+		t.Fatalf("decode project get output: %v\nout=%s", err, out)
+	}
+	if read.Project.Config == nil || !reflect.DeepEqual(*read.Project.Config, want) {
+		t.Fatalf("read config = %#v, want %#v", read.Project.Config, want)
+	}
+
+	readJSON, err := json.Marshal(read.Project.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, errOut, err = executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "project", "set-config", "demo", "--config-json", string(readJSON))
+	if err != nil {
+		t.Fatalf("project set-config: %v\nstderr=%s", err, errOut)
+	}
+	if !reflect.DeepEqual(captured.Config, want) {
+		t.Fatalf("round-tripped config = %#v, want %#v", captured.Config, want)
+	}
+}
+
+func TestBuildProjectConfigTrackerIntakeFlags(t *testing.T) {
+	got, err := buildProjectConfig(projectSetConfigOptions{
+		trackerIntake:   true,
+		trackerRepo:     "acme/demo",
+		trackerAssignee: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.TrackerIntake.Enabled || got.TrackerIntake.Provider != "github" || got.TrackerIntake.Repo != "acme/demo" || got.TrackerIntake.Assignee != "alice" {
+		t.Fatalf("tracker intake config = %#v", got.TrackerIntake)
+	}
 }
 
 func TestProjectList_Success(t *testing.T) {

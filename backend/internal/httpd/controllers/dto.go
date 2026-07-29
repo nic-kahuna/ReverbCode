@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/legacyimport"
+	agentsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/agent"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 )
@@ -23,6 +25,11 @@ import (
 // as the path parameter.
 type ProjectIDParam struct {
 	ID string `path:"id" description:"Project identifier (registry key)."`
+}
+
+// AgentIDParam is the {agent} path parameter for one-agent catalog probes.
+type AgentIDParam struct {
+	Agent string `path:"agent" description:"Agent adapter identifier."`
 }
 
 // ListProjectsResponse is the body of GET /api/v1/projects.
@@ -113,13 +120,17 @@ type CleanupSessionsQuery struct {
 }
 
 // SessionView is the session wire shape: the domain read model plus the
-// display-safe branch name and the session's attributed pull requests in the
-// curated SessionPRFacts shape. One session can own many PRs (e.g. a stack), so
-// prs is a list. The embedded domain.Session.Metadata and domain.Session.PRs
-// fields are json:"-"; these curated fields are what serialize.
+// operational branch/workspace identity and the session's attributed pull
+// requests in the curated SessionPRFacts shape. One session can own many PRs
+// (e.g. a stack), so prs is a list. The embedded domain.Session.Metadata and
+// domain.Session.PRs fields are json:"-"; these curated fields are what
+// serialize.
 type SessionView struct {
 	domain.Session
-	Branch string `json:"branch,omitempty"`
+	Branch         string                   `json:"branch,omitempty"`
+	WorkspacePath  string                   `json:"workspacePath,omitempty"`
+	RequestedRoute *domain.AgentRoute       `json:"requestedRoute,omitempty"`
+	LaunchRoute    *domain.AgentLaunchRoute `json:"launchRoute,omitempty"`
 	// PreviewURL is the browser preview target the desktop app opens for this
 	// session, set via POST /sessions/{sessionId}/preview. Empty (omitted) when
 	// no preview has been requested. Pulled from the json:"-" domain Metadata.
@@ -139,12 +150,18 @@ type ListSessionsResponse struct {
 
 // SpawnSessionRequest is the body of POST /api/v1/sessions.
 type SpawnSessionRequest struct {
-	ProjectID domain.ProjectID    `json:"projectId"`
-	IssueID   domain.IssueID      `json:"issueId,omitempty"`
-	Kind      domain.SessionKind  `json:"kind,omitempty" enum:"worker,orchestrator"`
-	Harness   domain.AgentHarness `json:"harness,omitempty" enum:"claude-code,codex,aider,opencode,grok,droid,amp,agy,crush,cursor,qwen,copilot,goose,auggie,continue,devin,cline,kimi,kiro,kilocode,vibe,pi,autohand"`
-	Branch    string              `json:"branch,omitempty"`
-	Prompt    string              `json:"prompt,omitempty" maxLength:"4096"`
+	ProjectID       domain.ProjectID       `json:"projectId"`
+	IssueID         domain.IssueID         `json:"issueId,omitempty"`
+	Kind            domain.SessionKind     `json:"kind,omitempty" enum:"worker,orchestrator"`
+	Harness         domain.AgentHarness    `json:"harness,omitempty" enum:"claude-code,codex,aider,opencode,grok,droid,amp,agy,crush,cursor,qwen,copilot,goose,auggie,continue,devin,cline,kimi,kiro,kilocode,vibe,pi,autohand"`
+	Model           string                 `json:"model,omitempty"`
+	ReasoningEffort domain.ReasoningEffort `json:"reasoningEffort,omitempty" enum:"low,medium,high,xhigh,max,ultra"`
+	Branch          string                 `json:"branch,omitempty"`
+	Prompt          string                 `json:"prompt,omitempty" maxLength:"4096"`
+	// DisplayName is the sidebar label for the session, capped at 20 characters.
+	// `ao spawn --name` always sets it; other clients (e.g. the desktop new-task
+	// dialog) may omit it and fall back to the session id in the read model.
+	DisplayName string `json:"displayName,omitempty" maxLength:"20"`
 }
 
 // SessionResponse is the { session } body shared by session create/get.
@@ -294,6 +311,8 @@ type SessionPRUnresolvedReviewer struct {
 	ReviewerID string                       `json:"reviewerId"`
 	Count      int                          `json:"count"`
 	Links      []SessionPRReviewCommentLink `json:"links"`
+	ReviewURL  string                       `json:"reviewUrl,omitempty"`
+	IsBot      bool                         `json:"isBot,omitempty"`
 }
 
 // SessionPRReviewCommentLink points to one unresolved review comment.
@@ -365,7 +384,7 @@ func newSessionPRReviewSummary(in sessionsvc.PRReviewSummary) SessionPRReviewSum
 		for _, link := range reviewer.Links {
 			links = append(links, SessionPRReviewCommentLink{URL: link.URL, File: link.File, Line: link.Line})
 		}
-		reviewers = append(reviewers, SessionPRUnresolvedReviewer{ReviewerID: reviewer.ReviewerID, Count: reviewer.Count, Links: links})
+		reviewers = append(reviewers, SessionPRUnresolvedReviewer{ReviewerID: reviewer.ReviewerID, Count: reviewer.Count, Links: links, ReviewURL: reviewer.ReviewURL, IsBot: reviewer.IsBot})
 	}
 	return SessionPRReviewSummary{Decision: in.Decision, HasUnresolvedHumanComments: in.HasUnresolvedHumanComments, UnresolvedBy: reviewers}
 }
@@ -394,8 +413,17 @@ type ClaimPRResponse struct {
 }
 
 // SetActivityRequest is the body of POST /api/v1/sessions/{sessionId}/activity.
+// Event/ToolName/ToolUseID are optional correlation facts: which AO hook
+// sub-command produced the state and, for tool-use hooks, which tool call it
+// concerns. Lifecycle uses them to clear a stale blocked state only when the
+// specific approved tool finishes. Absent on old CLIs and on adapters whose
+// payloads carry no tool identity — the signal then keeps its plain
+// state-only semantics.
 type SetActivityRequest struct {
-	State string `json:"state" enum:"active,idle,waiting_input,exited" description:"Agent activity state reported by an agent hook."`
+	State     string `json:"state" enum:"active,idle,waiting_input,blocked,exited" description:"Agent activity state reported by an agent hook."`
+	Event     string `json:"event,omitempty" description:"AO hook sub-command that produced this state (e.g. post-tool-use)."`
+	ToolName  string `json:"toolName,omitempty" description:"Native tool name, for tool-use hook events."`
+	ToolUseID string `json:"toolUseId,omitempty" description:"Native tool-use id, for tool-use hook events."`
 }
 
 // SetActivityResponse is the body of POST /api/v1/sessions/{sessionId}/activity.
@@ -427,6 +455,18 @@ type OrchestratorResponse struct {
 	ProjectID   domain.ProjectID `json:"projectId"`
 	ProjectName string           `json:"projectName,omitempty"`
 }
+
+// ListAgentsResponse is the body of GET /api/v1/agents.
+type ListAgentsResponse = agentsvc.Inventory
+
+// RefreshAgentsResponse is the body of POST /api/v1/agents/refresh.
+type RefreshAgentsResponse = agentsvc.Inventory
+
+// ProbeAgentResponse is the body of POST /api/v1/agents/{agent}/probe.
+type ProbeAgentResponse = agentsvc.ProbeResult
+
+// AgentInfo is one supported or installed agent entry.
+type AgentInfo = agentsvc.Info
 
 // ListNotificationsQuery is the query string accepted by GET /api/v1/notifications.
 type ListNotificationsQuery struct {
@@ -485,6 +525,19 @@ type MarkAllNotificationsReadResponse struct {
 	Notifications []NotificationResponse `json:"notifications"`
 }
 
+// ImportStatusResponse is the body of GET /api/v1/import: whether a legacy AO
+// install is available to import, and the root the daemon would read from.
+type ImportStatusResponse struct {
+	Available  bool   `json:"available"`
+	LegacyRoot string `json:"legacyRoot"`
+}
+
+// ImportRunResponse is the body of POST /api/v1/import: the structured outcome
+// of the import run (counts + notes), reused verbatim from the import engine.
+type ImportRunResponse struct {
+	Report legacyimport.Report `json:"report"`
+}
+
 // PRIDParam is the {id} path parameter shared by the /prs/{id} routes.
 type PRIDParam struct {
 	ID string `path:"id" description:"PR number."`
@@ -506,4 +559,15 @@ type ResolveCommentsRequest struct {
 type ResolveCommentsResponse struct {
 	OK       bool `json:"ok"`
 	Resolved int  `json:"resolved"`
+}
+
+// MobileStatusResponse is the body of the Connect Mobile status/enable/disable/
+// regenerate endpoints. Password is populated only transiently, on enable and
+// regenerate responses (empty otherwise) — it is never persisted in plaintext.
+type MobileStatusResponse struct {
+	Enabled  bool   `json:"enabled"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Password string `json:"password"`
+	Warning  string `json:"warning"`
 }

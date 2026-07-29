@@ -1,6 +1,9 @@
 import { create } from "zustand";
+import { resolveTheme, themeStorageKey, type Theme } from "../lib/theme";
 
-export type Theme = "light" | "dark";
+export type { Theme } from "../lib/theme";
+export { readStoredTheme } from "../lib/theme";
+
 /** Worker detail view toggles — Changes (Git rail) is the default. */
 export type WorkbenchTab = "changes" | "files" | "terminal";
 
@@ -13,16 +16,21 @@ type UiState = {
 	isSidebarOpen: boolean;
 	isInspectorOpen: boolean;
 	theme: Theme;
+	restartingProjectIds: ReadonlySet<string>;
+	orchestratorReplacementErrors: Record<string, string>;
+	orchestratorStartupErrors: Record<string, string>;
 	setWorkbenchTab: (tab: WorkbenchTab) => void;
 	setTheme: (theme: Theme) => void;
 	toggleTheme: () => void;
 	toggleSidebar: () => void;
 	toggleInspector: () => void;
+	setProjectRestarting: (projectId: string, restarting: boolean) => void;
+	setOrchestratorReplacementError: (projectId: string, message: string | null) => void;
+	setOrchestratorStartupError: (projectId: string, message: string | null) => void;
 };
 
 const sidebarStorageKey = "ao.sidebar.open";
 const inspectorStorageKey = "ao.inspector.open";
-const themeStorageKey = "ao.theme";
 
 function getLocalStorage() {
 	if (typeof window === "undefined" || !window.localStorage) return null;
@@ -37,27 +45,14 @@ function initialInspectorOpen() {
 	return getLocalStorage()?.getItem(inspectorStorageKey) !== "false";
 }
 
-function systemTheme(): Theme {
-	if (typeof window === "undefined") return "dark";
-	return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-}
-
-function initialTheme(): Theme {
-	const stored = getLocalStorage()?.getItem(themeStorageKey);
-	if (stored === "light" || stored === "dark") return stored;
-	return systemTheme();
-}
-
-export function readStoredTheme(): Theme | null {
-	const stored = getLocalStorage()?.getItem(themeStorageKey);
-	return stored === "light" || stored === "dark" ? stored : null;
-}
-
 export const useUiStore = create<UiState>((set) => ({
 	workbenchTab: "changes",
 	isSidebarOpen: initialSidebarOpen(),
 	isInspectorOpen: initialInspectorOpen(),
-	theme: initialTheme(),
+	theme: resolveTheme(),
+	restartingProjectIds: new Set<string>(),
+	orchestratorReplacementErrors: {},
+	orchestratorStartupErrors: {},
 	setWorkbenchTab: (workbenchTab) => set({ workbenchTab }),
 	setTheme: (theme) => {
 		getLocalStorage()?.setItem(themeStorageKey, theme);
@@ -80,5 +75,35 @@ export const useUiStore = create<UiState>((set) => ({
 			const isInspectorOpen = !state.isInspectorOpen;
 			getLocalStorage()?.setItem(inspectorStorageKey, String(isInspectorOpen));
 			return { isInspectorOpen };
+		}),
+	setProjectRestarting: (projectId, restarting) =>
+		set((state) => {
+			const restartingProjectIds = new Set(state.restartingProjectIds);
+			if (restarting) {
+				restartingProjectIds.add(projectId);
+			} else {
+				restartingProjectIds.delete(projectId);
+			}
+			return { restartingProjectIds };
+		}),
+	setOrchestratorReplacementError: (projectId, message) =>
+		set((state) => {
+			const orchestratorReplacementErrors = { ...state.orchestratorReplacementErrors };
+			if (message) {
+				orchestratorReplacementErrors[projectId] = message;
+			} else {
+				delete orchestratorReplacementErrors[projectId];
+			}
+			return { orchestratorReplacementErrors };
+		}),
+	setOrchestratorStartupError: (projectId, message) =>
+		set((state) => {
+			const orchestratorStartupErrors = { ...state.orchestratorStartupErrors };
+			if (message) {
+				orchestratorStartupErrors[projectId] = message;
+			} else {
+				delete orchestratorStartupErrors[projectId];
+			}
+			return { orchestratorStartupErrors };
 		}),
 }));

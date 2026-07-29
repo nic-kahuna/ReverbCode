@@ -105,16 +105,20 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 
 func sessionJSON(id, project, kind, status string, terminated bool) string {
 	b, _ := json.Marshal(map[string]any{
-		"id":           id,
-		"projectId":    project,
-		"kind":         kind,
-		"harness":      "codex",
-		"displayName":  "Current Name",
-		"activity":     map[string]any{"state": "idle", "lastActivityAt": "2026-06-02T12:00:00Z"},
-		"isTerminated": terminated,
-		"createdAt":    "2026-06-02T11:00:00Z",
-		"updatedAt":    "2026-06-02T12:00:00Z",
-		"status":       status,
+		"id":             id,
+		"projectId":      project,
+		"kind":           kind,
+		"harness":        "codex",
+		"displayName":    "Current Name",
+		"branch":         "ao/" + id + "/root",
+		"workspacePath":  "/tmp/worktrees/" + id,
+		"activity":       map[string]any{"state": "idle", "lastActivityAt": "2026-06-02T12:00:00Z"},
+		"isTerminated":   terminated,
+		"createdAt":      "2026-06-02T11:00:00Z",
+		"updatedAt":      "2026-06-02T12:00:00Z",
+		"status":         status,
+		"requestedRoute": map[string]any{"harness": "codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium"},
+		"launchRoute":    map[string]any{"harness": "codex", "model": "gpt-5.6-luna", "reasoningEffort": "medium"},
 	})
 	return string(b)
 }
@@ -177,6 +181,9 @@ func TestSessionList_JSONOutputDecodes(t *testing.T) {
 	if got.Data[0].ID != "demo-1" || got.Data[0].ProjectID != "demo" || got.Data[0].Role != "worker" {
 		t.Fatalf("unexpected JSON entry: %#v", got.Data[0])
 	}
+	if got.Data[0].Branch != "ao/demo-1/root" || got.Data[0].WorkspacePath != "/tmp/worktrees/demo-1" {
+		t.Fatalf("session workspace identity missing from JSON entry: %#v", got.Data[0])
+	}
 }
 
 func TestSessionGet_SuccessWithProjectScope(t *testing.T) {
@@ -192,6 +199,9 @@ func TestSessionGet_SuccessWithProjectScope(t *testing.T) {
 	}
 	if !strings.Contains(out, "id: demo-1") || !strings.Contains(out, "project: demo") {
 		t.Fatalf("unexpected get output:\n%s", out)
+	}
+	if !strings.Contains(out, "requested route: codex / gpt-5.6-luna / medium") || !strings.Contains(out, "launch route: codex / gpt-5.6-luna / medium") {
+		t.Fatalf("route readback missing from get output:\n%s", out)
 	}
 	want := []string{"GET /api/v1/sessions/demo-1"}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
@@ -216,6 +226,12 @@ func TestSessionGet_JSONOutputDecodes(t *testing.T) {
 	}
 	if got.Session.ID != "demo-1" || got.Session.ProjectID != "demo" || got.Session.Status != "working" {
 		t.Fatalf("unexpected session JSON: %#v", got.Session)
+	}
+	if got.Session.RequestedRoute == nil || got.Session.LaunchRoute == nil || got.Session.LaunchRoute.Model != "gpt-5.6-luna" {
+		t.Fatalf("route readback missing from session JSON: %#v", got.Session)
+	}
+	if got.Session.Branch != "ao/demo-1/root" || got.Session.WorkspacePath != "/tmp/worktrees/demo-1" {
+		t.Fatalf("session workspace identity missing from session JSON: %#v", got.Session)
 	}
 }
 

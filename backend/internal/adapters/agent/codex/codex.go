@@ -13,16 +13,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 // Plugin is the Codex agent adapter. It is safe for concurrent use; the binary
 // path is resolved once and cached under binaryMu.
 type Plugin struct {
+	agentbase.Base
 	binaryMu       sync.Mutex
 	resolvedBinary string
 }
@@ -32,8 +38,21 @@ func New() *Plugin {
 	return &Plugin{}
 }
 
+// EmitsSubmitActivity signals Codex fires a user-prompt-submit hook under AO's
+// launch. See ports.ActivitySignaler.
+func (p *Plugin) EmitsSubmitActivity() bool { return true }
+
+// EmitsBlockedActivity is false: codex reports permission prompts as
+// waiting_input — it installs no post-tool-use hook, so a blocked state could
+// never be cleared mid-turn. confirmActive must not nudge it (an Enter could
+// answer a pending decision it cannot report as blocked). See
+// ports.ActivitySignaler.
+func (p *Plugin) EmitsBlockedActivity() bool { return false }
+
 var _ adapters.Adapter = (*Plugin)(nil)
 var _ ports.Agent = (*Plugin)(nil)
+var _ ports.AgentAuthChecker = (*Plugin)(nil)
+var _ ports.AgentConfigValidator = (*Plugin)(nil)
 
 // Manifest returns the adapter's static self-description.
 func (p *Plugin) Manifest() adapters.Manifest {
@@ -48,12 +67,39 @@ func (p *Plugin) Manifest() adapters.Manifest {
 	}
 }
 
-// GetConfigSpec reports the agent-specific config keys. Codex exposes none yet.
+var codexReasoningEffortConfigEnum = []string{
+	string(domain.ReasoningEffortLow),
+	string(domain.ReasoningEffortMedium),
+	string(domain.ReasoningEffortHigh),
+	string(domain.ReasoningEffortXHigh),
+	string(domain.ReasoningEffortMax),
+	string(domain.ReasoningEffortUltra),
+}
+
+// GetConfigSpec reports the per-project defaults Codex also accepts as
+// per-session route overrides.
 func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
 	if err := ctx.Err(); err != nil {
 		return ports.ConfigSpec{}, err
 	}
-	return ports.ConfigSpec{}, nil
+	return ports.ConfigSpec{Fields: []ports.ConfigField{
+		{Key: "model", Type: ports.ConfigFieldString, Description: "Model override passed to `codex --model`."},
+		{Key: "profile", Type: ports.ConfigFieldString, Description: "Named Codex configuration profile passed through `codex --profile`."},
+		{Key: "reasoningEffort", Type: ports.ConfigFieldEnum, Description: "Per-session reasoning passed through `model_reasoning_effort`.", Enum: codexReasoningEffortConfigEnum},
+	}}, nil
+}
+
+// ValidateAgentConfig rejects malformed route values before AO creates durable
+// session state. Model-specific availability remains a provider capability
+// fact and is verified by the routing canary rather than a stale AO catalog.
+func (p *Plugin) ValidateAgentConfig(ctx context.Context, cfg ports.AgentConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("codex: %w", err)
+	}
+	return nil
 }
 
 // GetLaunchCommand builds the argv to start a new Codex session, applying the
@@ -62,6 +108,9 @@ func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
 // instructions, and the initial prompt (passed after `--` so a leading "-" is
 // not read as a flag).
 func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (cmd []string, err error) {
+	if err := p.ValidateAgentConfig(ctx, cfg.Config); err != nil {
+		return nil, err
+	}
 	binary, err := p.codexBinary(ctx)
 	if err != nil {
 		return nil, err
@@ -74,7 +123,9 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
+	appendProfileFlag(&cmd, cfg.Config)
 	appendWorkspaceTrustFlag(&cmd, cfg.WorkspacePath)
+	appendModelAndReasoningFlags(&cmd, cfg.Config)
 
 	if cfg.SystemPromptFile != "" {
 		cmd = append(cmd, "-c", "model_instructions_file="+cfg.SystemPromptFile)
@@ -89,15 +140,6 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	return cmd, nil
 }
 
-// GetPromptDeliveryStrategy reports that Codex receives its prompt in the
-// launch command itself.
-func (p *Plugin) GetPromptDeliveryStrategy(ctx context.Context, cfg ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	return ports.PromptDeliveryInCommand, nil
-}
-
 // GetRestoreCommand rebuilds the argv that continues an existing Codex
 // session: `codex resume <agentSessionId>`. ok is false when the hook-derived
 // native session id has not landed yet, so callers can fall back to fresh
@@ -109,6 +151,9 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	agentSessionID := strings.TrimSpace(cfg.Session.Metadata[ports.MetadataKeyAgentSessionID])
 	if agentSessionID == "" {
 		return nil, false, nil
+	}
+	if err := p.ValidateAgentConfig(ctx, cfg.Config); err != nil {
+		return nil, false, err
 	}
 
 	binary, err := p.codexBinary(ctx)
@@ -124,9 +169,26 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
+	appendProfileFlag(&cmd, cfg.Config)
 	appendWorkspaceTrustFlag(&cmd, cfg.Session.WorkspacePath)
+	appendModelAndReasoningFlags(&cmd, cfg.Config)
 	cmd = append(cmd, agentSessionID)
 	return cmd, true, nil
+}
+
+func appendModelAndReasoningFlags(cmd *[]string, cfg ports.AgentConfig) {
+	if model := strings.TrimSpace(cfg.Model); model != "" {
+		*cmd = append(*cmd, "--model", model)
+	}
+	if cfg.ReasoningEffort != "" {
+		*cmd = append(*cmd, "-c", "model_reasoning_effort="+strconv.Quote(string(cfg.ReasoningEffort)))
+	}
+}
+
+func appendProfileFlag(cmd *[]string, cfg ports.AgentConfig) {
+	if profile := strings.TrimSpace(cfg.Profile); profile != "" {
+		*cmd = append(*cmd, "--profile", profile)
+	}
 }
 
 // SessionInfo surfaces Codex hook-derived metadata. Metadata is intentionally
@@ -135,21 +197,41 @@ func (p *Plugin) SessionInfo(ctx context.Context, session ports.SessionRef) (por
 	if err := ctx.Err(); err != nil {
 		return ports.SessionInfo{}, false, err
 	}
-	info := ports.SessionInfo{
-		AgentSessionID: session.Metadata[ports.MetadataKeyAgentSessionID],
-		Title:          session.Metadata[ports.MetadataKeyTitle],
-		Summary:        session.Metadata[ports.MetadataKeySummary],
+	info, ok := agentbase.StandardSessionInfo(session)
+	return info, ok, nil
+}
+
+// AuthStatus checks Codex's local login state without making a model call.
+func (p *Plugin) AuthStatus(ctx context.Context) (ports.AgentAuthStatus, error) {
+	binary, err := p.codexBinary(ctx)
+	if err != nil {
+		return ports.AgentAuthStatusUnknown, err
 	}
-	if info.AgentSessionID == "" && info.Title == "" && info.Summary == "" {
-		return ports.SessionInfo{}, false, nil
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(probeCtx, binary, "login", "status").CombinedOutput()
+	if probeCtx.Err() != nil {
+		return ports.AgentAuthStatusUnknown, probeCtx.Err()
 	}
-	return info, true, nil
+	text := strings.ToLower(string(out))
+	if strings.Contains(text, "not logged in") || strings.Contains(text, "logged out") {
+		return ports.AgentAuthStatusUnauthorized, nil
+	}
+	if strings.Contains(text, "logged in") {
+		return ports.AgentAuthStatusAuthorized, nil
+	}
+	if err != nil {
+		return ports.AgentAuthStatusUnauthorized, nil
+	}
+	return ports.AgentAuthStatusUnknown, nil
 }
 
 // ResolveCodexBinary returns the path to the codex binary on this machine,
 // searching PATH then a handful of well-known install locations
-// (Homebrew, Cargo, npm global). Returns "codex" as a last-ditch fallback
-// so callers see a clear "command not found" rather than an empty argv.
+// (Homebrew, Cargo, npm global, NVM). Returns "codex" as a last-ditch
+// fallback so callers see a clear "command not found" rather than an empty
+// argv.
 func ResolveCodexBinary(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -203,6 +285,7 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 			filepath.Join(home, ".cargo", "bin", "codex"),
 			filepath.Join(home, ".npm", "bin", "codex"),
 		)
+		candidates = append(candidates, nvmNodeBinCandidates(home, "codex")...)
 	}
 
 	for _, candidate := range candidates {
@@ -217,6 +300,14 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("codex: %w", ports.ErrAgentBinaryNotFound)
 }
 
+func nvmNodeBinCandidates(home, binary string) []string {
+	matches, err := filepath.Glob(filepath.Join(home, ".nvm", "versions", "node", "*", "bin", binary))
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+	return matches
+}
 func resolveNativeWindowsCodex(path string) string {
 	if runtime.GOOS != "windows" || !strings.EqualFold(filepath.Ext(path), ".cmd") {
 		return path
@@ -301,7 +392,7 @@ func appendTerminalCompatibilityFlags(cmd *[]string) {
 }
 
 func appendApprovalFlags(cmd *[]string, permissions ports.PermissionMode) {
-	switch normalizePermissionMode(permissions) {
+	switch ports.NormalizePermissionMode(permissions) {
 	case ports.PermissionModeDefault:
 		// Codex sessions are AO-managed and run headlessly inside a terminal
 		// mux pane; default to no approval prompts unless project settings
@@ -316,19 +407,8 @@ func appendApprovalFlags(cmd *[]string, permissions ports.PermissionMode) {
 	}
 }
 
-func normalizePermissionMode(mode ports.PermissionMode) ports.PermissionMode {
-	switch mode {
-	case ports.PermissionModeDefault,
-		ports.PermissionModeAcceptEdits,
-		ports.PermissionModeAuto,
-		ports.PermissionModeBypassPermissions:
-		return mode
-	default:
-		return ports.PermissionModeDefault
-	}
-}
-
-func fileExists(path string) bool {
+// fileExists is a package var so tests can stub it to scope candidate probing.
+var fileExists = func(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
 }

@@ -19,6 +19,7 @@ import (
 
 // APIDeps bundles every service the API layer's controllers depend on.
 type APIDeps struct {
+	Agents             controllers.AgentCatalog
 	Projects           projectsvc.Manager
 	Sessions           controllers.SessionService
 	Activity           controllers.ActivityRecorder
@@ -26,20 +27,24 @@ type APIDeps struct {
 	Reviews            reviewsvc.Manager
 	Notifications      controllers.NotificationService
 	NotificationStream controllers.NotificationStream
+	Import             controllers.ImportService
 	CDC                cdc.Source
 	Events             cdcSubscriber
 	Telemetry          ports.EventSink
+	Mobile             *controllers.MobileController
 }
 
 // API owns one controller per resource and is the single Register call the
 // router invokes to mount the /api/v1 surface.
 type API struct {
 	cfg           config.Config
+	agents        *controllers.AgentsController
 	projects      *controllers.ProjectsController
 	sessions      *controllers.SessionsController
 	prs           *controllers.PRsController
 	reviews       *controllers.ReviewsController
 	notifications *controllers.NotificationsController
+	imports       *controllers.ImportController
 	events        *EventsController
 }
 
@@ -49,6 +54,9 @@ type API struct {
 func NewAPI(cfg config.Config, deps APIDeps) *API {
 	return &API{
 		cfg: cfg,
+		agents: &controllers.AgentsController{
+			Catalog: deps.Agents,
+		},
 		projects: &controllers.ProjectsController{
 			Mgr: deps.Projects,
 		},
@@ -59,6 +67,7 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 		prs:           &controllers.PRsController{Svc: deps.PRs},
 		reviews:       &controllers.ReviewsController{Svc: deps.Reviews},
 		notifications: &controllers.NotificationsController{Svc: deps.Notifications, Stream: deps.NotificationStream},
+		imports:       &controllers.ImportController{Svc: deps.Import},
 		events:        &EventsController{Source: deps.CDC, Live: deps.Events},
 	}
 }
@@ -77,11 +86,13 @@ func (a *API) Register(root chi.Router) {
 
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Timeout(timeout))
+			a.agents.Register(r)
 			a.projects.Register(r)
 			a.sessions.Register(r)
 			a.prs.Register(r)
 			a.reviews.Register(r)
 			a.notifications.Register(r)
+			a.imports.Register(r)
 			// Sibling REST controllers plug in here.
 		})
 		// Long-lived streams intentionally bypass the REST timeout middleware.

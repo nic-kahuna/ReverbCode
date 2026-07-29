@@ -40,17 +40,27 @@ type sessionRenameRequest struct {
 }
 
 type sessionDTO struct {
-	ID           string          `json:"id"`
-	ProjectID    string          `json:"projectId"`
-	IssueID      string          `json:"issueId,omitempty"`
-	Kind         string          `json:"kind"`
-	Harness      string          `json:"harness,omitempty"`
-	DisplayName  string          `json:"displayName,omitempty"`
-	Activity     sessionActivity `json:"activity"`
-	IsTerminated bool            `json:"isTerminated"`
-	CreatedAt    time.Time       `json:"createdAt"`
-	UpdatedAt    time.Time       `json:"updatedAt"`
-	Status       string          `json:"status"`
+	ID             string           `json:"id"`
+	ProjectID      string           `json:"projectId"`
+	IssueID        string           `json:"issueId,omitempty"`
+	Kind           string           `json:"kind"`
+	Harness        string           `json:"harness,omitempty"`
+	DisplayName    string           `json:"displayName,omitempty"`
+	Activity       sessionActivity  `json:"activity"`
+	IsTerminated   bool             `json:"isTerminated"`
+	CreatedAt      time.Time        `json:"createdAt"`
+	UpdatedAt      time.Time        `json:"updatedAt"`
+	Status         string           `json:"status"`
+	Branch         string           `json:"branch,omitempty"`
+	WorkspacePath  string           `json:"workspacePath,omitempty"`
+	RequestedRoute *sessionRouteDTO `json:"requestedRoute,omitempty"`
+	LaunchRoute    *sessionRouteDTO `json:"launchRoute,omitempty"`
+}
+
+type sessionRouteDTO struct {
+	Harness         string `json:"harness"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 type sessionActivity struct {
@@ -122,6 +132,8 @@ type sessionListEntry struct {
 	Status         string     `json:"status,omitempty"`
 	IssueID        string     `json:"issueId,omitempty"`
 	Harness        string     `json:"harness,omitempty"`
+	Branch         string     `json:"branch,omitempty"`
+	WorkspacePath  string     `json:"workspacePath,omitempty"`
 	IsTerminated   bool       `json:"isTerminated"`
 	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
 	CreatedAt      time.Time  `json:"createdAt"`
@@ -616,6 +628,8 @@ func sessionListEntries(sessions []sessionDTO) []sessionListEntry {
 			Status:         sess.Status,
 			IssueID:        sess.IssueID,
 			Harness:        sess.Harness,
+			Branch:         sess.Branch,
+			WorkspacePath:  sess.WorkspacePath,
 			IsTerminated:   sess.IsTerminated,
 			LastActivityAt: last,
 			CreatedAt:      sess.CreatedAt,
@@ -724,6 +738,24 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 			continue
 		}
 		if _, err := fmt.Fprintf(out, "%s: %s\n", field[0], field[1]); err != nil {
+			return err
+		}
+	}
+	if sess.RequestedRoute != nil {
+		if _, err := fmt.Fprintf(out, "requested route: %s / %s / %s\n", sess.RequestedRoute.Harness, sess.RequestedRoute.Model, sess.RequestedRoute.ReasoningEffort); err != nil {
+			return err
+		}
+	}
+	if sess.LaunchRoute != nil {
+		model := sess.LaunchRoute.Model
+		if model == "" {
+			model = "provider default"
+		}
+		effort := sess.LaunchRoute.ReasoningEffort
+		if effort == "" {
+			effort = "provider default"
+		}
+		if _, err := fmt.Fprintf(out, "launch route: %s / %s / %s\n", sess.LaunchRoute.Harness, model, effort); err != nil {
 			return err
 		}
 	}

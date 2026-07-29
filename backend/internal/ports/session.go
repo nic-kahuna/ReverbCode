@@ -16,6 +16,12 @@ type SpawnConfig struct {
 	IssueID   domain.IssueID
 	Kind      domain.SessionKind
 	Harness   domain.AgentHarness
-	Branch    string
-	Prompt    string
+	// Route is a complete per-session override. When present it wins over the
+	// legacy Harness field and project/role model defaults.
+	Route  *domain.AgentRoute
+	Branch string
+	Prompt string
+	// DisplayName is the user-facing sidebar label. Empty falls back to the
+	// session id in the read model (e.g. orchestrator sessions).
+	DisplayName string
 }

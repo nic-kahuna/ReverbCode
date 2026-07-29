@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
+	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 var workspaceRootIgnoreDenylist = []string{
@@ -213,6 +213,12 @@ func validateWorkspaceChild(ctx context.Context, child string) error {
 			"suggestedFix": "Check out the repository's default branch (for example `main`) and retry.",
 		})
 	}
+	if origin := resolveGitOriginURL(child); origin == "" {
+		return apierr.Invalid("WORKSPACE_CHILD_ORIGIN_REQUIRED", "Workspace child repositories must have an origin remote configured", map[string]any{
+			"path":         child,
+			"suggestedFix": "Run `git remote add origin <url>` in the child repository, then retry.",
+		})
+	}
 	return nil
 }
 
@@ -358,7 +364,7 @@ func workspaceReposFromRecords(records []domain.WorkspaceRepoRecord) []Workspace
 }
 
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd := aoprocess.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git -C %s %s: %w: %s", dir, strings.Join(args, " "), err, strings.TrimSpace(string(out)))

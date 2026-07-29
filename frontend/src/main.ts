@@ -5,19 +5,34 @@ import {
 	dialog,
 	ipcMain,
 	net,
+	nativeImage,
 	Notification as ElectronNotification,
 	protocol,
 	shell,
 	WebContentsView,
 	type OpenDialogOptions,
 } from "electron";
-import { updateElectronApp } from "update-electron-app";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+	startAutoUpdates,
+	ensureUpdatePrefs,
+	checkForUpdatesNow,
+	downloadUpdateNow,
+	quitAndInstallUpdate,
+	getUpdateStatus,
+} from "./main/auto-updater";
+import {
+	readUpdateSettings,
+	writeUpdateSettings,
+	type UpdateSettings,
+	type UpdateStatus,
+} from "./main/update-settings";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, rm } from "node:fs/promises";
+import { readdir, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
@@ -33,6 +48,9 @@ import { buildDaemonEnv, resolveShellEnv, type ShellRunner } from "./shared/shel
 import { DEFAULT_POSTHOG_HOST, DEFAULT_POSTHOG_PROJECT_KEY } from "./shared/posthog-config";
 import { buildTelemetryBootstrap } from "./shared/telemetry";
 import { createBrowserViewHost, type BrowserViewHost } from "./main/browser-view-host";
+import { connectSupervisor, type SupervisorLinkHandle } from "./main/supervisor-link";
+import { shouldLinkOnAttach } from "./main/daemon-owner";
+import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
 
 // Globals injected at compile time by @electron-forge/plugin-vite.
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -53,6 +71,14 @@ process.stderr.on("error", ignoreStdStreamError);
 // Must run before app ready so the About panel and default-menu role labels use it.
 app.setName("Agent Orchestrator");
 
+// Windows shows native toasts only when the app declares an AppUserModelID that
+// matches its installer shortcut (the NSIS maker's appId). Without it,
+// Notification.isSupported() still returns true but show() silently drops the
+// toast, so notifications never appear. No-op on macOS/Linux.
+if (process.platform === "win32") {
+	app.setAppUserModelId("dev.agent-orchestrator.desktop");
+}
+
 // Pin ALL Electron-owned state (Chromium cache, cookies, local/session storage,
 // crash dumps) under the canonical AO home at ~/.ao instead of Electron's macOS
 // default ~/Library/Application Support/<name>. Keeps the app's entire footprint
@@ -68,8 +94,51 @@ let daemonStartPromise: Promise<DaemonStatus> | null = null;
 let daemonStartEpoch = 0;
 let daemonStatus: DaemonStatus = { state: "stopped" };
 let browserViewHost: BrowserViewHost | null = null;
+// Held for the app lifetime. Dropping it (on any exit) triggers daemon self-stop.
+let supervisorLink: SupervisorLinkHandle | null = null;
+
+const execFileAsync = promisify(execFile);
+
+type GitRepoScanResult = {
+	name: string;
+	path: string;
+	relativePath: string;
+	branch: string;
+	remote: string;
+	hasRemote: boolean;
+	status: "ok" | "error";
+	reason?: string;
+};
+
+type ImportFolderScanResult = {
+	path: string;
+	repos: GitRepoScanResult[];
+};
+
+const IMPORT_SCAN_CONCURRENCY = 8;
+const IMPORT_SCAN_MAX_ENTRIES = 200;
+const IMPORT_SCAN_SKIP_DIRS = new Set([
+	".git",
+	"node_modules",
+	"dist",
+	"build",
+	".cache",
+	".turbo",
+	"target",
+	"coverage",
+	"tmp",
+	"temp",
+	"Library",
+]);
 
 const isDev = !app.isPackaged;
+
+// Dev mode uses a separate port and state subdirectory so it never collides with
+// a concurrently running installed-app daemon. The subdir also isolates supervise.sock
+// on Unix (backend derives it as dir(RunFilePath)/supervise.sock) and the named pipe
+// on Windows (supervisorPipeFromRunFile derives it from the same dir basename).
+const DEV_DAEMON_PORT = 3002;
+const DEV_STATE_SUBDIR = "dev"; // ~/.ao/dev/
 
 const RENDERER_SCHEME = "app";
 const RENDERER_HOST = "renderer";
@@ -136,6 +205,16 @@ function windowIconPath(): string | undefined {
 		? path.join(process.resourcesPath, "icon.png")
 		: path.join(__dirname, "../../assets/icon.png");
 	return existsSync(candidate) ? candidate : undefined;
+}
+
+function applyRuntimeAppIcon(): void {
+	if (process.platform !== "darwin") return;
+	const iconPath = windowIconPath();
+	if (!iconPath) return;
+	const icon = nativeImage.createFromPath(iconPath);
+	if (!icon.isEmpty()) {
+		app.dock.setIcon(icon);
+	}
 }
 
 function setDaemonStatus(nextStatus: DaemonStatus): void {
@@ -220,6 +299,7 @@ const DAEMON_PROBE_TIMEOUT_MS = 2_000;
 
 function runFilePath(): string | null {
 	if (process.env.AO_RUN_FILE) return process.env.AO_RUN_FILE;
+	if (isDev) return path.join(os.homedir(), ".ao", DEV_STATE_SUBDIR, "running.json");
 	return defaultRunFilePath(process.platform, process.env, os.homedir());
 }
 
@@ -300,11 +380,23 @@ function ensureShellEnv(): Promise<void> {
 }
 
 function daemonEnv(): NodeJS.ProcessEnv {
+	// AO_OWNER=app marks this daemon as app-spawned so the app can re-link the
+	// supervisor on attach (headless `ao start` daemons get no AO_OWNER and stay
+	// unlinked, preserving their persistence across app quit).
+	const ownerTag = { AO_OWNER: "app" };
+	// In dev mode, inject isolation defaults so the dev daemon never collides with
+	// the installed app. User-set env vars take priority (checked first).
+	const devExtras: Record<string, string> = {};
+	if (isDev) {
+		if (!process.env.AO_PORT) devExtras.AO_PORT = String(DEV_DAEMON_PORT);
+		if (!process.env.AO_RUN_FILE) devExtras.AO_RUN_FILE = runFilePath() ?? "";
+		if (!process.env.AO_DATA_DIR) devExtras.AO_DATA_DIR = path.join(os.homedir(), ".ao", DEV_STATE_SUBDIR, "data");
+	}
 	// Windows keeps the old behavior exactly: no shell probe, no unix PATH floor.
 	if (process.platform === "win32") {
-		return { ...process.env, ...telemetryOverrides() };
+		return { ...process.env, ...devExtras, ...telemetryOverrides(), ...ownerTag };
 	}
-	return buildDaemonEnv(process.env, cachedShellEnv, telemetryOverrides());
+	return buildDaemonEnv(process.env, cachedShellEnv, { ...devExtras, ...telemetryOverrides(), ...ownerTag });
 }
 
 function pathKey(value: string): string {
@@ -371,7 +463,45 @@ function daemonIdentityError(launch: DaemonLaunchSpec, probe: DaemonProbe): stri
 	return null;
 }
 
-async function inspectExistingDaemon(launch: DaemonLaunchSpec): Promise<DaemonStatus | null> {
+/**
+ * Establish (or re-establish) the OS-native liveness link to the daemon's
+ * supervisor socket. Holding this connection keeps the daemon alive: when
+ * Electron exits for any reason (Cmd+Q, crash, SIGKILL), the OS closes the fd
+ * and the daemon detects EOF, then self-stops after its ~5s grace period.
+ *
+ * Called unconditionally on the spawn path (we always own that daemon).
+ * Called on the attach path only when the daemon is app-owned (owner === "app");
+ * headless `ao start` daemons stay unlinked so they remain persistent after
+ * app quit.
+ */
+function supervisorPipeFromRunFile(rfp: string | null): string {
+	if (!rfp) return "\\\\.\\pipe\\ao-supervise";
+	const dir = path.basename(path.dirname(rfp));
+	if (dir === ".ao" || dir === "." || dir === "") return "\\\\.\\pipe\\ao-supervise";
+	return "\\\\.\\pipe\\ao-supervise-" + dir.replace(/[^a-zA-Z0-9-]/g, "-");
+}
+
+function establishSupervisorLink(): void {
+	const rfp = runFilePath();
+	const addr =
+		process.platform === "win32"
+			? supervisorPipeFromRunFile(rfp)
+			: rfp
+				? path.join(path.dirname(rfp), "supervise.sock")
+				: null;
+	if (addr) {
+		supervisorLink?.dispose();
+		supervisorLink = connectSupervisor(addr, {
+			log: (msg) => console.log(`AO: ${msg}`),
+		});
+	} else {
+		console.warn("AO: supervisor link skipped; run-file path unavailable");
+	}
+}
+
+async function inspectExistingDaemon(
+	launch: DaemonLaunchSpec,
+): Promise<{ status: DaemonStatus; owner: string | undefined } | null> {
 	const handshakePath = runFilePath();
 	let runFileContents: string | null = null;
 	if (handshakePath) {
@@ -381,12 +511,15 @@ async function inspectExistingDaemon(launch: DaemonLaunchSpec): Promise<DaemonSt
 			runFileContents = null;
 		}
 	}
-	return resolveDaemonFromRunFile({
+	const status = await resolveDaemonFromRunFile({
 		runFileContents,
 		isProcessAlive: processAlive,
 		probe: readDaemonProbe,
 		identityError: (probe) => daemonIdentityError(launch, probe),
 	});
+	if (!status) return null;
+	const owner = runFileContents ? (parseRunFile(runFileContents)?.owner ?? undefined) : undefined;
+	return { status, owner };
 }
 
 async function refreshDaemonStatus(): Promise<DaemonStatus> {
@@ -403,7 +536,7 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 	if (!launch) return daemonStatus;
 	const existing = await inspectExistingDaemon(launch);
 	if (existing) {
-		setDaemonStatus(existing);
+		setDaemonStatus(existing.status);
 	} else if (
 		daemonStatus.state === "ready" ||
 		(daemonStatus.state === "error" && (daemonStatus.pid || daemonStatus.port))
@@ -411,6 +544,7 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 		setDaemonStatus({
 			state: "stopped",
 			message: "AO daemon is no longer reachable.",
+			code: "daemon_unreachable",
 		});
 	}
 	return daemonStatus;
@@ -428,6 +562,13 @@ async function startDaemon(): Promise<DaemonStatus> {
 	});
 	daemonStartPromise = promise;
 	return daemonStartPromise;
+}
+
+// The port this Electron instance expects the daemon to bind. In dev mode a
+// separate port isolates the dev daemon from the installed-app daemon.
+// AO_PORT always wins if set explicitly.
+function resolvedDaemonPort(): number {
+	return isDev && !process.env.AO_PORT ? DEV_DAEMON_PORT : expectedDaemonPort(process.env);
 }
 
 async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
@@ -451,6 +592,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		setDaemonStatus({
 			state: "stopped",
 			message: "AO_DAEMON_COMMAND is not configured; renderer uses loopback REST when available.",
+			code: "not_configured",
 		});
 		return daemonStatus;
 	}
@@ -460,7 +602,13 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		return daemonStatus;
 	}
 	if (existing) {
-		setDaemonStatus(existing);
+		setDaemonStatus(existing.status);
+		// Re-link the supervisor only when attaching to an app-owned daemon (one we
+		// previously spawned). Headless `ao start` daemons (owner unset) stay unlinked
+		// so they remain persistent after app quit.
+		if (shouldLinkOnAttach(existing.owner)) {
+			establishSupervisorLink();
+		}
 		return daemonStatus;
 	}
 
@@ -473,7 +621,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// port the Go child would bind and collide on — probing a hardcoded 3001 would
 	// miss an AO_PORT override.
 	const directDaemon = await resolveDaemonFromPort({
-		expectedPort: expectedDaemonPort(process.env),
+		expectedPort: resolvedDaemonPort(),
 		probe: readDaemonProbe,
 		identityError: (probe) => daemonIdentityError(launch, probe),
 	});
@@ -482,6 +630,25 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	}
 	if (directDaemon) {
 		setDaemonStatus(directDaemon);
+		// Re-link iff the daemon is app-owned. Read the run-file for the owner tag;
+		// if unavailable (run-file absent or unreadable), treat as headless and skip.
+		// ponytail: narrow TOCTOU here (the port was probed live, then the run-file
+		// is read separately), so in theory a headless daemon could have replaced an
+		// app-owned one in the gap. Acceptable: the window is tiny, the worst case is
+		// linking a headless daemon, and establishSupervisorLink disposes any prior
+		// link so nothing leaks.
+		const rfp = runFilePath();
+		let portAttachOwner: string | undefined;
+		if (rfp) {
+			try {
+				portAttachOwner = parseRunFile(await readFile(rfp, "utf8"))?.owner ?? undefined;
+			} catch {
+				// run-file absent or unreadable: treat as headless, skip link.
+			}
+		}
+		if (shouldLinkOnAttach(portAttachOwner)) {
+			establishSupervisorLink();
+		}
 		return daemonStatus;
 	}
 
@@ -494,7 +661,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// killed here), and a foreign non-AO process holding the port with a dead
 	// run-file PID is not replaced (out of scope). When no holder is detectable,
 	// skip straight to spawn.
-	const orphanProbe = await readDaemonProbe(expectedDaemonPort(process.env), "healthz");
+	const orphanProbe = await readDaemonProbe(resolvedDaemonPort(), "healthz");
 	const runFilePath_ = runFilePath();
 	let runFilePid: number | null = null;
 	if (runFilePath_) {
@@ -507,7 +674,12 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// process.kill(pid, 0) does not kill; it throws iff the PID is not live.
 	let holderPidAlive = false;
 	if (runFilePid) {
-		try { process.kill(runFilePid, 0); holderPidAlive = true; } catch { holderPidAlive = false; }
+		try {
+			process.kill(runFilePid, 0);
+			holderPidAlive = true;
+		} catch {
+			holderPidAlive = false;
+		}
 	}
 	if (shouldReplacePortHolder(orphanProbe, holderPidAlive)) {
 		// Use the run-file PID when available; fall back to the probe's reported
@@ -529,7 +701,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		const TAKEOVER_POLL_MS = 200;
 		const deadline = Date.now() + TAKEOVER_TIMEOUT_MS;
 		while (Date.now() < deadline) {
-			const still = await readDaemonProbe(expectedDaemonPort(process.env), "healthz");
+			const still = await readDaemonProbe(resolvedDaemonPort(), "healthz");
 			if (!still) break;
 			await new Promise<void>((r) => setTimeout(r, TAKEOVER_POLL_MS));
 		}
@@ -543,6 +715,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		setDaemonStatus({
 			state: "error",
 			message: `Bundled AO daemon binary was not found at ${launch.command}. Rebuild the desktop package.`,
+			code: "binary_missing",
 		});
 		return daemonStatus;
 	}
@@ -588,6 +761,15 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		portConfirmed = true;
 		stopDiscovery();
 		setDaemonStatus({ state: "ready", port });
+
+		// Establish the OS-native liveness link unconditionally: this callback fires
+		// only on the spawn path (we own this daemon). Holding the connection keeps
+		// the daemon alive; when Electron exits for any reason, the OS closes the fd
+		// and the daemon detects EOF, then self-stops after its ~5s grace period.
+		// The attach paths link only when the daemon is app-owned (see
+		// establishSupervisorLink + shouldLinkOnAttach); headless `ao start` daemons
+		// stay unlinked so they remain persistent across app quit.
+		establishSupervisorLink();
 	};
 
 	// One scanner per stream: each keeps its own partial-line buffer.
@@ -629,8 +811,9 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		stopDiscovery();
 		setDaemonStatus({
 			state: "ready",
-			port: process.env.AO_PORT ? Number(process.env.AO_PORT) : undefined,
+			port: resolvedDaemonPort(),
 			message: "Daemon port not confirmed from logs or running.json; assuming the configured port.",
+			code: "port_unconfirmed",
 		});
 	}, PORT_DISCOVERY_TIMEOUT_MS);
 
@@ -639,17 +822,29 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		if (daemonProcess !== child) return;
 		daemonProcess = null;
 		if (daemonStoppingProcess === child) daemonStoppingProcess = null;
-		setDaemonStatus({ state: "error", message: error.message });
+		setDaemonStatus({ state: "error", message: error.message, code: "spawn_failed" });
 	});
 
 	child.once("exit", (code, signal) => {
 		stopDiscovery();
 		if (daemonProcess !== child) return;
 		daemonProcess = null;
-		if (daemonStoppingProcess === child) daemonStoppingProcess = null;
+		// An explicit stopDaemon() already set a clean `{ state: "stopped" }`.
+		// daemon-telemetry reports any status carrying a `code` as
+		// ao.renderer.daemon_failure, so don't stamp `code: "exited"` on a stop
+		// the user or app asked for — that would count intentional stops as
+		// failures. Preserve the clean stopped status instead.
+		if (daemonStoppingProcess === child) {
+			daemonStoppingProcess = null;
+			setDaemonStatus({ state: "stopped" });
+			return;
+		}
 		setDaemonStatus({
 			state: "stopped",
 			message: signal ? `Daemon exited with ${signal}` : `Daemon exited with code ${code ?? "unknown"}`,
+			code: "exited",
+			exitCode: code,
+			signal,
 		});
 	});
 
@@ -678,6 +873,11 @@ function stopDaemon(): DaemonStatus {
 	}
 
 	daemonStoppingProcess = daemonProcess;
+	// Drop the liveness link: an explicit stop is not a frontend death, so stop
+	// holding the socket open (and stop the reconnect loop retrying a dead daemon).
+	// A later daemon:start re-establishes the link via reportBoundPort.
+	supervisorLink?.dispose();
+	supervisorLink = null;
 	killDaemon(daemonProcess);
 	setDaemonStatus({ state: "stopped" });
 	return daemonStatus;
@@ -690,15 +890,171 @@ ipcMain.handle("app:getVersion", () => app.getVersion());
 ipcMain.handle("telemetry:getBootstrap", () =>
 	buildTelemetryBootstrap(process.env, app.getVersion(), process.platform),
 );
-ipcMain.handle("app:chooseDirectory", async () => {
+async function chooseDirectory(title: string): Promise<string | null> {
 	const options: OpenDialogOptions = {
 		properties: ["openDirectory"],
-		title: "Choose a git repository",
+		title,
 	};
-	const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+	// On Windows, parenting the common file dialog forces a repaint of the main
+	// window while Explorer initializes, which produces a visible white flash.
+	// The unparented native dialog remains foregrounded by Electron without that
+	// compositor handoff.
+	const result = await dialog.showOpenDialog(options);
 
 	if (result.canceled) return null;
 	return result.filePaths[0] ?? null;
+}
+
+async function gitOutput(cwd: string, args: string[]): Promise<string> {
+	const { stdout } = await execFileAsync("git", args, { cwd, env: daemonEnv(), timeout: 5000 });
+	return String(stdout).trim();
+}
+
+async function isGitRepo(repoPath: string): Promise<boolean> {
+	try {
+		const gitInfo = await stat(path.join(repoPath, ".git"));
+		if (!gitInfo.isDirectory()) return false;
+		await gitOutput(repoPath, ["rev-parse", "--show-toplevel"]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function resolveDefaultBranch(repoPath: string): Promise<string> {
+	try {
+		const ref = await gitOutput(repoPath, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+		if (ref) return ref.replace(/^origin\//, "");
+	} catch {
+		// Fall back to the checked-out branch when origin/HEAD is unavailable.
+	}
+	try {
+		const branch = await gitOutput(repoPath, ["branch", "--show-current"]);
+		if (branch) return branch;
+	} catch {
+		// Detached or unreadable HEAD is represented below.
+	}
+	return "HEAD";
+}
+
+async function scanGitRepo(repoPath: string, rootPath: string): Promise<GitRepoScanResult | null> {
+	const relativePath = repoPath === rootPath ? "." : path.relative(rootPath, repoPath);
+	const name = path.basename(repoPath);
+	try {
+		const gitInfo = await stat(path.join(repoPath, ".git"));
+		if (!gitInfo.isDirectory()) {
+			return {
+				name,
+				path: repoPath,
+				relativePath,
+				branch: "HEAD",
+				remote: "",
+				hasRemote: false,
+				status: "error",
+				reason: "Linked worktree children cannot be imported.",
+			};
+		}
+	} catch {
+		try {
+			if ((await gitOutput(repoPath, ["rev-parse", "--is-bare-repository"])) === "true") {
+				return {
+					name,
+					path: repoPath,
+					relativePath,
+					branch: "HEAD",
+					remote: "",
+					hasRemote: false,
+					status: "error",
+					reason: "Bare repositories cannot be imported.",
+				};
+			}
+		} catch {
+			// Not a git repository.
+		}
+		return null;
+	}
+	if (!(await isGitRepo(repoPath))) return null;
+	const [branchResult, remoteResult, bareResult, headResult] = await Promise.allSettled([
+		resolveDefaultBranch(repoPath),
+		gitOutput(repoPath, ["remote", "get-url", "origin"]),
+		gitOutput(repoPath, ["rev-parse", "--is-bare-repository"]),
+		gitOutput(repoPath, ["rev-parse", "--verify", "HEAD"]),
+	]);
+	const validationReason = scanRepoValidationReason(
+		name,
+		branchResult.status === "fulfilled" && branchResult.value ? branchResult.value : "HEAD",
+		remoteResult.status === "fulfilled" && remoteResult.value.length > 0,
+		bareResult.status === "fulfilled" && bareResult.value === "true",
+		headResult.status === "fulfilled",
+	);
+	return {
+		name,
+		path: repoPath,
+		relativePath,
+		branch: branchResult.status === "fulfilled" && branchResult.value ? branchResult.value : "HEAD",
+		remote: remoteResult.status === "fulfilled" ? remoteResult.value : "",
+		hasRemote: remoteResult.status === "fulfilled" && remoteResult.value.length > 0,
+		status: validationReason ? "error" : "ok",
+		reason: validationReason,
+	};
+}
+
+function scanRepoValidationReason(
+	name: string,
+	branch: string,
+	hasRemote: boolean,
+	isBare: boolean,
+	hasHead: boolean,
+): string | undefined {
+	if (name === "__root__") return "Repository name is reserved by AO.";
+	if (isBare) return "Bare repositories cannot be imported.";
+	if (!hasHead) return "Repository must have at least one commit.";
+	if (branch === "HEAD") return "Repository must have a checked-out branch.";
+	if (!hasRemote) return "Origin remote is required.";
+	return undefined;
+}
+
+async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+	const out = new Array<R>(items.length);
+	let next = 0;
+	await Promise.all(
+		Array.from({ length: Math.min(limit, items.length) }, async () => {
+			for (;;) {
+				const index = next++;
+				if (index >= items.length) return;
+				out[index] = await fn(items[index]);
+			}
+		}),
+	);
+	return out;
+}
+
+async function scanImportFolder(rootPath: string, mode: "project" | "workspace"): Promise<ImportFolderScanResult> {
+	if (mode === "project") {
+		const repo = await scanGitRepo(rootPath, rootPath);
+		return { path: rootPath, repos: repo ? [repo] : [] };
+	}
+
+	const entries = (await readdir(rootPath, { withFileTypes: true }))
+		.filter((entry) => entry.isDirectory() && !IMPORT_SCAN_SKIP_DIRS.has(entry.name))
+		.slice(0, IMPORT_SCAN_MAX_ENTRIES);
+	const repos = await mapLimited(entries, IMPORT_SCAN_CONCURRENCY, (entry) =>
+		scanGitRepo(path.join(rootPath, entry.name), rootPath),
+	);
+	return {
+		path: rootPath,
+		repos: repos
+			.filter((repo): repo is GitRepoScanResult => repo !== null)
+			.sort((a, b) => a.name.localeCompare(b.name)),
+	};
+}
+
+ipcMain.handle("app:chooseDirectory", async (_event, title?: string) => {
+	return chooseDirectory(typeof title === "string" && title.trim() ? title : "Choose a git repository");
+});
+ipcMain.handle("app:scanImportFolder", async (_event, input: { path: string; mode: "project" | "workspace" }) => {
+	await ensureShellEnv();
+	return scanImportFolder(input.path, input.mode);
 });
 ipcMain.handle("clipboard:writeText", (_event, text: string) => {
 	clipboard.writeText(text, "clipboard");
@@ -707,6 +1063,41 @@ ipcMain.handle("clipboard:writeText", (_event, text: string) => {
 	}
 });
 ipcMain.handle("clipboard:readText", () => clipboard.readText());
+
+ipcMain.handle("appState:getMigration", async (): Promise<MigrationState> => {
+	const runFile = runFilePath();
+	if (!runFile) return { status: "pending" };
+	return readMigrationState(path.dirname(runFile));
+});
+ipcMain.handle("appState:setMigration", async (_event, migration: MigrationState) => {
+	const runFile = runFilePath();
+	if (!runFile) return;
+	await updateMigration({ stateDir: path.dirname(runFile), migration, now: () => new Date() });
+});
+
+ipcMain.handle("updateSettings:get", async (): Promise<UpdateSettings> => {
+	const runFile = runFilePath();
+	if (!runFile) return { enabled: false, channel: "latest", nightlyAck: false };
+	return readUpdateSettings(path.dirname(runFile));
+});
+ipcMain.handle("updateSettings:set", async (_event, settings: UpdateSettings) => {
+	const runFile = runFilePath();
+	if (!runFile) return;
+	await writeUpdateSettings(path.dirname(runFile), settings);
+});
+
+ipcMain.handle("updates:getStatus", (): UpdateStatus => getUpdateStatus());
+ipcMain.handle("updates:check", async () => {
+	const runFile = runFilePath();
+	if (!runFile) return;
+	await checkForUpdatesNow(path.dirname(runFile));
+});
+ipcMain.handle("updates:download", async () => {
+	await downloadUpdateNow();
+});
+ipcMain.handle("updates:install", () => {
+	quitAndInstallUpdate();
+});
 
 ipcMain.handle("notifications:show", (_event, notification: { id: string; title: string; body?: string }) => {
 	if (!notification.id || !notification.title || !ElectronNotification.isSupported()) return;
@@ -730,11 +1121,94 @@ ipcMain.handle("notifications:show", (_event, notification: { id: string; title:
 // frontend/docs/desktop-release.md.
 function initAutoUpdates(): void {
 	if (!app.isPackaged) return;
-	updateElectronApp();
+	const runFile = runFilePath();
+	if (!runFile) return;
+	const stateDir = path.dirname(runFile);
+	void ensureUpdatePrefs(stateDir).then(() => startAutoUpdates(stateDir));
 }
 
-app.whenReady().then(() => {
+// Resolve the bundle path `ao start` will later `open` and stat as a usable app.
+// On macOS process.execPath is .../Agent Orchestrator.app/Contents/MacOS/<exe>;
+// the thing `ao start` opens is the enclosing `.app` directory, so walk up three
+// levels (MacOS -> Contents -> .app). app.getAppPath() is WRONG here: it returns
+// the app.asar archive path inside the bundle, not the bundle itself.
+// On win32/linux there is no .app wrapper, so record execPath; a richer
+// resolveApp() for those platforms lands in T6/T7.
+function resolveBundlePath(): string {
+	if (process.platform === "darwin") {
+		return path.resolve(process.execPath, "..", "..", "..");
+	}
+	return process.execPath;
+}
+
+// `ao start` opens the app with `--installed-via=<value>` so the app can record
+// how it arrived on first marker creation. Parse it out of argv; absent => the
+// marker defaults installSource to "unknown".
+function parseInstalledVia(argv: string[]): string | undefined {
+	const flag = argv.find((a) => a.startsWith("--installed-via="));
+	return flag ? flag.slice("--installed-via=".length) : undefined;
+}
+
+// Write ~/.ao/app-state.json so `ao start`'s resolveApp() can find this bundle
+// (spec §7.1). The app is the sole writer (invariant 3) and writes every launch.
+// A failure here must NOT block startup, so the caller wraps this in try/catch;
+// we still surface it via the log.
+async function writeAppStateOnLaunch(): Promise<void> {
+	// Reuse the same ~/.ao resolution as running.json; the marker lives beside it
+	// (the Go side computes its dir as dirname(RunFilePath)). runFilePath() returns
+	// null only when the home dir is unresolvable, in which case we cannot place
+	// the marker; the caller's try/catch logs it.
+	const runFile = runFilePath();
+	if (!runFile) {
+		throw new Error("cannot resolve ~/.ao run-file path; skipping app-state marker");
+	}
+	const stateDir = path.dirname(runFile);
+	await writeAppStateMarker({
+		stateDir,
+		appPath: resolveBundlePath(),
+		version: app.getVersion(),
+		installedVia: parseInstalledVia(process.argv),
+		now: () => new Date(),
+	});
+}
+
+app.whenReady().then(async () => {
+	// Capture install provenance BEFORE relocation. moveToApplicationsFolder()
+	// relaunches from /Applications WITHOUT forwarding our --installed-via arg, and
+	// code past a successful move never runs in this instance, so a post-move-only
+	// write would record installSource="unknown" and the sticky logic in
+	// writeAppStateMarker would then lock it there forever. Writing now (only when
+	// the arg is present, i.e. the npm-bootstrap launch) persists the source so the
+	// post-move instance preserves it while refreshing appPath to /Applications.
+	if (parseInstalledVia(process.argv)) {
+		try {
+			await writeAppStateOnLaunch();
+		} catch (err) {
+			console.error("failed to write pre-relocation app-state marker:", err);
+		}
+	}
+
+	if (process.platform === "darwin" && app.isPackaged) {
+		try {
+			// On success this restarts the app from /Applications, so code past
+			// here only runs when no move happened (already there, or declined).
+			app.moveToApplicationsFolder();
+		} catch (err) {
+			console.error("relocation to Applications failed:", err);
+		}
+	}
+
+	// Refresh the marker post-relocation so appPath records the final bundle path;
+	// the sticky installSource preserves the value captured above. A marker-write
+	// failure is non-fatal: log and continue so the app still boots.
+	try {
+		await writeAppStateOnLaunch();
+	} catch (err) {
+		console.error("failed to write app-state marker:", err);
+	}
+
 	registerRendererProtocol();
+	applyRuntimeAppIcon();
 	createWindow();
 	void startDaemon();
 	initAutoUpdates();
@@ -746,77 +1220,24 @@ app.whenReady().then(() => {
 	});
 });
 
-// Re-entrancy guard: the first before-quit fires, prevents default, does async
-// work, then calls app.exit(). If app.quit() is called concurrently (e.g. from
-// window-all-closed on non-darwin), the second before-quit fires while the first
-// is still in flight. Without a guard it would preventDefault again and loop.
-// With the guard set to true, the second invocation falls through and lets the
-// quit proceed. app.exit() itself does NOT re-fire before-quit, so the guard
-// mainly protects against a concurrent app.quit() race.
-let quitting = false;
-
-app.on("before-quit", (event) => {
+// Daemon teardown is now handled via the OS-native supervisor socket: the daemon
+// self-stops ~5s after the last client (this process) drops its connection.
+// The supervisorLink fd is NOT explicitly closed on quit; the OS closes it when
+// the process exits for any reason (Cmd+Q, crash, SIGKILL). Sessions survive.
+app.on("before-quit", () => {
 	browserViewHost?.dispose();
 	browserViewHost = null;
-
-	// Re-entrancy: if we already started the async quit sequence, let this
-	// invocation fall through so the app actually exits.
-	if (quitting) return;
-	quitting = true;
-
-	// Capture the current daemon handle and port before any async gap so that
-	// a race with stopDaemon() cannot null them out underneath us.
-	const child = daemonProcess;
-	const port = daemonStatus.state === "ready" ? daemonStatus.port : undefined;
-
-	if (!child) {
-		// No daemon we own: nothing to shut down.
-		return;
-	}
-
-	// Prevent the synchronous quit so we can ask the daemon to save gracefully
-	// before killing it.
-	event.preventDefault();
-
-	const doQuit = async () => {
-		// Best-effort graceful shutdown: POST /shutdown so the daemon flushes
-		// its session state before exiting. An ~8s timeout prevents a hung or
-		// absent daemon from blocking quit indefinitely.
-		// Note: the daemon's internal save bound is 30s (shutdownSaveTimeout), so
-		// if this fetch times out and we proceed to killDaemon (SIGTERM), the first
-		// SIGTERM only cancels the daemon's listen context; the daemon's in-flight
-		// save (on a fresh context) still runs to completion or its own 30s bound.
-		if (port !== undefined) {
-			try {
-				await fetch(`http://127.0.0.1:${port}/shutdown`, {
-					method: "POST",
-					signal: AbortSignal.timeout(8_000),
-				});
-			} catch {
-				// Timeout, network error, or daemon already gone: proceed to kill.
-				console.log(`AO: /shutdown fetch failed (port ${port}); proceeding with SIGTERM.`);
-			}
-		}
-
-		// Kill the daemon process group (reaches the daemon behind any shell
-		// wrapper and its PTY children).
-		killDaemon(child);
-
-		// Exit without re-firing before-quit (app.exit bypasses the event).
-		app.exit(0);
-	};
-
-	void doQuit();
 });
 
-// Last-resort teardown. before-quit covers the normal quit path, but app.exit()
-// and some shutdown routes skip it, which would orphan the detached daemon and
-// leave it holding the port for the next launch. The Node 'exit' event fires
-// synchronously on those paths too, so the daemon's process group is always
-// signalled when the supervisor goes away. (A hard SIGKILL/crash still can't run
-// JS; the daemon's port-conflict fallback covers the orphan that leaves behind.)
+// Last resort: if the OS-native supervisor link is not actually connected
+// (daemon socket never bound, e.g. UDS path-length limit, or addr was null),
+// the dropped fd will NOT stop the daemon on quit, so kill it here to avoid an
+// orphan. Safe because Phase A made the daemon's SIGTERM non-destructive: it
+// exits without tearing down sessions, which survive for the next boot to adopt.
+// When the link IS connected we do nothing here and rely on the OS closing the
+// fd on exit, which covers crash and SIGKILL uniformly.
 process.on("exit", () => {
-	if (daemonProcess) {
+	if (daemonProcess && !supervisorLink?.connected) {
 		killDaemon(daemonProcess);
 	}
 });

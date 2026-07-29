@@ -15,7 +15,7 @@ import (
 )
 
 // commandTimeout bounds a mutating daemon call. Spawns do real work (git
-// worktree add, zellij launch, hook install), so it is generous compared to the
+// worktree add, tmux launch, hook install), so it is generous compared to the
 // status probe timeout.
 const commandTimeout = 2 * time.Minute
 
@@ -25,6 +25,18 @@ type apiError struct {
 	Message   string `json:"message"`
 	Code      string `json:"code"`
 	RequestID string `json:"requestId"`
+}
+
+type apiResponseError struct {
+	StatusCode int
+	ErrorBody  apiError
+}
+
+func (e apiResponseError) Error() string {
+	if e.ErrorBody.Message == "" {
+		return fmt.Sprintf("daemon returned HTTP %d", e.StatusCode)
+	}
+	return e.ErrorBody.String()
 }
 
 // String renders the envelope for the user: "<message> (<code>) [request <id>]",
@@ -128,10 +140,7 @@ func (c *commandContext) doJSONPath(ctx context.Context, method, path string, bo
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var e apiError
 		_ = json.NewDecoder(resp.Body).Decode(&e)
-		if e.Message == "" {
-			return fmt.Errorf("daemon returned HTTP %d", resp.StatusCode)
-		}
-		return fmt.Errorf("%s", e.String())
+		return apiResponseError{StatusCode: resp.StatusCode, ErrorBody: e}
 	}
 	if out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {

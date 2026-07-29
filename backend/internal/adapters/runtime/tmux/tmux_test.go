@@ -3,7 +3,9 @@ package tmux
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,7 +15,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
-// -- fakeRunner test seam (mirrors zellij_test.go exactly) --
+// -- fakeRunner test seam --
 
 type fakeRunner struct {
 	calls   []runnerCall
@@ -46,6 +48,7 @@ func newTestRuntime(chunkSize int) (*Runtime, *fakeRunner) {
 	fr := &fakeRunner{}
 	r := New(Options{Binary: "tmux-test", Timeout: time.Second, Shell: "/bin/sh", ChunkSize: chunkSize})
 	r.runner = fr
+	r.enterDelay = 0 // tests must not pay the real 300ms pre-Enter pause
 	return r, fr
 }
 
@@ -65,6 +68,48 @@ func TestNewPicksUpShellFromEnv(t *testing.T) {
 	if got := r.shell; got != "/bin/zsh" {
 		t.Fatalf("shell = %q, want /bin/zsh", got)
 	}
+}
+
+func TestExecRunnerStartsCommandInConfiguredDirectory(t *testing.T) {
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+
+	out, err := (execRunner{dir: dir}).Run(
+		context.Background(),
+		[]string{"AO_TMUX_CWD_TEST=1"},
+		executable,
+		"-test.run=^TestExecRunnerCWDHelper$",
+	)
+	if err != nil {
+		t.Fatalf("run cwd helper: %v\n%s", err, out)
+	}
+
+	got, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("resolve reported cwd: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve configured cwd: %v", err)
+	}
+	if got != want {
+		t.Fatalf("spawned command cwd = %q, want %q", got, want)
+	}
+}
+
+func TestExecRunnerCWDHelper(t *testing.T) {
+	if os.Getenv("AO_TMUX_CWD_TEST") != "1" {
+		return
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		os.Exit(2)
+	}
+	_, _ = os.Stdout.WriteString(cwd)
+	os.Exit(0)
 }
 
 // -- command builder tests --
@@ -94,8 +139,124 @@ func TestCommandBuilders(t *testing.T) {
 	if got, want := sendEnterArgs("sess-1"), []string{"send-keys", "-t", "sess-1", "Enter"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("sendEnterArgs = %#v, want %#v", got, want)
 	}
+	if got, want := sendInterruptArgs("sess-1"), []string{"send-keys", "-t", "sess-1", "C-c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("sendInterruptArgs = %#v, want %#v", got, want)
+	}
 	if got, want := capturePaneArgs("sess-1", 10), []string{"capture-pane", "-t", "sess-1", "-p", "-S", "-10"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("capturePaneArgs = %#v, want %#v", got, want)
+	}
+}
+
+func TestNewSessionKeepsPaneCWDInWorkspace(t *testing.T) {
+	args := newSessionArgs("sess-1", "/workspace/project", "/bin/sh", "agent")
+	want := []string{"-c", "/workspace/project"}
+	for i := 0; i+1 < len(args); i++ {
+		if reflect.DeepEqual(args[i:i+2], want) {
+			return
+		}
+	}
+	t.Fatalf("new-session args = %#v, want pane cwd %v", args, want)
+}
+
+func TestEnsureControlServerRetainsMarkedServer(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{
+		[]byte(ControlServerVersion + "\n"),
+		[]byte(r.controlDataDir + "\n"),
+		nil,
+	}
+
+	if err := r.EnsureControlServer(context.Background()); err != nil {
+		t.Fatalf("EnsureControlServer: %v", err)
+	}
+	want := [][]string{
+		controlShowOptionArgs(r.controlSocket, "@ao-control-version"),
+		controlShowOptionArgs(r.controlSocket, "@ao-control-data-dir"),
+		controlRetainArgs(r.controlSocket),
+	}
+	if len(fr.calls) != len(want) {
+		t.Fatalf("calls = %#v, want %d", fr.calls, len(want))
+	}
+	for i := range want {
+		if !reflect.DeepEqual(fr.calls[i].args, want[i]) {
+			t.Fatalf("call[%d] = %#v, want %#v", i, fr.calls[i].args, want[i])
+		}
+	}
+}
+
+func TestEnsureControlServerRejectsUnmarkedExistingServer(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{nil}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "control server version") {
+		t.Fatalf("EnsureControlServer error = %v, want version rejection", err)
+	}
+	if len(fr.calls) != 1 {
+		t.Fatalf("calls = %#v, want only marker inspection", fr.calls)
+	}
+}
+
+func TestEnsureControlServerRejectsWrongVersion(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{[]byte("99\n")}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "99") {
+		t.Fatalf("EnsureControlServer error = %v, want version rejection", err)
+	}
+}
+
+func TestEnsureControlServerRejectsWrongDataDir(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{[]byte(ControlServerVersion + "\n"), []byte("/wrong\n")}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "/wrong") {
+		t.Fatalf("EnsureControlServer error = %v, want data-dir rejection", err)
+	}
+}
+
+func TestEnsureControlServerCreatesAndVerifiesMissingServer(t *testing.T) {
+	r, _ := newTestRuntime(0)
+	fr := &fakeRunnerSelectiveErr{
+		outputs: [][]byte{
+			[]byte("error connecting to " + r.controlSocket + " (No such file or directory)"),
+			nil,
+			[]byte(ControlServerVersion + "\n"),
+			[]byte(r.controlDataDir + "\n"),
+		},
+		exitErrAt: 0,
+	}
+	r.runner = fr
+
+	if err := r.EnsureControlServer(context.Background()); err != nil {
+		t.Fatalf("EnsureControlServer: %v", err)
+	}
+	want := [][]string{
+		controlShowOptionArgs(r.controlSocket, "@ao-control-version"),
+		controlCreateArgs(r.controlSocket, r.controlDataDir),
+		controlShowOptionArgs(r.controlSocket, "@ao-control-version"),
+		controlShowOptionArgs(r.controlSocket, "@ao-control-data-dir"),
+	}
+	if len(fr.calls) != len(want) {
+		t.Fatalf("calls = %#v, want inspect/create/verify-version/verify-data-dir", fr.calls)
+	}
+	for i := range want {
+		if !reflect.DeepEqual(fr.calls[i].args, want[i]) {
+			t.Fatalf("call[%d] = %#v, want %#v", i, fr.calls[i].args, want[i])
+		}
+	}
+}
+
+func TestEnsureControlServerReportsUnexpectedInspectionFailure(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{[]byte("permission denied")}
+	fr.err = &exec.ExitError{}
+
+	err := r.EnsureControlServer(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "inspect control server version") {
+		t.Fatalf("EnsureControlServer error = %v, want inspection failure", err)
 	}
 }
 
@@ -480,6 +641,97 @@ func TestSendMessageUsesLiteralFlag(t *testing.T) {
 	}
 }
 
+// TestSendMessageDelaysBeforeEnter verifies the pre-Enter pause (mirroring
+// conpty's ptyInputEnterDelay) fires only for a non-empty message: a large
+// multiline paste needs time to settle before the trailing Enter, or the Enter
+// is absorbed and the prompt is left unsubmitted (issue #2342). An empty
+// (nudge) message skips the pause — there is no paste ahead of a catch-up Enter.
+func TestSendMessageDelaysBeforeEnter(t *testing.T) {
+	// enterDelay=0 (the test default) => no pause: SendMessage is near-instant.
+	r0, _ := newTestRuntime(0)
+	r0.enterDelay = 0
+	start := time.Now()
+	if err := r0.SendMessage(context.Background(), ports.RuntimeHandle{ID: "sess-1"}, "hi"); err != nil {
+		t.Fatalf("SendMessage (no delay): %v", err)
+	}
+	if dt := time.Since(start); dt > 50*time.Millisecond {
+		t.Fatalf("SendMessage with enterDelay=0 took %s; want no real pause", dt)
+	}
+
+	// enterDelay>0 => SendMessage blocks at least enterDelay before Enter, but
+	// only for a non-empty message.
+	r, fr := newTestRuntime(0)
+	r.enterDelay = 30 * time.Millisecond
+	start = time.Now()
+	if err := r.SendMessage(context.Background(), ports.RuntimeHandle{ID: "sess-1"}, "hello"); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if dt := time.Since(start); dt < r.enterDelay {
+		t.Fatalf("SendMessage took %s, want >= %s pre-Enter pause", dt, r.enterDelay)
+	}
+	// Non-empty message still ends with the literal chunks then Enter.
+	if len(fr.calls) != 2 {
+		t.Fatalf("calls = %d, want 2 (chunk + Enter)", len(fr.calls))
+	}
+	if got, want := fr.calls[1].args, sendEnterArgs("sess-1"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Enter args = %#v, want %#v", got, want)
+	}
+
+	// Empty (nudge) message: no paste, no pause — even with enterDelay set.
+	rNudge, frNudge := newTestRuntime(0)
+	rNudge.enterDelay = 30 * time.Millisecond
+	start = time.Now()
+	if err := rNudge.SendMessage(context.Background(), ports.RuntimeHandle{ID: "sess-1"}, ""); err != nil {
+		t.Fatalf("SendMessage (nudge): %v", err)
+	}
+	if dt := time.Since(start); dt > 50*time.Millisecond {
+		t.Fatalf("nudge SendMessage took %s; want no pause for empty message", dt)
+	}
+	// Empty message is Enter-only: no send-keys -l call, just Enter.
+	if len(frNudge.calls) != 1 {
+		t.Fatalf("nudge calls = %d, want 1 (Enter only)", len(frNudge.calls))
+	}
+	if got, want := frNudge.calls[0].args, sendEnterArgs("sess-1"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("nudge Enter args = %#v, want %#v", got, want)
+	}
+}
+
+// TestSendMessageEnterSurvivesCallerCancel pins the detached-Enter contract:
+// once the chunks are pasted, a caller cancellation landing in the pre-Enter
+// pause must NOT abandon the send — the pasted draft would sit unsubmitted and
+// a retried send would double-paste. The pause and Enter run on a context
+// detached from the caller's, so SendMessage completes (chunks then Enter).
+func TestSendMessageEnterSurvivesCallerCancel(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	// A pause long enough that the 50ms-delayed cancel deterministically lands
+	// inside it (the chunk send is near-instant against the fake runner).
+	r.enterDelay = 200 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timer := time.AfterFunc(50*time.Millisecond, cancel)
+	defer timer.Stop()
+
+	if err := r.SendMessage(ctx, ports.RuntimeHandle{ID: "sess-1"}, "hello"); err != nil {
+		t.Fatalf("SendMessage cancelled mid-pause: %v (Enter must run detached)", err)
+	}
+	if len(fr.calls) != 2 {
+		t.Fatalf("calls = %d, want 2 (chunk + Enter despite the caller cancel after the paste)", len(fr.calls))
+	}
+	if got, want := fr.calls[1].args, sendEnterArgs("sess-1"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Enter args = %#v, want %#v", got, want)
+	}
+}
+
+func TestInterruptSendsCtrlC(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	if err := r.Interrupt(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+	if got, want := fr.calls[0].args, sendInterruptArgs("sess-1"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("interrupt args = %#v, want %#v", got, want)
+	}
+}
+
 // -- GetOutput tests --
 
 func TestGetOutputValidatesLines(t *testing.T) {
@@ -537,7 +789,7 @@ func TestAttachCommandReturnsExpectedArgv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AttachCommand: %v", err)
 	}
-	want := []string{"/usr/bin/tmux", "attach-session", "-t", "sess-1"}
+	want := []string{"/usr/bin/tmux", "-u", "attach-session", "-t", "sess-1"}
 	if !reflect.DeepEqual(argv, want) {
 		t.Fatalf("argv = %#v, want %#v", argv, want)
 	}
@@ -548,6 +800,18 @@ func TestAttachCommandRejectsInvalidHandle(t *testing.T) {
 	_, err := r.attachCommand(ports.RuntimeHandle{ID: ""})
 	if err == nil {
 		t.Fatal("AttachCommand empty handle: got nil, want error")
+	}
+}
+
+func TestAttachEnvForcesUsableTerm(t *testing.T) {
+	env := attachEnv([]string{"PATH=/bin", "TERM=dumb", "SHELL=/bin/sh"})
+	if got, want := env, []string{"PATH=/bin", "TERM=xterm-256color", "SHELL=/bin/sh"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("attachEnv = %#v, want %#v", got, want)
+	}
+
+	env = attachEnv([]string{"PATH=/bin"})
+	if got, want := env, []string{"PATH=/bin", "TERM=xterm-256color"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("attachEnv without TERM = %#v, want %#v", got, want)
 	}
 }
 

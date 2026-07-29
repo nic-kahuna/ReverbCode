@@ -8,15 +8,13 @@ package crush
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/binaryutil"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -29,6 +27,7 @@ const (
 // Plugin is the Crush agent adapter. It is safe for concurrent use; the
 // binary path is resolved once and cached under binaryMu.
 type Plugin struct {
+	agentbase.Base
 	binaryMu       sync.Mutex
 	resolvedBinary string
 }
@@ -54,23 +53,17 @@ func (p *Plugin) Manifest() adapters.Manifest {
 	}
 }
 
-// GetConfigSpec reports the agent-specific config keys. Crush exposes none yet.
-func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
-	if err := ctx.Err(); err != nil {
-		return ports.ConfigSpec{}, err
-	}
-	return ports.ConfigSpec{}, nil
-}
-
 // GetLaunchCommand builds the argv to start an interactive Crush session.
 // Shape:
 //
-//	crush [--cwd <WorkspacePath>] [--yolo] [-- <Prompt>]
+//	crush [--cwd <WorkspacePath>] [--yolo]
 //
 // The session runs in the worktree (cwd is set by the runtime). Crush doesn't
 // have native system prompt support, so cfg.SystemPrompt / SystemPromptFile are
-// intentionally ignored. The initial task prompt is delivered as a positional
-// argument after `--`. The --yolo flag corresponds to bypass-permissions mode.
+// intentionally ignored. Worker task prompts are delivered after startup so AO
+// keeps the interactive TUI; Crush's documented `run` command is intentionally
+// not used here because it is non-interactive. The --yolo flag corresponds to
+// bypass-permissions mode.
 //
 // We intentionally do not pass --session on launch: cfg.SessionID is the
 // AO-internal id, not a Crush-native session id. Letting Crush mint its own
@@ -94,21 +87,34 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 		cmd = append(cmd, "--yolo")
 	}
 
-	// Prompt is passed after `--` so a leading "-" is not read as a flag
-	if cfg.Prompt != "" {
-		cmd = append(cmd, "--", cfg.Prompt)
-	}
-
 	return cmd, nil
 }
 
-// GetPromptDeliveryStrategy reports that Crush receives its prompt in the
-// launch command itself as a positional argument.
+// GetPromptDeliveryStrategy reports that prompted sessions receive their task
+// after the interactive Crush UI starts.
 func (p *Plugin) GetPromptDeliveryStrategy(ctx context.Context, cfg ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if cfg.Prompt != "" {
+		return ports.PromptDeliveryAfterStart, nil
+	}
 	return ports.PromptDeliveryInCommand, nil
+}
+
+// PromptReadinessHints waits for Crush's ready prompt before AO injects the
+// worker's first task.
+func (p *Plugin) PromptReadinessHints(ctx context.Context, _ ports.LaunchConfig) (ports.PromptReadinessHints, error) {
+	if err := ctx.Err(); err != nil {
+		return ports.PromptReadinessHints{}, err
+	}
+	return ports.PromptReadinessHints{
+		InitialDelay: 500 * time.Millisecond,
+		Patterns:     []string{"Ready..."},
+		PollInterval: 200 * time.Millisecond,
+		Timeout:      8 * time.Second,
+		Lines:        80,
+	}, nil
 }
 
 // GetRestoreCommand rebuilds the argv that continues an existing Crush session:
@@ -143,83 +149,24 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	return cmd, true, nil
 }
 
-// SessionInfo surfaces Crush session metadata. Currently a no-op since Crush
-// doesn't have full hooks support like Claude Code and Codex. Returns false
-// to indicate no metadata is available.
-func (p *Plugin) SessionInfo(ctx context.Context, session ports.SessionRef) (ports.SessionInfo, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return ports.SessionInfo{}, false, err
-	}
-	// No-op for now since Crush doesn't have full hooks support
-	return ports.SessionInfo{}, false, nil
+var crushBinarySpec = binaryutil.BinarySpec{
+	Label:         "crush",
+	Names:         []string{"crush"},
+	WinNames:      []string{"crush.cmd", "crush.exe", "crush"},
+	UnixPaths:     []string{"/usr/local/bin/crush", "/opt/homebrew/bin/crush"},
+	UnixHomePaths: [][]string{{".local", "bin", "crush"}, {".cargo", "bin", "crush"}, {".npm", "bin", "crush"}},
+	WinPaths: []binaryutil.WinPath{
+		{Base: binaryutil.WinAppData, Parts: []string{"npm", "crush.cmd"}},
+		{Base: binaryutil.WinAppData, Parts: []string{"npm", "crush.exe"}},
+		{Base: binaryutil.WinHome, Parts: []string{".cargo", "bin", "crush.exe"}},
+	},
 }
 
 // ResolveCrushBinary returns the path to the crush binary on this machine,
-// searching PATH then a handful of well-known install locations.
-// Returns "crush" as a last-ditch fallback.
+// searching PATH then a handful of well-known install locations. It returns a
+// wrapped ports.ErrAgentBinaryNotFound when crush is absent.
 func ResolveCrushBinary(ctx context.Context) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	if runtime.GOOS == "windows" {
-		for _, name := range []string{"crush.cmd", "crush.exe", "crush"} {
-			path, err := exec.LookPath(name)
-			if err == nil && path != "" {
-				return path, nil
-			}
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-
-		candidates := []string{}
-		if appData := os.Getenv("APPDATA"); appData != "" {
-			candidates = append(candidates,
-				filepath.Join(appData, "npm", "crush.cmd"),
-				filepath.Join(appData, "npm", "crush.exe"),
-			)
-		}
-		if home, err := os.UserHomeDir(); err == nil {
-			candidates = append(candidates, filepath.Join(home, ".cargo", "bin", "crush.exe"))
-		}
-		for _, candidate := range candidates {
-			if fileExists(candidate) {
-				return candidate, nil
-			}
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-
-		return "", fmt.Errorf("crush: %w", ports.ErrAgentBinaryNotFound)
-	}
-
-	if path, err := exec.LookPath("crush"); err == nil && path != "" {
-		return path, nil
-	}
-
-	candidates := []string{
-		"/usr/local/bin/crush",
-		"/opt/homebrew/bin/crush",
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(home, ".local", "bin", "crush"),
-			filepath.Join(home, ".cargo", "bin", "crush"),
-			filepath.Join(home, ".npm", "bin", "crush"),
-		)
-	}
-	for _, candidate := range candidates {
-		if fileExists(candidate) {
-			return candidate, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-	}
-
-	return "", fmt.Errorf("crush: %w", ports.ErrAgentBinaryNotFound)
+	return binaryutil.ResolveBinary(ctx, crushBinarySpec)
 }
 
 func (p *Plugin) crushBinary(ctx context.Context) (string, error) {
@@ -236,9 +183,4 @@ func (p *Plugin) crushBinary(ctx context.Context) (string, error) {
 	}
 	p.resolvedBinary = binary
 	return binary, nil
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

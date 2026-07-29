@@ -15,13 +15,20 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/supervisor"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
+	"github.com/aoagents/agent-orchestrator/backend/internal/mobilebridge"
 	"github.com/aoagents/agent-orchestrator/backend/internal/notify"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/preview"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
+	agentsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/agent"
+	importsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/importer"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
@@ -59,6 +66,13 @@ func Run() error {
 	}
 	defer func() { _ = store.Close() }()
 
+	// Refresh the embedded using-ao skill into the data dir so worker sessions
+	// in any project can read the ao CLI catalog from a stable absolute path.
+	// Non-fatal: the skill is an enhancement over `ao --help`, not required.
+	if err := skillassets.Install(cfg.DataDir); err != nil {
+		log.Warn("install using-ao skill", "err", err)
+	}
+
 	telemetrySink := newTelemetrySink(cfg, store, log)
 	defer func() { _ = telemetrySink.Close(context.Background()) }()
 	telemetrySink.Emit(context.Background(), ports.TelemetryEvent{
@@ -86,7 +100,14 @@ func Run() error {
 	// attach Stream and liveness; the CDC broadcaster feeds the session-state channel. The manager
 	// is handed to httpd, which mounts it at /mux. Raw PTY bytes never flow
 	// through the CDC change_log -- only session-state events do.
-	runtimeAdapter := runtimeselect.New(log)
+	runtimeAdapter := runtimeselect.New(log, cfg.DataDir)
+	if err := ensureRuntimeControlServer(ctx, runtimeAdapter); err != nil {
+		stop()
+		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
+			log.Error("cdc pipeline shutdown", "err", cdcErr)
+		}
+		return fmt.Errorf("initialize runtime control server: %w", err)
+	}
 	termMgr := terminal.NewManager(runtimeAdapter, cdcPipe.Broadcaster, log)
 	defer termMgr.Close()
 
@@ -118,18 +139,40 @@ func Run() error {
 		}
 		return fmt.Errorf("wire session service: %w", err)
 	}
+	lcStack.trackerDone = startTrackerIntake(ctx, store, sessionSvc, log)
 	previewDone := preview.NewPoller(store, sessionSvc, "http://"+cfg.Addr(), preview.PollerConfig{Logger: log}).Start(ctx)
+	agentSvc := agentsvc.New()
+	go func() {
+		if _, err := agentSvc.Refresh(ctx); err != nil {
+			log.Warn("initial agent catalog refresh failed", "err", err)
+		}
+	}()
+
+	// Connect Mobile: the bridge service needs the LAN listener, but the LAN
+	// listener needs the built router's handler, which only exists once srv is
+	// constructed — and srv's router mounts the mobile controller, which needs
+	// the bridge service. Break the cycle with late binding: build bs with LAN
+	// left nil, hand its controller into NewWithDeps, then once srv exists,
+	// build the LAN listener over srv.Handler() and assign it onto bs.LAN.
+	bs := &controllers.BridgeService{
+		ConfigPath:  mobilebridge.Path(cfg.DataDir),
+		DefaultPort: mobilebridge.DefaultPort,
+	}
+	mc := &controllers.MobileController{Bridge: bs}
 
 	srv, err := httpd.NewWithDeps(cfg, log, termMgr, httpd.APIDeps{
-		Projects:           projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, Telemetry: telemetrySink}),
+		Projects:           projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, DefaultHarness: domain.AgentHarness(cfg.Agent), Telemetry: telemetrySink}),
+		Agents:             agentSvc,
 		Sessions:           sessionSvc,
 		Reviews:            reviewSvc,
 		Notifications:      notifier,
 		NotificationStream: notificationHub,
+		Import:             importsvc.New(importsvc.Deps{Store: store}),
 		CDC:                store,
 		Events:             cdcPipe.Broadcaster,
 		Activity:           lcStack.LCM,
 		Telemetry:          telemetrySink,
+		Mobile:             mc,
 	})
 	if err != nil {
 		stop()
@@ -141,6 +184,19 @@ func Run() error {
 		return err
 	}
 
+	// Late-bind: the LAN listener shares the exact loopback router instance so
+	// the LAN surface and loopback surface never drift apart.
+	lan := httpd.NewMobileLAN(srv.Handler(), mobilebridge.DefaultPort, log)
+	bs.LAN = lan
+
+	// Restore Connect Mobile across a daemon restart: if the bridge was left
+	// enabled, re-arm the listener on its last port with the same password
+	// hash so an already-paired phone keeps working with no new password.
+	// Best-effort: never blocks boot.
+	if err := restoreMobileOnBoot(mobilebridge.Path(cfg.DataDir), lan); err != nil {
+		log.Warn("restore mobile bridge on boot failed", "err", err)
+	}
+
 	// Reconcile sessions on boot: adopt crash-surviving runtimes, capture and
 	// terminate dead ones, reap leaked tmux, then restore shutdown-saved
 	// sessions. Best-effort: a failure is logged but never blocks boot. Placed
@@ -149,21 +205,30 @@ func Run() error {
 		log.Error("reconcile sessions on boot failed", "err", reconcileErr)
 	}
 
+	// ponytail: 5s tolerates a brief frontend restart; tune if dev hot-reload trips it.
+	const supervisorGrace = 5 * time.Second
+
+	if ln, addr, err := supervisor.Listen(cfg.RunFilePath); err != nil {
+		// Non-fatal: without the link the daemon still works (e.g. headless "ao start"),
+		// it just will not auto-stop when a frontend dies. Do not block startup on it.
+		log.Warn("supervisor: listener unavailable; frontend-death auto-stop disabled", "err", err)
+	} else {
+		log.Info("supervisor: listening", "addr", addr)
+		sup := supervisor.New(supervisorGrace, srv.RequestShutdown, log)
+		go func() {
+			if err := sup.Serve(ctx, ln); err != nil {
+				log.Warn("supervisor: serve stopped with error", "err", err)
+			}
+		}()
+	}
+
 	runErr := srv.Run(ctx)
 
-	// Save and tear down all live sessions before the store closes. Both SIGTERM
-	// and POST /shutdown funnel through srv.Run returning (SIGTERM cancels ctx,
-	// which srv.Run selects on; POST /shutdown closes the shutdownRequested channel,
-	// which srv.Run also selects on), so this single call site covers both paths.
-	//
-	// Use a fresh context with a bounded deadline: the ctx that caused srv.Run
-	// to return is already cancelled, so passing it would abort the save
-	// immediately and leave every session unsaved.
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownSaveTimeout)
-	defer shutdownCancel()
-	if saveErr := sessMgr.SaveAndTeardownAll(shutdownCtx); saveErr != nil {
-		log.Error("save sessions on shutdown failed", "err", saveErr)
-	}
+	// Both graceful shutdown paths (SIGTERM and POST /shutdown) funnel through
+	// srv.Run returning. We deliberately do NOT tear down sessions here: they
+	// survive the daemon exit and the next boot's Reconcile adopts them,
+	// preserving session IDs. The narrowed sessionLifecycle interface makes
+	// teardown-on-shutdown a compile error.
 
 	// Shut the background goroutines down in order: cancel the context FIRST so
 	// their loops exit, then wait for them to drain. Doing this explicitly (not
@@ -172,15 +237,28 @@ func Run() error {
 	stop()
 	<-previewDone
 	lcStack.Stop()
+	lanStopCtx, lanCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer lanCancel()
+	if err := lan.Stop(lanStopCtx); err != nil {
+		log.Error("mobile LAN listener shutdown", "err", err)
+	}
 	if err := cdcPipe.Stop(); err != nil {
 		log.Error("cdc pipeline shutdown", "err", err)
 	}
 	return runErr
 }
 
-// shutdownSaveTimeout bounds the SaveAndTeardownAll call on shutdown so a
-// pathological session cannot stall the process exit indefinitely.
-const shutdownSaveTimeout = 30 * time.Second
+type runtimeControlServerEnsurer interface {
+	EnsureControlServer(context.Context) error
+}
+
+func ensureRuntimeControlServer(ctx context.Context, runtimeAdapter runtimeselect.Runtime) error {
+	ensurer, ok := runtimeAdapter.(runtimeControlServerEnsurer)
+	if !ok {
+		return nil
+	}
+	return ensurer.EnsureControlServer(ctx)
+}
 
 // newLogger returns the daemon's slog logger. It writes to stderr so supervisors
 // can capture it separately from any structured stdout protocol added later.

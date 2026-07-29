@@ -152,7 +152,7 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 //     then-failed I/O). The reaper records ProbeFailed and retries rather than
 //     treating it as a death conclusion.
 //
-// tmux/zellij return a non-nil error for transient failures for the same
+// tmux returns a non-nil error for transient failures for the same
 // reason; conpty matches that contract here.
 func (r *Runtime) IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool, error) {
 	sess := r.resolve(handle.ID)
@@ -169,6 +169,15 @@ func (r *Runtime) SendMessage(ctx context.Context, handle ports.RuntimeHandle, m
 		return fmt.Errorf("conpty: session %q not found", handle.ID)
 	}
 	return clientSendMessage(sess.addr, message)
+}
+
+// Interrupt sends Ctrl-C to the PTY without tearing down the terminal host.
+func (r *Runtime) Interrupt(ctx context.Context, handle ports.RuntimeHandle) error {
+	sess := r.resolve(handle.ID)
+	if sess == nil {
+		return fmt.Errorf("conpty: session %q not found", handle.ID)
+	}
+	return clientSendInput(sess.addr, "\x03")
 }
 
 // GetOutput returns the last lines lines from the pty-host ring buffer.

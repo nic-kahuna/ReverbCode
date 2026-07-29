@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -22,8 +23,9 @@ import (
 )
 
 const (
-	maxPromptLen  = 4096
-	maxMessageLen = 4096
+	maxPromptLen      = 4096
+	maxMessageLen     = 4096
+	maxDisplayNameLen = 20
 )
 
 var errPreviewFileNotFound = errors.New("preview file not found")
@@ -120,10 +122,28 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROMPT_TOO_LONG", "prompt is too long", nil)
 		return
 	}
+	// displayName is optional at the API (the desktop new-task dialog omits it
+	// and the read model falls back to the session id). `ao spawn` makes it
+	// required CLI-side. When present, it is held to the same length cap here so
+	// a direct API call cannot exceed it.
+	displayName := strings.TrimSpace(in.DisplayName)
+	if utf8.RuneCountInString(displayName) > maxDisplayNameLen {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "DISPLAY_NAME_TOO_LONG", "displayName must be 20 characters or fewer", nil)
+		return
+	}
 	if in.Kind == "" {
 		in.Kind = domain.KindWorker
 	}
-	sess, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, Prompt: in.Prompt})
+	var route *domain.AgentRoute
+	if in.Model != "" || in.ReasoningEffort != "" {
+		candidate := domain.AgentRoute{Harness: in.Harness, Model: in.Model, ReasoningEffort: in.ReasoningEffort}
+		if err := candidate.Validate(); err != nil {
+			envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_AGENT_ROUTE", err.Error(), nil)
+			return
+		}
+		route = &candidate
+	}
+	sess, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, Kind: in.Kind, Harness: in.Harness, Route: route, Branch: in.Branch, Prompt: in.Prompt, DisplayName: displayName})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
@@ -178,7 +198,30 @@ func (c *SessionsController) previewFile(w http.ResponseWriter, r *http.Request)
 		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "PREVIEW_FILE_NOT_FOUND", "Preview file not found", nil)
 		return
 	}
+	if previewutil.IsMarkdownPath(file) {
+		c.servePreviewMarkdown(w, r, file)
+		return
+	}
 	http.ServeFile(w, r, file)
+}
+
+// servePreviewMarkdown renders a workspace Markdown file to a self-contained
+// HTML document so the browser panel displays formatted content instead of raw
+// source.
+func (c *SessionsController) servePreviewMarkdown(w http.ResponseWriter, r *http.Request, file string) {
+	source, err := os.ReadFile(file)
+	if err != nil {
+		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "PREVIEW_FILE_NOT_FOUND", "Preview file not found", nil)
+		return
+	}
+	rendered, err := previewutil.RenderMarkdown(source, filepath.Base(file))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	_, _ = w.Write(rendered) //nolint:gosec // G705: preview content is workspace-local and agent-trusted
 }
 
 // setPreview persists the browser preview URL the desktop app opens for a
@@ -426,12 +469,24 @@ func (c *SessionsController) activity(w http.ResponseWriter, r *http.Request) {
 	}
 	state := domain.ActivityState(in.State)
 	switch state {
-	case domain.ActivityActive, domain.ActivityIdle, domain.ActivityWaitingInput, domain.ActivityExited:
+	case domain.ActivityActive, domain.ActivityIdle, domain.ActivityWaitingInput, domain.ActivityBlocked, domain.ActivityExited:
 	default:
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_ACTIVITY_STATE", "Unknown activity state", nil)
 		return
 	}
-	if err := c.Activity.ApplyActivitySignal(r.Context(), sessionID(r), ports.ActivitySignal{Valid: true, State: state}); err != nil {
+	// The correlation fields ride the same lenient decode: absent on old CLIs.
+	// They are externally-supplied strings headed for logs and in-memory maps,
+	// so sanitize control chars and cap their length (a truncated id could
+	// never match its pre/post counterpart, so overlong values are dropped by
+	// the CLI; the cap here is defense against non-AO callers).
+	sig := ports.ActivitySignal{
+		Valid:     true,
+		State:     state,
+		Event:     capActivityMeta(domain.SanitizeControlChars(in.Event)),
+		ToolName:  capActivityMeta(domain.SanitizeControlChars(in.ToolName)),
+		ToolUseID: capActivityMeta(domain.SanitizeControlChars(in.ToolUseID)),
+	}
+	if err := c.Activity.ApplyActivitySignal(r.Context(), sessionID(r), sig); err != nil {
 		if errors.Is(err, ports.ErrSessionNotFound) {
 			envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "SESSION_NOT_FOUND", "Unknown session", nil)
 			return
@@ -440,6 +495,16 @@ func (c *SessionsController) activity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, SetActivityResponse{OK: true, SessionID: sessionID(r), State: in.State})
+}
+
+// capActivityMeta bounds an optional activity correlation string; overlong
+// values are dropped, not truncated (see the comment at its call site).
+func capActivityMeta(v string) string {
+	const maxLen = 256
+	if len(v) > maxLen {
+		return ""
+	}
+	return v
 }
 
 func (c *SessionsController) spawnOrchestrator(w http.ResponseWriter, r *http.Request) {
@@ -653,7 +718,16 @@ func previewFileURL(r *http.Request, id domain.SessionID, entry string) string {
 }
 
 func sessionView(s domain.Session) SessionView {
-	return SessionView{Session: s, Branch: s.Metadata.Branch, PreviewURL: s.Metadata.PreviewURL, PreviewRevision: s.Metadata.PreviewRevision, PRs: sessionPRFacts(s.PRs)}
+	return SessionView{
+		Session:         s,
+		Branch:          s.Metadata.Branch,
+		WorkspacePath:   s.Metadata.WorkspacePath,
+		RequestedRoute:  s.Metadata.RequestedRoute,
+		LaunchRoute:     s.Metadata.LaunchRoute,
+		PreviewURL:      s.Metadata.PreviewURL,
+		PreviewRevision: s.Metadata.PreviewRevision,
+		PRs:             sessionPRFacts(s.PRs),
+	}
 }
 
 func sessionViews(sessions []domain.Session) []SessionView {
