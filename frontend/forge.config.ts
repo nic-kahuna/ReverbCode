@@ -27,10 +27,7 @@ const localOsxSign = {
 		if (filePath.includes("(Plugin).app")) return {};
 		if (filePath.includes("(GPU).app") || filePath.includes("(Renderer).app")) {
 			return {
-				entitlements: [
-					"com.apple.security.cs.allow-jit",
-					"com.apple.security.cs.disable-library-validation",
-				],
+				entitlements: ["com.apple.security.cs.allow-jit", "com.apple.security.cs.disable-library-validation"],
 			};
 		}
 		return { entitlements: "assets/entitlements.local.plist" };
