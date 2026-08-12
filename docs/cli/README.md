@@ -62,6 +62,18 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 readiness. Use `--refresh` to rerun the bounded local probes and `--json` to
 print the raw inventory response.
 
+`ao project set-config <id> --startup-restore-policy preserve_only` opts one
+project out of automatic startup relaunch. Sessions whose saved runtime is
+absent remain `terminated` with `recovery.state=awaiting_recovery` in session
+GET/list output until `ao session restore <exact-id>` passes strict
+native-resume preflight; an exact surviving runtime is adopted in place.
+The policy flag must be used alone: the CLI reads the current complete config,
+validates it, patches only this field, and writes it back so unrelated settings
+survive. It refuses a degraded stored config; repair that config explicitly
+before changing policy. Omitted policy remains `automatic`. See
+[Managed startup restore](../managed-startup-restore.md) for state, migration,
+rollback, and canary semantics.
+
 `ao spawn` resolves project context in this order: explicit `--project`,
 `AO_PROJECT_ID`, `AO_SESSION_ID` (by fetching the current session from the
 daemon), then the current working directory matched against registered project

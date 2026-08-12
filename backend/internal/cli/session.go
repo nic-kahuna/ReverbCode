@@ -40,27 +40,45 @@ type sessionRenameRequest struct {
 }
 
 type sessionDTO struct {
-	ID             string           `json:"id"`
-	ProjectID      string           `json:"projectId"`
-	IssueID        string           `json:"issueId,omitempty"`
-	Kind           string           `json:"kind"`
-	Harness        string           `json:"harness,omitempty"`
-	DisplayName    string           `json:"displayName,omitempty"`
-	Activity       sessionActivity  `json:"activity"`
-	IsTerminated   bool             `json:"isTerminated"`
-	CreatedAt      time.Time        `json:"createdAt"`
-	UpdatedAt      time.Time        `json:"updatedAt"`
-	Status         string           `json:"status"`
-	Branch         string           `json:"branch,omitempty"`
-	WorkspacePath  string           `json:"workspacePath,omitempty"`
-	RequestedRoute *sessionRouteDTO `json:"requestedRoute,omitempty"`
-	LaunchRoute    *sessionRouteDTO `json:"launchRoute,omitempty"`
+	ID             string              `json:"id"`
+	ProjectID      string              `json:"projectId"`
+	IssueID        string              `json:"issueId,omitempty"`
+	Kind           string              `json:"kind"`
+	Harness        string              `json:"harness,omitempty"`
+	DisplayName    string              `json:"displayName,omitempty"`
+	Activity       sessionActivity     `json:"activity"`
+	IsTerminated   bool                `json:"isTerminated"`
+	CreatedAt      time.Time           `json:"createdAt"`
+	UpdatedAt      time.Time           `json:"updatedAt"`
+	Status         string              `json:"status"`
+	Branch         string              `json:"branch,omitempty"`
+	WorkspacePath  string              `json:"workspacePath,omitempty"`
+	RequestedRoute *sessionRouteDTO    `json:"requestedRoute,omitempty"`
+	LaunchRoute    *sessionRouteDTO    `json:"launchRoute,omitempty"`
+	Recovery       *sessionRecoveryDTO `json:"recovery,omitempty"`
 }
 
 type sessionRouteDTO struct {
 	Harness         string `json:"harness"`
 	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+}
+
+type sessionRecoveryDTO struct {
+	State                string                       `json:"state"`
+	Policy               string                       `json:"policy"`
+	RuntimeState         string                       `json:"runtimeState"`
+	ProviderSessionSaved bool                         `json:"providerSessionSaved"`
+	Worktrees            []sessionRecoveryWorktreeDTO `json:"worktrees"`
+}
+
+type sessionRecoveryWorktreeDTO struct {
+	RepoName     string `json:"repoName"`
+	Branch       string `json:"branch"`
+	BaseSHA      string `json:"baseSha"`
+	WorktreePath string `json:"worktreePath"`
+	PreservedRef string `json:"preservedRef"`
+	State        string `json:"state"`
 }
 
 type sessionActivity struct {
@@ -126,18 +144,21 @@ type claimPRResponse struct {
 }
 
 type sessionListEntry struct {
-	ID             string     `json:"id"`
-	ProjectID      string     `json:"projectId"`
-	Role           string     `json:"role"`
-	Status         string     `json:"status,omitempty"`
-	IssueID        string     `json:"issueId,omitempty"`
-	Harness        string     `json:"harness,omitempty"`
-	Branch         string     `json:"branch,omitempty"`
-	WorkspacePath  string     `json:"workspacePath,omitempty"`
-	IsTerminated   bool       `json:"isTerminated"`
-	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	UpdatedAt      time.Time  `json:"updatedAt"`
+	ID             string              `json:"id"`
+	ProjectID      string              `json:"projectId"`
+	Role           string              `json:"role"`
+	Status         string              `json:"status,omitempty"`
+	IssueID        string              `json:"issueId,omitempty"`
+	Harness        string              `json:"harness,omitempty"`
+	Branch         string              `json:"branch,omitempty"`
+	WorkspacePath  string              `json:"workspacePath,omitempty"`
+	RequestedRoute *sessionRouteDTO    `json:"requestedRoute,omitempty"`
+	LaunchRoute    *sessionRouteDTO    `json:"launchRoute,omitempty"`
+	Recovery       *sessionRecoveryDTO `json:"recovery,omitempty"`
+	IsTerminated   bool                `json:"isTerminated"`
+	LastActivityAt *time.Time          `json:"lastActivityAt,omitempty"`
+	CreatedAt      time.Time           `json:"createdAt"`
+	UpdatedAt      time.Time           `json:"updatedAt"`
 }
 
 type sessionListOutput struct {
@@ -505,7 +526,7 @@ func (c *commandContext) renameSession(ctx context.Context, cmd *cobra.Command, 
 }
 
 func (c *commandContext) cleanupSessions(ctx context.Context, cmd *cobra.Command, opts sessionCleanupOptions) error {
-	candidates, err := c.previewCleanupSessions(ctx, opts.project)
+	candidates, preserved, err := c.previewCleanupSessions(ctx, opts.project)
 	if err != nil {
 		return err
 	}
@@ -516,8 +537,14 @@ func (c *commandContext) cleanupSessions(ctx context.Context, cmd *cobra.Command
 	if _, err := fmt.Fprintln(out); err != nil {
 		return err
 	}
+	for _, sess := range preserved {
+		label := cleanupLabels([]sessionDTO{sess}, opts.project)[0]
+		if _, err := fmt.Fprintf(out, "  Would skip %s (awaiting managed recovery)\n", label); err != nil {
+			return err
+		}
+	}
 	if len(candidates) == 0 {
-		_, err := fmt.Fprintln(out, "  No sessions to clean up.")
+		_, err := fmt.Fprintln(out, "  No eligible sessions to clean up.")
 		return err
 	}
 	labels := cleanupLabels(candidates, opts.project)
@@ -572,7 +599,7 @@ func (c *commandContext) cleanupSessions(ctx context.Context, cmd *cobra.Command
 	return err
 }
 
-func (c *commandContext) previewCleanupSessions(ctx context.Context, project string) ([]sessionDTO, error) {
+func (c *commandContext) previewCleanupSessions(ctx context.Context, project string) ([]sessionDTO, []sessionDTO, error) {
 	params := url.Values{}
 	params.Set("active", "false")
 	if project != "" {
@@ -580,9 +607,19 @@ func (c *commandContext) previewCleanupSessions(ctx context.Context, project str
 	}
 	var res sessionListResponse
 	if err := c.getJSON(ctx, apiPath("sessions", params), &res); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return filterAndSortSessions(res.Sessions, true), nil
+	all := filterAndSortSessions(res.Sessions, true)
+	candidates := make([]sessionDTO, 0, len(all))
+	preserved := make([]sessionDTO, 0)
+	for _, sess := range all {
+		if sess.Recovery != nil {
+			preserved = append(preserved, sess)
+			continue
+		}
+		candidates = append(candidates, sess)
+	}
+	return candidates, preserved, nil
 }
 
 func (c *commandContext) fetchScopedSession(ctx context.Context, id, project string) (sessionDTO, error) {
@@ -630,6 +667,9 @@ func sessionListEntries(sessions []sessionDTO) []sessionListEntry {
 			Harness:        sess.Harness,
 			Branch:         sess.Branch,
 			WorkspacePath:  sess.WorkspacePath,
+			RequestedRoute: sess.RequestedRoute,
+			LaunchRoute:    sess.LaunchRoute,
+			Recovery:       sess.Recovery,
 			IsTerminated:   sess.IsTerminated,
 			LastActivityAt: last,
 			CreatedAt:      sess.CreatedAt,
@@ -711,6 +751,9 @@ func sessionLineParts(sess sessionDTO) []string {
 	if sess.Status != "" {
 		parts = append(parts, "["+sess.Status+"]")
 	}
+	if sess.Recovery != nil {
+		parts = append(parts, "[recovery:"+sess.Recovery.State+"]")
+	}
 	if sess.Kind != "" {
 		parts = append(parts, sess.Kind)
 	}
@@ -757,6 +800,25 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 		}
 		if _, err := fmt.Fprintf(out, "launch route: %s / %s / %s\n", sess.LaunchRoute.Harness, model, effort); err != nil {
 			return err
+		}
+	}
+	if sess.Recovery != nil {
+		if _, err := fmt.Fprintf(out, "recovery: %s (policy %s)\n", sess.Recovery.State, sess.Recovery.Policy); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(out, "recovery runtime: %s\n", sess.Recovery.RuntimeState); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(out, "provider session saved: %t\n", sess.Recovery.ProviderSessionSaved); err != nil {
+			return err
+		}
+		for _, worktree := range sess.Recovery.Worktrees {
+			if _, err := fmt.Fprintf(out,
+				"recovery worktree %s: branch=%q baseSha=%q path=%q preservedRef=%q state=%q\n",
+				worktree.RepoName, worktree.Branch, worktree.BaseSHA, worktree.WorktreePath, worktree.PreservedRef, worktree.State,
+			); err != nil {
+				return err
+			}
 		}
 	}
 	if !sess.CreatedAt.IsZero() {

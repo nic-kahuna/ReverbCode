@@ -9,6 +9,9 @@ func TestProjectConfigValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty ok", ProjectConfig{}, false},
+		{"automatic startup restore", ProjectConfig{StartupRestorePolicy: StartupRestoreAutomatic}, false},
+		{"preserve-only startup restore", ProjectConfig{StartupRestorePolicy: StartupRestorePreserveOnly}, false},
+		{"unknown startup restore", ProjectConfig{StartupRestorePolicy: "managed"}, true},
 		{"good agent config", ProjectConfig{AgentConfig: AgentConfig{Model: "m", Permissions: PermissionModeAuto}}, false},
 		{"good agent profile", ProjectConfig{AgentConfig: AgentConfig{Profile: "ao-minimal"}}, false},
 		{"profile cannot start with punctuation", ProjectConfig{AgentConfig: AgentConfig{Profile: "-ao"}}, true},
@@ -53,14 +56,18 @@ func TestProjectConfigValidate(t *testing.T) {
 func TestDefaultProjectConfig(t *testing.T) {
 	def := DefaultProjectConfig()
 
-	// The one documented non-empty default.
+	// The documented non-empty defaults preserve historical behavior.
 	if def.DefaultBranch != "main" {
 		t.Fatalf("default DefaultBranch = %q, want main", def.DefaultBranch)
 	}
+	if def.StartupRestorePolicy != StartupRestoreAutomatic {
+		t.Fatalf("default StartupRestorePolicy = %q, want automatic", def.StartupRestorePolicy)
+	}
 
 	// Every other field defaults to its zero value: clearing the documented
-	// default must leave the config completely empty.
+	// defaults must leave the config completely empty.
 	def.DefaultBranch = ""
+	def.StartupRestorePolicy = ""
 	if !def.IsZero() {
 		t.Fatalf("default config has unexpected non-zero fields: %#v", def)
 	}
@@ -72,17 +79,24 @@ func TestProjectConfigWithDefaults(t *testing.T) {
 	if got.DefaultBranch != DefaultBranchName {
 		t.Fatalf("WithDefaults = %#v, want branch=main", got)
 	}
+	if got.StartupRestorePolicy != StartupRestoreAutomatic {
+		t.Fatalf("WithDefaults = %#v, want startup restore policy automatic", got)
+	}
 
 	// Set fields are preserved, not overwritten.
 	got = (ProjectConfig{
-		DefaultBranch: "develop",
-		AgentConfig:   AgentConfig{Model: "m"},
+		DefaultBranch:        "develop",
+		StartupRestorePolicy: StartupRestorePreserveOnly,
+		AgentConfig:          AgentConfig{Model: "m"},
 	}).WithDefaults()
 	if got.DefaultBranch != "develop" {
 		t.Fatalf("WithDefaults overwrote set fields: %#v", got)
 	}
 	if got.AgentConfig.Model != "m" {
 		t.Fatalf("WithDefaults dropped a set field: %#v", got.AgentConfig)
+	}
+	if got.StartupRestorePolicy != StartupRestorePreserveOnly {
+		t.Fatalf("WithDefaults overwrote startup restore policy: %#v", got)
 	}
 
 	got = (ProjectConfig{TrackerIntake: TrackerIntakeConfig{Enabled: true, Assignee: "alice"}}).WithDefaults()
@@ -134,5 +148,8 @@ func TestProjectConfigIsZero(t *testing.T) {
 	}
 	if (ProjectConfig{Env: map[string]string{"A": "b"}}).IsZero() {
 		t.Fatal("config with env should not be zero")
+	}
+	if (ProjectConfig{StartupRestorePolicy: StartupRestorePreserveOnly}).IsZero() {
+		t.Fatal("config with startup restore policy should not be zero")
 	}
 }

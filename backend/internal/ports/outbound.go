@@ -144,6 +144,42 @@ type Workspace interface {
 	ApplyPreserved(ctx context.Context, info WorkspaceInfo, ref string) error
 }
 
+// ExactWorkspaceRestorer is the optional recovery capability used by an
+// explicit, policy-gated restore. PreflightExactRestore is read-only and must
+// reject any path, branch, registration, or preserved-ref ambiguity.
+// RestoreExact must revalidate the same invariants before materialising an
+// absent worktree and must never move, stash, reset, or delete an existing
+// path. An already-registered exact worktree may be returned in place.
+//
+// The ordinary Workspace.Restore path deliberately retains its historical
+// automatic-recovery behaviour. Keeping this capability separate prevents a
+// managed restore from silently inheriting that path's normalisation rules.
+type ExactWorkspaceRestorer interface {
+	PreflightExactRestore(ctx context.Context, cfg WorkspaceConfig, disposition WorkspaceRecoveryDisposition, preservedRef string) error
+	RestoreExact(ctx context.Context, cfg WorkspaceConfig, disposition WorkspaceRecoveryDisposition, preservedRef string) (WorkspaceInfo, error)
+	// ApplyPreservedExact applies the saved tree without deleting its ref. The
+	// managed journal remains truthful until runtime launch and durable marker
+	// consumption both succeed.
+	ApplyPreservedExact(ctx context.Context, info WorkspaceInfo, ref string) error
+	// DeletePreservedRef is best-effort post-commit cleanup after managed
+	// recovery no longer depends on the ref for evidence.
+	DeletePreservedRef(ctx context.Context, info WorkspaceInfo, ref string) error
+}
+
+// WorkspaceRecoveryDisposition is the exact physical state persisted by the
+// recovery journal. In-place targets must already be registered at their
+// exact path; removed targets must be entirely absent before re-attachment.
+type WorkspaceRecoveryDisposition string
+
+const (
+	// WorkspaceRecoveryInPlace requires the exact persisted path to remain a
+	// registered worktree on the persisted branch.
+	WorkspaceRecoveryInPlace WorkspaceRecoveryDisposition = "in_place"
+	// WorkspaceRecoveryRemoved requires the exact persisted path to be absent
+	// before re-attaching the persisted local branch.
+	WorkspaceRecoveryRemoved WorkspaceRecoveryDisposition = "removed"
+)
+
 // WorkspaceProject is an optional extension for projects composed from a
 // root-as-repo parent plus child repositories. It materialises the parent
 // worktree at the session root and each child repo at its registered relative
@@ -175,6 +211,10 @@ var (
 	// this state after path-safety checks, while real preserve failures remain
 	// fatal.
 	ErrWorkspaceStale = errors.New("workspace: stale managed worktree")
+	// ErrWorkspaceRestoreAmbiguous reports that an explicit recovery could not
+	// prove the persisted path/branch/ref identity without normalising state.
+	// Managed restore must leave the worktree and preserved ref untouched.
+	ErrWorkspaceRestoreAmbiguous = errors.New("workspace: exact restore is ambiguous")
 	// ErrPreservedConflict is returned by ApplyPreserved when replaying a
 	// preserved ref onto the worktree produces merge conflicts. The ref is
 	// kept intact (never deleted on conflict); the working tree is left with
@@ -195,6 +235,9 @@ type WorkspaceConfig struct {
 	// orchestrator worktree. Defaults to a truncation of ProjectID when empty.
 	SessionPrefix string
 	Branch        string
+	// BaseSHA is the persisted commit ancestry anchor for strict managed
+	// recovery. Ordinary create/automatic restore callers leave it empty.
+	BaseSHA string
 	// BaseBranch is the per-project default branch new session branches are
 	// created from. Empty falls back to the workspace adapter's own default.
 	BaseBranch string

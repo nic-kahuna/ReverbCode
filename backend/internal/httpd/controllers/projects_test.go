@@ -374,6 +374,51 @@ func TestProjectsAPI_RejectsUnknownConfigKeys(t *testing.T) {
 	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
 }
 
+func TestProjectsAPI_StartupRestorePolicyConfigRoundTrip(t *testing.T) {
+	srv := newTestServer(t)
+	repo := gitRepo(t, "startup-restore-config")
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/projects", `{"path":`+quote(repo)+`,"projectId":"restore-policy"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("seed create = %d, want 201; body=%s", status, body)
+	}
+
+	want := domain.ProjectConfig{
+		DefaultBranch:        "develop",
+		SessionPrefix:        "managed",
+		StartupRestorePolicy: domain.StartupRestorePreserveOnly,
+		Env:                  map[string]string{"KEEP": "yes"},
+		Symlinks:             []string{".env"},
+		PostCreate:           []string{"make prepare"},
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/restore-policy/config", `{"config":`+string(encoded)+`}`)
+	if status != http.StatusOK {
+		t.Fatalf("PUT config = %d, want 200; body=%s", status, body)
+	}
+
+	body, status, _ = doRequest(t, srv, "GET", "/api/v1/projects/restore-policy", "")
+	if status != http.StatusOK {
+		t.Fatalf("GET config = %d, want 200; body=%s", status, body)
+	}
+	var got struct {
+		Status  string `json:"status"`
+		Project struct {
+			Config *domain.ProjectConfig `json:"config"`
+		} `json:"project"`
+	}
+	mustJSON(t, body, &got)
+	if got.Status != "ok" || got.Project.Config == nil {
+		t.Fatalf("GET response = %#v", got)
+	}
+	cfg := got.Project.Config
+	if cfg.StartupRestorePolicy != domain.StartupRestorePreserveOnly || cfg.DefaultBranch != want.DefaultBranch || cfg.SessionPrefix != want.SessionPrefix || cfg.Env["KEEP"] != "yes" || len(cfg.Symlinks) != 1 || cfg.Symlinks[0] != ".env" || len(cfg.PostCreate) != 1 || cfg.PostCreate[0] != "make prepare" {
+		t.Fatalf("round-tripped config = %#v, want policy and unrelated fields intact", cfg)
+	}
+}
+
 func TestProjectsRoutes_LegacyUnregistered(t *testing.T) {
 
 	srv := newTestServer(t)

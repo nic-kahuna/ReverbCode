@@ -133,6 +133,8 @@ var schemaNames = map[string]string{
 	"DomainIssueID":             "IssueID",
 	"DomainSession":             "Session",
 	"DomainProjectConfig":       "ProjectConfig",
+	"DomainSessionRecovery":     "SessionRecovery",
+	"DomainRecoveryWorktree":    "RecoveryWorktree",
 	"DomainTrackerIntakeConfig": "TrackerIntakeConfig",
 	"DomainAgentConfig":         "AgentConfig",
 	"DomainRoleOverride":        "RoleOverride",

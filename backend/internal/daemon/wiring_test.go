@@ -17,6 +17,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
+	"github.com/aoagents/agent-orchestrator/backend/internal/mobilebridge"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
@@ -376,7 +377,9 @@ func TestWiring_StartLifecycleThreadsMessengerIntoLCM(t *testing.T) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	messenger := &captureMessenger{}
-	stack := startLifecycle(ctx, store, tmux.New(tmux.Options{}), messenger, nil, nil, log)
+	reconciled := make(chan struct{})
+	close(reconciled)
+	stack := startLifecycle(ctx, reconciled, store, tmux.New(tmux.Options{}), messenger, nil, nil, log)
 	t.Cleanup(stack.Stop)
 	t.Cleanup(cancel)
 
@@ -451,6 +454,148 @@ func (f *fakeSessionLifecycle) Reconcile(_ context.Context) error {
 func (f *fakeSessionLifecycle) RestoreAll(_ context.Context) error {
 	f.restoreAllCalled = true
 	return f.restoreErr
+}
+
+type blockingSessionLifecycle struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (f *blockingSessionLifecycle) Reconcile(ctx context.Context) error {
+	close(f.entered)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-f.release:
+		return nil
+	}
+}
+
+func (f *blockingSessionLifecycle) RestoreAll(context.Context) error { return nil }
+
+func gatedTestLane(name string, started chan<- string) func(context.Context) <-chan struct{} {
+	return func(ctx context.Context) <-chan struct{} {
+		started <- name
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			<-ctx.Done()
+		}()
+		return done
+	}
+}
+
+func waitDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("gated background lane did not drain after cancellation")
+	}
+}
+
+func TestWiring_BootReconcileGateWaitsForReconcileReturn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	started := make(chan string, 1)
+	done := startAfterSessionReconcile(ctx, ready, gatedTestLane("reaper", started))
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	reconcileResult := make(chan bool, 1)
+	go func() {
+		reconcileResult <- reconcileSessionsOnBoot(ctx, &blockingSessionLifecycle{entered: entered, release: release}, ready, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}()
+
+	<-entered
+	select {
+	case lane := <-started:
+		t.Fatalf("background lane %q started while Reconcile was blocked", lane)
+	default:
+	}
+	close(release)
+	if ok := <-reconcileResult; !ok {
+		t.Fatal("successful Reconcile did not release the startup gate")
+	}
+	select {
+	case lane := <-started:
+		if lane != "reaper" {
+			t.Fatalf("started lane = %q, want reaper", lane)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background lane did not start after successful Reconcile")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestWiring_BootReconcileGateSuccessAndFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		reconcile  error
+		wantStart  bool
+		wantMobile bool
+	}{
+		{name: "success releases every lane", wantStart: true, wantMobile: true},
+		{name: "failure stays closed", reconcile: errors.New("storage unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			ready := make(chan struct{})
+			started := make(chan string, 4)
+			var dones []<-chan struct{}
+			for _, lane := range []string{"reaper", "scm", "tracker", "preview"} {
+				dones = append(dones, startAfterSessionReconcile(ctx, ready, gatedTestLane(lane, started)))
+			}
+
+			reconciled := reconcileSessionsOnBoot(ctx, &fakeSessionLifecycle{reconcileErr: tc.reconcile}, ready, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			mobilePath := mobilebridge.Path(t.TempDir())
+			if err := mobilebridge.Save(mobilePath, mobilebridge.State{Enabled: true, Password: "secret12", LastPort: 3011}); err != nil {
+				t.Fatalf("save mobile state: %v", err)
+			}
+			mobile := &fakeLAN{}
+			if err := restoreMobileAfterSessionReconcile(reconciled, mobilePath, mobile); err != nil {
+				t.Fatalf("restore mobile after reconcile: %v", err)
+			}
+			if reconciled != tc.wantStart {
+				t.Fatalf("reconciled = %v, want %v", reconciled, tc.wantStart)
+			}
+			if mobile.started != tc.wantMobile {
+				t.Fatalf("mobile started = %v, want %v", mobile.started, tc.wantMobile)
+			}
+
+			if tc.wantStart {
+				seen := map[string]bool{}
+				for len(seen) < 4 {
+					select {
+					case lane := <-started:
+						if seen[lane] {
+							t.Fatalf("background lane %q started more than once", lane)
+						}
+						seen[lane] = true
+					case <-time.After(time.Second):
+						t.Fatalf("started lanes = %v, want reaper/scm/tracker/preview", seen)
+					}
+				}
+			} else {
+				select {
+				case <-ready:
+					t.Fatal("failed Reconcile closed the startup gate")
+				default:
+				}
+			}
+
+			cancel()
+			for _, done := range dones {
+				waitDone(t, done)
+			}
+			if !tc.wantStart && len(started) != 0 {
+				t.Fatalf("failure started %d background lanes", len(started))
+			}
+		})
+	}
 }
 
 // TestWiring_SessionLifecycleInterfaceInvokedByDaemon asserts the

@@ -120,11 +120,15 @@ func Run() error {
 	notifier := notificationsvc.New(notificationsvc.Deps{Store: store})
 	notificationWriter := notify.New(notify.Deps{Store: store, Publisher: notificationHub})
 
-	// Bring up the Lifecycle Manager and the reaper first: it makes the session
-	// lifecycle write path live (reducer write -> store -> DB trigger ->
-	// change_log -> poller -> broadcaster) and gives startSession the shared LCM.
-	lcStack := startLifecycle(ctx, store, runtimeAdapter, messenger, notificationWriter, telemetrySink, log)
-	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, log)
+	// Construct the Lifecycle Manager before the session service, but keep every
+	// session-mutating background lane behind a one-shot reconciliation gate. The
+	// reducer remains available to startSession while the reaper and observers are
+	// still quiescent.
+	sessionReconciled := make(chan struct{})
+	lcStack := startLifecycle(ctx, sessionReconciled, store, runtimeAdapter, messenger, notificationWriter, telemetrySink, log)
+	lcStack.scmDone = startAfterSessionReconcile(ctx, sessionReconciled, func(ctx context.Context) <-chan struct{} {
+		return startSCMObserver(ctx, store, lcStack.LCM, log)
+	})
 
 	// Wire the controller-facing session service over the same store + LCM, the
 	// selected runtime, a gitworktree workspace, the per-session agent resolver
@@ -139,8 +143,11 @@ func Run() error {
 		}
 		return fmt.Errorf("wire session service: %w", err)
 	}
-	lcStack.trackerDone = startTrackerIntake(ctx, store, sessionSvc, log)
-	previewDone := preview.NewPoller(store, sessionSvc, "http://"+cfg.Addr(), preview.PollerConfig{Logger: log}).Start(ctx)
+	lcStack.trackerDone = startAfterSessionReconcile(ctx, sessionReconciled, func(ctx context.Context) <-chan struct{} {
+		return startTrackerIntake(ctx, store, sessionSvc, log)
+	})
+	previewPoller := preview.NewPoller(store, sessionSvc, "http://"+cfg.Addr(), preview.PollerConfig{Logger: log})
+	previewDone := startAfterSessionReconcile(ctx, sessionReconciled, previewPoller.Start)
 	agentSvc := agentsvc.New()
 	go func() {
 		if _, err := agentSvc.Refresh(ctx); err != nil {
@@ -189,20 +196,18 @@ func Run() error {
 	lan := httpd.NewMobileLAN(srv.Handler(), mobilebridge.DefaultPort, log)
 	bs.LAN = lan
 
-	// Restore Connect Mobile across a daemon restart: if the bridge was left
-	// enabled, re-arm the listener on its last port with the same password
-	// hash so an already-paired phone keeps working with no new password.
-	// Best-effort: never blocks boot.
-	if err := restoreMobileOnBoot(mobilebridge.Path(cfg.DataDir), lan); err != nil {
-		log.Warn("restore mobile bridge on boot failed", "err", err)
-	}
-
 	// Reconcile sessions on boot: adopt crash-surviving runtimes, capture and
 	// terminate dead ones, reap leaked tmux, then restore shutdown-saved
-	// sessions. Best-effort: a failure is logged but never blocks boot. Placed
-	// before srv.Run so sessions are consistent before the server serves.
-	if reconcileErr := sessMgr.Reconcile(ctx); reconcileErr != nil {
-		log.Error("reconcile sessions on boot failed", "err", reconcileErr)
+	// sessions. A top-level failure does not prevent the loopback API from serving,
+	// but it keeps every background mutation lane and restored Mobile access closed.
+	// This is placed before srv.Run so successful boots expose reconciled sessions.
+	reconcileOK := reconcileSessionsOnBoot(ctx, sessMgr, sessionReconciled, log)
+
+	// Restore Connect Mobile only after successful session reconciliation. If the
+	// bridge was left enabled, re-arm the listener on its last port with the same
+	// password hash so an already-paired phone keeps working with no rotation.
+	if err := restoreMobileAfterSessionReconcile(reconcileOK, mobilebridge.Path(cfg.DataDir), lan); err != nil {
+		log.Warn("restore mobile bridge on boot failed", "err", err)
 	}
 
 	// ponytail: 5s tolerates a brief frontend restart; tune if dev hot-reload trips it.
@@ -246,6 +251,13 @@ func Run() error {
 		log.Error("cdc pipeline shutdown", "err", err)
 	}
 	return runErr
+}
+
+func restoreMobileAfterSessionReconcile(reconciled bool, path string, lan controllers.LANController) error {
+	if !reconciled {
+		return nil
+	}
+	return restoreMobileOnBoot(path, lan)
 }
 
 type runtimeControlServerEnsurer interface {

@@ -40,14 +40,38 @@ type lifecycleStack struct {
 	trackerDone <-chan struct{}
 }
 
-// startLifecycle constructs the Lifecycle Manager over the store and starts the
-// reaper. The goroutine stops when ctx is cancelled; Stop waits for it to drain.
-// The messenger is the per-daemon agent messenger the LCM uses to nudge agents
-// in response to SCM observations (CI failure, review feedback, merge conflict).
-func startLifecycle(ctx context.Context, store *sqlite.Store, runtime ports.Runtime, messenger ports.AgentMessenger, notifier notificationSink, telemetry ports.EventSink, logger *slog.Logger) *lifecycleStack {
+// startLifecycle constructs the Lifecycle Manager over the store and arms the
+// reaper behind the daemon's session-reconciliation gate. The reaper starts only
+// after ready closes; cancellation before that point closes its done channel
+// without starting it, so shutdown can always drain the stack. The messenger is
+// the per-daemon agent messenger the LCM uses to nudge agents in response to SCM
+// observations (CI failure, review feedback, merge conflict).
+func startLifecycle(ctx context.Context, ready <-chan struct{}, store *sqlite.Store, runtime ports.Runtime, messenger ports.AgentMessenger, notifier notificationSink, telemetry ports.EventSink, logger *slog.Logger) *lifecycleStack {
 	lcm := lifecycle.New(store, messenger, lifecycle.WithNotificationSink(notifier), lifecycle.WithTelemetry(telemetry))
 	rp := reaper.New(lcm, store, runtime, reaper.Config{Logger: logger})
-	return &lifecycleStack{LCM: lcm, reaperDone: rp.Start(ctx)}
+	return &lifecycleStack{LCM: lcm, reaperDone: startAfterSessionReconcile(ctx, ready, rp.Start)}
+}
+
+// startAfterSessionReconcile arms one background lane behind the daemon's
+// one-shot boot gate. The wrapper owns a done channel even when startup never
+// becomes ready, which keeps cancellation and lifecycleStack.Stop deterministic.
+func startAfterSessionReconcile(ctx context.Context, ready <-chan struct{}, start func(context.Context) <-chan struct{}) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ready:
+		}
+
+		startedDone := start(ctx)
+		if startedDone == nil {
+			return
+		}
+		<-startedDone
+	}()
+	return done
 }
 
 // Stop waits for the reaper goroutine to exit. The caller must cancel the ctx
@@ -73,6 +97,19 @@ func (l *lifecycleStack) Stop() {
 type sessionLifecycle interface {
 	Reconcile(ctx context.Context) error
 	RestoreAll(ctx context.Context) error
+}
+
+// reconcileSessionsOnBoot runs the synchronous consistency pass and releases
+// session-mutating background lanes only on success. A failure intentionally
+// leaves ready open: the loopback API may still serve, but reaper, observers,
+// preview polling, and restored Mobile access remain quiescent until shutdown.
+func reconcileSessionsOnBoot(ctx context.Context, sessions sessionLifecycle, ready chan<- struct{}, logger *slog.Logger) bool {
+	if err := sessions.Reconcile(ctx); err != nil {
+		logger.Error("reconcile sessions on boot failed; background mutation lanes remain disabled", "err", err)
+		return false
+	}
+	close(ready)
+	return true
 }
 
 // startSession builds the controller-facing session service: a session manager

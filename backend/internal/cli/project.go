@@ -104,16 +104,59 @@ type reviewerConfig struct {
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
 type projectConfig struct {
-	DefaultBranch string              `json:"defaultBranch,omitempty"`
-	SessionPrefix string              `json:"sessionPrefix,omitempty"`
-	Env           map[string]string   `json:"env,omitempty"`
-	Symlinks      []string            `json:"symlinks,omitempty"`
-	PostCreate    []string            `json:"postCreate,omitempty"`
-	AgentConfig   agentConfig         `json:"agentConfig,omitempty"`
-	Worker        roleOverride        `json:"worker,omitempty"`
-	Orchestrator  roleOverride        `json:"orchestrator,omitempty"`
-	Reviewers     []reviewerConfig    `json:"reviewers,omitempty"`
-	TrackerIntake trackerIntakeConfig `json:"trackerIntake,omitempty"`
+	DefaultBranch        string              `json:"defaultBranch,omitempty"`
+	SessionPrefix        string              `json:"sessionPrefix,omitempty"`
+	StartupRestorePolicy string              `json:"startupRestorePolicy,omitempty"`
+	Env                  map[string]string   `json:"env,omitempty"`
+	Symlinks             []string            `json:"symlinks,omitempty"`
+	PostCreate           []string            `json:"postCreate,omitempty"`
+	AgentConfig          agentConfig         `json:"agentConfig,omitempty"`
+	Worker               roleOverride        `json:"worker,omitempty"`
+	Orchestrator         roleOverride        `json:"orchestrator,omitempty"`
+	Reviewers            []reviewerConfig    `json:"reviewers,omitempty"`
+	TrackerIntake        trackerIntakeConfig `json:"trackerIntake,omitempty"`
+	// Extra retains daemon config fields introduced after this CLI build. Policy
+	// patching is read-modify-write, so forward fields must survive too.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (c *projectConfig) UnmarshalJSON(data []byte) error {
+	type known projectConfig
+	var decoded known
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, key := range []string{"defaultBranch", "sessionPrefix", "startupRestorePolicy", "env", "symlinks", "postCreate", "agentConfig", "worker", "orchestrator", "reviewers", "trackerIntake"} {
+		delete(fields, key)
+	}
+	*c = projectConfig(decoded)
+	if len(fields) > 0 {
+		c.Extra = fields
+	}
+	return nil
+}
+
+func (c projectConfig) MarshalJSON() ([]byte, error) {
+	type known projectConfig
+	data, err := json.Marshal(known(c))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for key, value := range c.Extra {
+		if _, knownKey := fields[key]; knownKey {
+			continue
+		}
+		fields[key] = value
+	}
+	return json.Marshal(fields)
 }
 
 // setConfigRequest mirrors the daemon's SetConfigInput body for
@@ -123,21 +166,22 @@ type setConfigRequest struct {
 }
 
 type projectSetConfigOptions struct {
-	defaultBranch     string
-	sessionPrefix     string
-	model             string
-	permission        string
-	workerAgent       string
-	orchestratorAgent string
-	env               []string
-	symlink           []string
-	postCreate        []string
-	trackerIntake     bool
-	trackerRepo       string
-	trackerAssignee   string
-	configJSON        string
-	clear             bool
-	json              bool
+	defaultBranch        string
+	sessionPrefix        string
+	startupRestorePolicy string
+	model                string
+	permission           string
+	workerAgent          string
+	orchestratorAgent    string
+	env                  []string
+	symlink              []string
+	postCreate           []string
+	trackerIntake        bool
+	trackerRepo          string
+	trackerAssignee      string
+	configJSON           string
+	clear                bool
+	json                 bool
 }
 
 type projectListResult struct {
@@ -278,11 +322,12 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "set-config <id>",
 		Short: "Set the per-project config",
-		Long: "Replace a project's per-project config (branch, session prefix, env, " +
+		Long: "Replace a project's per-project config (branch, session prefix, startup restore policy, env, " +
 			"symlinks, post-create, agent model/permissions, role overrides, tracker intake). The config " +
 			"is resolved when a session spawns.\n\n" +
-			"Set fields via flags, pass the whole object with --config-json, or --clear " +
-			"to remove all config.",
+			"Most field flags replace the whole config; pass the whole object with --config-json, or " +
+			"--clear to remove all config. --startup-restore-policy is a narrow patch: use it alone " +
+			"(except for --json) to preserve every unrelated config field.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return usageError{err}
@@ -294,9 +339,43 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := strings.TrimSpace(args[0])
-			config, err := buildProjectConfig(opts)
-			if err != nil {
-				return err
+			policyPatch := cmd.Flags().Changed("startup-restore-policy")
+			if policyPatch {
+				changedConfigFlags := cmd.Flags().NFlag()
+				if cmd.Flags().Changed("json") {
+					changedConfigFlags--
+				}
+				if changedConfigFlags != 1 {
+					return usageError{errors.New("--startup-restore-policy cannot be combined with other config flags, --config-json, or --clear")}
+				}
+				if opts.startupRestorePolicy != "automatic" && opts.startupRestorePolicy != "preserve_only" {
+					return usageError{fmt.Errorf("invalid --startup-restore-policy %q: want automatic or preserve_only", opts.startupRestorePolicy)}
+				}
+			}
+
+			var config projectConfig
+			if policyPatch {
+				var current projectGetResult
+				if err := ctx.getJSON(cmd.Context(), "projects/"+url.PathEscape(id), &current); err != nil {
+					return err
+				}
+				if current.Status != "ok" || current.Project.ResolveError != "" {
+					reason := strings.TrimSpace(current.Project.ResolveError)
+					if reason == "" {
+						reason = "project config is unavailable"
+					}
+					return fmt.Errorf("cannot update startup restore policy for project %s: %s", id, reason)
+				}
+				if current.Project.Config != nil {
+					config = *current.Project.Config
+				}
+				config.StartupRestorePolicy = opts.startupRestorePolicy
+			} else {
+				var err error
+				config, err = buildProjectConfig(opts)
+				if err != nil {
+					return err
+				}
 			}
 			req := setConfigRequest{Config: config}
 			var res projectResult
@@ -306,13 +385,14 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), res)
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "updated config for project %s\n", res.Project.ID)
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "updated config for project %s\n", res.Project.ID)
 			return err
 		},
 	}
 	f := cmd.Flags()
 	f.StringVar(&opts.defaultBranch, "default-branch", "", "Base branch new session worktrees are created from")
 	f.StringVar(&opts.sessionPrefix, "session-prefix", "", "Displayed session-id prefix")
+	f.StringVar(&opts.startupRestorePolicy, "startup-restore-policy", "", "Patch startup restore policy without changing other config: automatic or preserve_only")
 	f.StringVar(&opts.model, "model", "", "Agent model override (e.g. claude-opus-4-5)")
 	f.StringVar(&opts.permission, "permission", "", "Permission mode: default, accept-edits, auto, bypass-permissions")
 	f.StringVar(&opts.workerAgent, "worker-agent", "", "Harness override for worker sessions")
@@ -350,14 +430,15 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 		return projectConfig{}, err
 	}
 	cfg := projectConfig{
-		DefaultBranch: opts.defaultBranch,
-		SessionPrefix: opts.sessionPrefix,
-		Env:           env,
-		Symlinks:      opts.symlink,
-		PostCreate:    opts.postCreate,
-		AgentConfig:   agentConfig{Model: opts.model, Permissions: opts.permission},
-		Worker:        roleOverride{Agent: opts.workerAgent},
-		Orchestrator:  roleOverride{Agent: opts.orchestratorAgent},
+		DefaultBranch:        opts.defaultBranch,
+		SessionPrefix:        opts.sessionPrefix,
+		StartupRestorePolicy: opts.startupRestorePolicy,
+		Env:                  env,
+		Symlinks:             opts.symlink,
+		PostCreate:           opts.postCreate,
+		AgentConfig:          agentConfig{Model: opts.model, Permissions: opts.permission},
+		Worker:               roleOverride{Agent: opts.workerAgent},
+		Orchestrator:         roleOverride{Agent: opts.orchestratorAgent},
 		TrackerIntake: trackerIntakeConfig{
 			Enabled:  opts.trackerIntake,
 			Provider: trackerProviderForFlags(opts),

@@ -717,6 +717,7 @@ export interface components {
             previewUrl?: string;
             projectId: string;
             prs: components["schemas"]["SessionPRFacts"][];
+            recovery?: components["schemas"]["SessionRecovery"];
             requestedRoute?: components["schemas"]["DomainAgentRoute"];
             /** @enum {string} */
             status: "working" | "pr_open" | "draft" | "ci_failed" | "review_pending" | "changes_requested" | "approved" | "mergeable" | "merged" | "needs_input" | "idle" | "terminated" | "no_signal";
@@ -885,6 +886,8 @@ export interface components {
             postCreate?: string[];
             reviewers?: components["schemas"]["DomainReviewerConfig"][];
             sessionPrefix?: string;
+            /** @enum {string} */
+            startupRestorePolicy?: "automatic" | "preserve_only";
             symlinks?: string[];
             trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
             worker?: components["schemas"]["RoleOverride"];
@@ -906,6 +909,14 @@ export interface components {
             path: string;
             resolveError?: string;
             sessionPrefix: string;
+        };
+        RecoveryWorktree: {
+            baseSha: string;
+            branch: string;
+            preservedRef: string;
+            repoName: string;
+            state: string;
+            worktreePath: string;
         };
         RemoveProjectResult: {
             projectId: string;
@@ -1057,6 +1068,16 @@ export interface components {
             entry?: string;
             previewUrl?: string;
             sessionId: string;
+        };
+        SessionRecovery: {
+            /** @enum {string} */
+            policy: "preserve_only";
+            providerSessionSaved: boolean;
+            /** @enum {string} */
+            runtimeState: "absent" | "unknown";
+            /** @enum {string} */
+            state: "awaiting_recovery";
+            worktrees: components["schemas"]["RecoveryWorktree"][];
         };
         SessionResponse: {
             session: components["schemas"]["ControllersSessionView"];

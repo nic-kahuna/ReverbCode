@@ -115,6 +115,7 @@ func (m *Service) List(ctx context.Context) ([]Summary, error) {
 			Kind:              row.Kind.WithDefault(),
 			SessionPrefix:     resolveSessionPrefix(row),
 			OrchestratorAgent: row.Config.Orchestrator.Harness,
+			ResolveError:      row.ConfigDecodeError,
 		})
 	}
 	return out, nil
@@ -131,6 +132,18 @@ func (m *Service) Get(ctx context.Context, id domain.ProjectID) (GetResult, erro
 	}
 	if !ok || !row.ArchivedAt.IsZero() {
 		return GetResult{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
+	}
+	if row.ConfigDecodeError != "" {
+		return GetResult{
+			Status: "degraded",
+			Degraded: &Degraded{
+				ID:           domain.ProjectID(row.ID),
+				Name:         displayName(row),
+				Kind:         row.Kind.WithDefault(),
+				Path:         row.Path,
+				ResolveError: row.ConfigDecodeError,
+			},
+		}, nil
 	}
 	p := m.projectFromRow(row)
 	if row.Kind.WithDefault() == domain.ProjectKindWorkspace {
@@ -527,6 +540,10 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 		return Project{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
 	}
 	row.Config = in.Config
+	// A successful typed replacement is the explicit repair boundary for a row
+	// whose prior JSON could not be decoded. Incidental writers remain blocked by
+	// the storage guard until this field is intentionally cleared here.
+	row.ConfigDecodeError = ""
 	if err := m.store.UpsertProject(ctx, row); err != nil {
 		return Project{}, apierr.Internal("PROJECT_CONFIG_UPDATE_FAILED", "Failed to update project config")
 	}

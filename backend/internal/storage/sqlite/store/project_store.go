@@ -14,6 +14,9 @@ import (
 
 // UpsertProject inserts or replaces a registered project row.
 func (s *Store) UpsertProject(ctx context.Context, r domain.ProjectRecord) error {
+	if r.ConfigDecodeError != "" {
+		return fmt.Errorf("upsert project %s: refusing to overwrite undecodable config: %s", r.ID, r.ConfigDecodeError)
+	}
 	config, err := marshalProjectConfig(r.Config)
 	if err != nil {
 		return err
@@ -26,6 +29,9 @@ func (s *Store) UpsertProject(ctx context.Context, r domain.ProjectRecord) error
 // UpsertWorkspaceProject inserts or replaces a workspace project and its child
 // repository registry in one transaction. The child set is authoritative.
 func (s *Store) UpsertWorkspaceProject(ctx context.Context, r domain.ProjectRecord, repos []domain.WorkspaceRepoRecord) error {
+	if r.ConfigDecodeError != "" {
+		return fmt.Errorf("upsert workspace project %s: refusing to overwrite undecodable config: %s", r.ID, r.ConfigDecodeError)
+	}
 	config, err := marshalProjectConfig(r.Config)
 	if err != nil {
 		return err
@@ -139,14 +145,16 @@ func (s *Store) ArchiveProject(ctx context.Context, id string, at time.Time) (bo
 }
 
 func projectRowFromGen(p gen.Project) domain.ProjectRecord {
+	config, configDecodeError := decodeProjectConfig(p.Config)
 	r := domain.ProjectRecord{
-		ID:            string(p.ID),
-		Path:          p.Path,
-		RepoOriginURL: p.RepoOriginURL,
-		DisplayName:   p.DisplayName,
-		RegisteredAt:  p.RegisteredAt,
-		Kind:          domain.ProjectKind(p.Kind).WithDefault(),
-		Config:        unmarshalProjectConfig(p.Config),
+		ID:                string(p.ID),
+		Path:              p.Path,
+		RepoOriginURL:     p.RepoOriginURL,
+		DisplayName:       p.DisplayName,
+		RegisteredAt:      p.RegisteredAt,
+		Kind:              domain.ProjectKind(p.Kind).WithDefault(),
+		Config:            config,
+		ConfigDecodeError: configDecodeError,
 	}
 	if p.ArchivedAt.Valid {
 		r.ArchivedAt = p.ArchivedAt.Time
@@ -168,20 +176,22 @@ func marshalProjectConfig(cfg domain.ProjectConfig) (sql.NullString, error) {
 	return sql.NullString{String: string(data), Valid: true}, nil
 }
 
-// unmarshalProjectConfig decodes the nullable JSON column back into the typed
-// struct. SQL NULL (an unset config) decodes to a zero value. A damaged config
-// (invalid JSON from a direct DB edit or migration bug) also degrades to a zero
-// config rather than erroring — a corrupt config must never block access to the
-// project row, nor fail an entire ListProjects.
-func unmarshalProjectConfig(s sql.NullString) domain.ProjectConfig {
+// decodeProjectConfig decodes the nullable JSON column without making a damaged
+// config block GetProject or ListProjects. The returned error fact distinguishes
+// a trustworthy legacy/unset automatic policy from corrupt, unknown policy so
+// startup reconciliation can fail closed.
+func decodeProjectConfig(s sql.NullString) (domain.ProjectConfig, string) {
 	if !s.Valid || s.String == "" {
-		return domain.ProjectConfig{}
+		return domain.ProjectConfig{}, ""
 	}
 	var cfg domain.ProjectConfig
 	if err := json.Unmarshal([]byte(s.String), &cfg); err != nil {
-		return domain.ProjectConfig{}
+		return domain.ProjectConfig{}, fmt.Sprintf("decode project config: %v", err)
 	}
-	return cfg
+	if err := cfg.Validate(); err != nil {
+		return domain.ProjectConfig{}, fmt.Sprintf("validate project config: %v", err)
+	}
+	return cfg, ""
 }
 
 func nullTime(t time.Time) sql.NullTime {

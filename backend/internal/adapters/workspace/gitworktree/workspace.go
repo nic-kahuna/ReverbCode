@@ -85,6 +85,7 @@ type commandRunner func(ctx context.Context, binary string, args ...string) ([]b
 
 var _ ports.Workspace = (*Workspace)(nil)
 var _ ports.WorkspaceProject = (*Workspace)(nil)
+var _ ports.ExactWorkspaceRestorer = (*Workspace)(nil)
 
 // New builds a gitworktree Workspace, validating that ManagedRoot and
 // RepoResolver are set and resolving the root to an absolute, symlink-free path.
@@ -491,11 +492,33 @@ func (w *Workspace) countIgnoredPaths(ctx context.Context, worktree string) (int
 //
 // NEVER deletes the preserve ref on a failed or conflicted apply.
 func (w *Workspace) ApplyPreserved(ctx context.Context, info ports.WorkspaceInfo, ref string) error {
+	if err := w.ApplyPreservedExact(ctx, info, ref); err != nil {
+		return err
+	}
+	if err := w.DeletePreservedRef(ctx, info, ref); err != nil {
+		// Historical automatic restore treats ref cleanup as best effort once
+		// the tree is applied.
+		slog.WarnContext(ctx, "gitworktree: ApplyPreserved could not delete preserve ref",
+			"ref", ref,
+			"err", err,
+		)
+	}
+	return nil
+}
+
+// ApplyPreservedExact applies the captured tree but deliberately retains the
+// preserve ref. Managed recovery keeps that immutable evidence until its
+// runtime and durable journal transition both succeed.
+func (w *Workspace) ApplyPreservedExact(ctx context.Context, info ports.WorkspaceInfo, ref string) error {
 	if info.Path == "" {
 		return fmt.Errorf("%w: empty path", ErrUnsafePath)
 	}
 	if ref == "" {
 		return errors.New("gitworktree: ApplyPreserved: ref must not be empty")
+	}
+	expected := "refs/ao/preserved/" + string(info.SessionID)
+	if ref != expected {
+		return fmt.Errorf("%w: preserved ref %q does not belong to session %q", ports.ErrWorkspaceRestoreAmbiguous, ref, info.SessionID)
 	}
 
 	// Resolve the ref to its commit SHA.
@@ -504,6 +527,25 @@ func (w *Workspace) ApplyPreserved(ctx context.Context, info ports.WorkspaceInfo
 		return fmt.Errorf("gitworktree: ApplyPreserved resolve ref %q: %w", ref, err)
 	}
 	commitSHA := strings.TrimSpace(string(resolveOut))
+	branchHead, err := w.revParse(ctx, info.Path, "refs/heads/"+info.Branch)
+	if err != nil {
+		return fmt.Errorf("%w: resolve branch head %q: %w", ports.ErrWorkspaceRestoreAmbiguous, info.Branch, err)
+	}
+	head, err := w.revParse(ctx, info.Path, "HEAD")
+	if err != nil {
+		return fmt.Errorf("%w: resolve worktree HEAD: %w", ports.ErrWorkspaceRestoreAmbiguous, err)
+	}
+	symbolicOut, err := w.run(ctx, w.binary, "-C", info.Path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil || strings.TrimSpace(string(symbolicOut)) != info.Branch || head != branchHead {
+		return fmt.Errorf("%w: worktree is not on exact branch %q at its current head", ports.ErrWorkspaceRestoreAmbiguous, info.Branch)
+	}
+	parents, err := w.revParseParents(ctx, info.Path, ref)
+	if err != nil {
+		return fmt.Errorf("%w: resolve preserved ref parent %q: %w", ports.ErrWorkspaceRestoreAmbiguous, ref, err)
+	}
+	if len(parents) != 1 || parents[0] != branchHead {
+		return fmt.Errorf("%w: preserved ref %q parent does not match branch head %q", ports.ErrWorkspaceRestoreAmbiguous, ref, branchHead)
+	}
 
 	// Apply the preserve commit via "git cherry-pick --no-commit <sha>".
 	// cherry-pick computes the diff between the preserve commit and its parent
@@ -518,14 +560,20 @@ func (w *Workspace) ApplyPreserved(ctx context.Context, info ports.WorkspaceInfo
 		return fmt.Errorf("%w: %w", ErrPreservedConflict, applyErr)
 	}
 
-	// Clean apply: remove the preserve ref so it is never replayed twice.
+	return nil
+}
+
+// DeletePreservedRef removes a preserve ref after its managed recovery journal
+// was safely consumed. It never changes the worktree or branch.
+func (w *Workspace) DeletePreservedRef(ctx context.Context, info ports.WorkspaceInfo, ref string) error {
+	if info.Path == "" {
+		return fmt.Errorf("%w: empty path", ErrUnsafePath)
+	}
+	if ref == "" {
+		return errors.New("gitworktree: DeletePreservedRef: ref must not be empty")
+	}
 	if _, err := w.run(ctx, w.binary, deleteRefArgs(info.Path, ref)...); err != nil {
-		// Log but do not fail: the work is already applied. A dangling preserve
-		// ref is harmless; the next StashUncommitted will overwrite it.
-		slog.WarnContext(ctx, "gitworktree: ApplyPreserved could not delete preserve ref",
-			"ref", ref,
-			"err", err,
-		)
+		return fmt.Errorf("gitworktree: delete preserve ref %q: %w", ref, err)
 	}
 	return nil
 }
@@ -585,6 +633,140 @@ func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (por
 		return ports.WorkspaceInfo{}, err
 	}
 	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+}
+
+// PreflightExactRestore proves that a persisted recovery target is either the
+// exact registered worktree named by cfg or an entirely absent path whose
+// existing local branch can be re-attached without normalisation. It is
+// intentionally read-only: unlike Restore it never prunes registrations or
+// moves a stray path aside.
+func (w *Workspace) PreflightExactRestore(ctx context.Context, cfg ports.WorkspaceConfig, disposition ports.WorkspaceRecoveryDisposition, preservedRef string) error {
+	_, _, _, err := w.preflightExactRestore(ctx, cfg, disposition, preservedRef)
+	return err
+}
+
+// RestoreExact revalidates the read-only preflight and then either returns the
+// already-registered exact worktree or attaches the persisted local branch at
+// the persisted, absent path. It never creates a replacement branch, prunes a
+// stale registration, or moves/deletes any existing path.
+func (w *Workspace) RestoreExact(ctx context.Context, cfg ports.WorkspaceConfig, disposition ports.WorkspaceRecoveryDisposition, preservedRef string) (ports.WorkspaceInfo, error) {
+	repo, path, existing, err := w.preflightExactRestore(ctx, cfg, disposition, preservedRef)
+	if err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	if existing {
+		return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+	}
+	if _, err := w.run(ctx, w.binary, worktreeAddBranchArgs(repo, path, cfg.Branch)...); err != nil {
+		return ports.WorkspaceInfo{}, fmt.Errorf("%w: attach existing branch %q at %q: %w", ports.ErrWorkspaceRestoreAmbiguous, cfg.Branch, path, err)
+	}
+	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+}
+
+func (w *Workspace) preflightExactRestore(ctx context.Context, cfg ports.WorkspaceConfig, disposition ports.WorkspaceRecoveryDisposition, preservedRef string) (repo, path string, existing bool, err error) {
+	if disposition != ports.WorkspaceRecoveryInPlace && disposition != ports.WorkspaceRecoveryRemoved {
+		return "", "", false, fmt.Errorf("%w: unknown recovery disposition %q", ports.ErrWorkspaceRestoreAmbiguous, disposition)
+	}
+	if err := validateConfig(cfg); err != nil {
+		return "", "", false, fmt.Errorf("%w: invalid persisted workspace config: %w", ports.ErrWorkspaceRestoreAmbiguous, err)
+	}
+	if strings.TrimSpace(cfg.Path) == "" {
+		return "", "", false, fmt.Errorf("%w: persisted worktree path is required", ports.ErrWorkspaceRestoreAmbiguous)
+	}
+	repo, err = w.repoPathForConfig(cfg)
+	if err != nil {
+		return "", "", false, fmt.Errorf("%w: resolve persisted repo: %w", ports.ErrWorkspaceRestoreAmbiguous, err)
+	}
+	path, err = w.restorePath(cfg)
+	if err != nil {
+		return "", "", false, fmt.Errorf("%w: resolve persisted worktree path: %w", ports.ErrWorkspaceRestoreAmbiguous, err)
+	}
+	if err := w.validateBranch(ctx, repo, cfg.Branch); err != nil {
+		return "", "", false, fmt.Errorf("%w: %w", ports.ErrWorkspaceRestoreAmbiguous, err)
+	}
+	records, err := w.listRecords(ctx, repo)
+	if err != nil {
+		return "", "", false, fmt.Errorf("%w: list registered worktrees: %w", ports.ErrWorkspaceRestoreAmbiguous, err)
+	}
+	if rec, ok := findWorktree(records, path); ok {
+		if disposition != ports.WorkspaceRecoveryInPlace {
+			return "", "", false, fmt.Errorf("%w: persisted removed worktree path %q is still registered", ports.ErrWorkspaceRestoreAmbiguous, path)
+		}
+		if rec.Branch != cfg.Branch || rec.Detached || rec.Bare {
+			return "", "", false, fmt.Errorf("%w: persisted path %q is registered for branch %q, want %q", ports.ErrWorkspaceRestoreAmbiguous, path, rec.Branch, cfg.Branch)
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return "", "", false, fmt.Errorf("%w: registered worktree %q is unavailable: %w", ports.ErrWorkspaceRestoreAmbiguous, path, statErr)
+		}
+		if !info.IsDir() {
+			return "", "", false, fmt.Errorf("%w: registered worktree %q is not a directory", ports.ErrWorkspaceRestoreAmbiguous, path)
+		}
+		existing = true
+	} else {
+		if disposition != ports.WorkspaceRecoveryRemoved {
+			return "", "", false, fmt.Errorf("%w: persisted in-place worktree path %q is not registered", ports.ErrWorkspaceRestoreAmbiguous, path)
+		}
+		if _, statErr := os.Lstat(path); statErr == nil {
+			return "", "", false, fmt.Errorf("%w: persisted path %q exists but is not a registered worktree", ports.ErrWorkspaceRestoreAmbiguous, path)
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", "", false, fmt.Errorf("%w: inspect persisted path %q: %w", ports.ErrWorkspaceRestoreAmbiguous, path, statErr)
+		}
+		if conflict, ok := findWorktreeByBranch(records, cfg.Branch); ok {
+			return "", "", false, fmt.Errorf("%w: %w: %q is checked out at %q", ports.ErrWorkspaceRestoreAmbiguous, ErrBranchCheckedOutElsewhere, cfg.Branch, conflict.Path)
+		}
+		localBranch, refErr := w.refExists(ctx, repo, "refs/heads/"+cfg.Branch)
+		if refErr != nil {
+			return "", "", false, fmt.Errorf("%w: verify persisted branch %q: %w", ports.ErrWorkspaceRestoreAmbiguous, cfg.Branch, refErr)
+		}
+		if !localBranch {
+			return "", "", false, fmt.Errorf("%w: persisted local branch %q is missing", ports.ErrWorkspaceRestoreAmbiguous, cfg.Branch)
+		}
+	}
+	branchRef := "refs/heads/" + cfg.Branch
+	branchHead, headErr := w.revParse(ctx, repo, branchRef)
+	if headErr != nil {
+		return "", "", false, fmt.Errorf("%w: resolve persisted branch head %q: %w", ports.ErrWorkspaceRestoreAmbiguous, cfg.Branch, headErr)
+	}
+	if cfg.BaseSHA != "" {
+		if err := w.isAncestor(ctx, repo, cfg.BaseSHA, branchRef); err != nil {
+			return "", "", false, fmt.Errorf("%w: persisted base %q is not proven in branch %q: %w", ports.ErrWorkspaceRestoreAmbiguous, cfg.BaseSHA, cfg.Branch, err)
+		}
+	}
+	if preservedRef != "" {
+		expected := "refs/ao/preserved/" + string(cfg.SessionID)
+		if preservedRef != expected {
+			return "", "", false, fmt.Errorf("%w: preserved ref %q does not belong to session %q", ports.ErrWorkspaceRestoreAmbiguous, preservedRef, cfg.SessionID)
+		}
+		refOK, refErr := w.refExists(ctx, repo, preservedRef+"^{commit}")
+		if refErr != nil {
+			return "", "", false, fmt.Errorf("%w: verify preserved ref %q: %w", ports.ErrWorkspaceRestoreAmbiguous, preservedRef, refErr)
+		}
+		if !refOK {
+			return "", "", false, fmt.Errorf("%w: preserved ref %q is missing or is not a commit", ports.ErrWorkspaceRestoreAmbiguous, preservedRef)
+		}
+		parents, parentErr := w.revParseParents(ctx, repo, preservedRef)
+		if parentErr != nil {
+			return "", "", false, fmt.Errorf("%w: resolve preserved ref parent %q: %w", ports.ErrWorkspaceRestoreAmbiguous, preservedRef, parentErr)
+		}
+		if len(parents) != 1 || parents[0] != branchHead {
+			return "", "", false, fmt.Errorf("%w: preserved ref %q parent does not match persisted branch head %q", ports.ErrWorkspaceRestoreAmbiguous, preservedRef, branchHead)
+		}
+	}
+	return repo, path, existing, nil
+}
+
+func (w *Workspace) isAncestor(ctx context.Context, repo, ancestor, descendant string) error {
+	_, err := w.run(ctx, w.binary, mergeBaseIsAncestorArgs(repo, ancestor, descendant)...)
+	return err
+}
+
+func (w *Workspace) revParseParents(ctx context.Context, repo, ref string) ([]string, error) {
+	out, err := w.run(ctx, w.binary, "-C", repo, "rev-parse", ref+"^@")
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(out)), nil
 }
 
 func (w *Workspace) existingWorktree(ctx context.Context, repo, path string, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, bool, error) {

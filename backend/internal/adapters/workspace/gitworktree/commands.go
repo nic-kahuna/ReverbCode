@@ -91,6 +91,10 @@ func revParseHeadArgs(worktree string) []string {
 	return []string{"-C", worktree, "rev-parse", "--verify", "HEAD"}
 }
 
+func mergeBaseIsAncestorArgs(repo, ancestor, descendant string) []string {
+	return []string{"-C", repo, "merge-base", "--is-ancestor", ancestor, descendant}
+}
+
 // cherryPickNoCommitArgs applies a single commit's diff onto the current
 // working tree via a true three-way merge without committing or moving HEAD.
 // git cherry-pick --no-commit computes the diff between <sha> and its parent

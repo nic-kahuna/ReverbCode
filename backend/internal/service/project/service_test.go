@@ -2,6 +2,7 @@ package project_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"os/exec"
@@ -439,9 +440,68 @@ func TestManager_SetConfig(t *testing.T) {
 	_, err = m.SetConfig(ctx, "ao", project.SetConfigInput{Config: domain.ProjectConfig{Worker: domain.RoleOverride{Harness: "nope"}}})
 	wantCode(t, err, "INVALID_PROJECT_CONFIG")
 
+	// Startup restore is a closed vocabulary: unknown modes must fail closed.
+	_, err = m.SetConfig(ctx, "ao", project.SetConfigInput{Config: domain.ProjectConfig{StartupRestorePolicy: "managed"}})
+	wantCode(t, err, "INVALID_PROJECT_CONFIG")
+
 	// Setting on an unknown project is a clean not-found.
 	_, err = m.SetConfig(ctx, "ghost", project.SetConfigInput{Config: cfg})
 	wantCode(t, err, "PROJECT_NOT_FOUND")
+}
+
+func TestManager_SetConfigRepairsUndecodableStoredConfig(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	store, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	m := project.New(store)
+
+	if _, err := m.Add(ctx, project.AddInput{Path: gitRepo(t), ProjectID: ptr("repair")}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	rawDB, err := sql.Open("sqlite", filepath.Join(dataDir, "ao.db"))
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+	if _, err := rawDB.ExecContext(ctx, `UPDATE projects SET config = '{not json' WHERE id = 'repair'`); err != nil {
+		t.Fatalf("corrupt stored config fixture: %v", err)
+	}
+	corrupt, ok, err := store.GetProject(ctx, "repair")
+	if err != nil || !ok || corrupt.ConfigDecodeError == "" {
+		t.Fatalf("corrupt project = %#v ok=%v err=%v, want decode error fact", corrupt, ok, err)
+	}
+	list, err := m.List(ctx)
+	if err != nil || len(list) != 1 || list[0].ResolveError != corrupt.ConfigDecodeError {
+		t.Fatalf("degraded list = %#v err=%v, want storage decode error", list, err)
+	}
+	degraded, err := m.Get(ctx, "repair")
+	if err != nil || degraded.Status != "degraded" || degraded.Project != nil || degraded.Degraded == nil {
+		t.Fatalf("degraded Get = %#v err=%v", degraded, err)
+	}
+	if degraded.Degraded.ID != "repair" || degraded.Degraded.Path == "" || degraded.Degraded.ResolveError != corrupt.ConfigDecodeError {
+		t.Fatalf("degraded project identity = %#v", degraded.Degraded)
+	}
+
+	want := domain.ProjectConfig{StartupRestorePolicy: domain.StartupRestorePreserveOnly}
+	if _, err := m.SetConfig(ctx, "repair", project.SetConfigInput{Config: want}); err != nil {
+		t.Fatalf("SetConfig repair: %v", err)
+	}
+	repaired, ok, err := store.GetProject(ctx, "repair")
+	if err != nil || !ok || repaired.ConfigDecodeError != "" || repaired.Config.StartupRestorePolicy != domain.StartupRestorePreserveOnly {
+		t.Fatalf("repaired project = %#v ok=%v err=%v", repaired, ok, err)
+	}
+	resolved, err := m.Get(ctx, "repair")
+	if err != nil || resolved.Status != "ok" || resolved.Project == nil || resolved.Degraded != nil {
+		t.Fatalf("resolved Get = %#v err=%v", resolved, err)
+	}
+	list, err = m.List(ctx)
+	if err != nil || len(list) != 1 || list[0].ResolveError != "" {
+		t.Fatalf("resolved list = %#v err=%v", list, err)
+	}
 }
 
 func TestManager_ListIncludesOnlySummarySafeProjectConfig(t *testing.T) {

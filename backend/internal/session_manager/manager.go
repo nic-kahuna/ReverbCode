@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -54,7 +55,41 @@ var (
 	// would answer it on the user's behalf. The API maps it to a 409; the
 	// caller retries once the user has answered in the terminal.
 	ErrAwaitingDecision = errors.New("session: awaiting a user decision")
+	// ErrManagedRestore is the stable class for a managed explicit restore that
+	// fails closed, whether during read-only proof or after a guarded mutation.
+	ErrManagedRestore = errors.New("session: managed recovery failed closed")
+	// ErrRecoveryAdmission means durable managed recovery evidence prevents a
+	// fresh launch, replacement, or pane write until it is explicitly restored
+	// or discarded through the exact session boundary.
+	ErrRecoveryAdmission = errors.New("session: managed recovery admission blocked")
+	// ErrProjectConfigInvalid prevents a malformed stored project policy from
+	// silently falling back to automatic/default spawn behavior.
+	ErrProjectConfigInvalid = errors.New("session: project config is invalid")
 )
+
+// RecoveryFailure describes one fail-closed explicit restore. Code is stable
+// machine-readable evidence; Message/Error may contain adapter diagnostics.
+// No provider session identifier is ever included.
+type RecoveryFailure struct {
+	SessionID            domain.SessionID
+	Code                 string
+	Phase                string
+	ProjectID            domain.ProjectID
+	Kind                 domain.SessionKind
+	ProviderSessionSaved bool
+	RuntimeStopped       *bool
+	Worktrees            []domain.SessionWorktreeRecord
+	Err                  error
+}
+
+func (e *RecoveryFailure) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("managed restore %s: %s", e.SessionID, e.Code)
+	}
+	return fmt.Sprintf("managed restore %s: %s: %v", e.SessionID, e.Code, e.Err)
+}
+
+func (e *RecoveryFailure) Unwrap() error { return ErrManagedRestore }
 
 // Env vars a spawned process reads to learn who it is.
 const (
@@ -106,6 +141,9 @@ type Store interface {
 	// SaveAndTeardownAll writes the preserved_ref here (even when empty) as the
 	// "shutdown-saved" marker before ForceDestroying the worktree.
 	UpsertSessionWorktree(ctx context.Context, row domain.SessionWorktreeRecord) error
+	// UpsertSessionWorktrees atomically journals a complete multi-repo recovery
+	// snapshot. No row may become visible unless every row was written.
+	UpsertSessionWorktrees(ctx context.Context, rows []domain.SessionWorktreeRecord) error
 	// ListSessionWorktrees returns every worktree row for a session. RestoreAll
 	// uses this to identify sessions saved by the last SaveAndTeardownAll: the
 	// presence of any row is the marker; preserved_ref may be empty for clean
@@ -144,8 +182,12 @@ type Manager struct {
 	// sendConfirm bounds the best-effort post-send confirmation that the session
 	// actually became active (the agent accepted the prompt). New fills in the
 	// sendConfirm* defaults; tests in this package shrink the timings directly.
-	sendConfirm sendConfirmConfig
-	logger      *slog.Logger
+	sendConfirm    sendConfirmConfig
+	logger         *slog.Logger
+	lifecycleMu    sync.Mutex
+	lifecycleLocks map[domain.SessionID]*sync.Mutex
+	projectMu      sync.Mutex
+	projectLocks   map[domain.ProjectID]*sync.Mutex
 }
 
 // sendConfirmConfig bounds the best-effort activity-confirmation loop run after
@@ -216,7 +258,9 @@ func New(d Deps) *Manager {
 			attemptDeadline: sendConfirmAttemptDeadline,
 			maxAttempts:     sendConfirmMaxAttempts,
 		},
-		logger: d.Logger,
+		logger:         d.Logger,
+		lifecycleLocks: make(map[domain.SessionID]*sync.Mutex),
+		projectLocks:   make(map[domain.ProjectID]*sync.Mutex),
 	}
 	if m.clock == nil {
 		// UTC so spawn-stamped CreatedAt/UpdatedAt match every other session
@@ -244,6 +288,9 @@ func New(d Deps) *Manager {
 // materialization fails the still-seed row is deleted outright; a later failure
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error) {
+	unlockProject := m.lockProjectLifecycle(cfg.ProjectID)
+	defer unlockProject()
+
 	if cfg.Route != nil {
 		if err := cfg.Route.Validate(); err != nil {
 			return domain.SessionRecord{}, fmt.Errorf("spawn: invalid route: %w", err)
@@ -256,6 +303,14 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	project, err := m.loadProject(ctx, cfg.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
+	}
+	if project.ConfigDecodeError != "" {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %s", ErrProjectConfigInvalid, project.ConfigDecodeError)
+	}
+	if blocked, blockedSession, err := m.spawnConflictsWithManagedRecovery(ctx, cfg); err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: inspect recovery admission: %w", err)
+	} else if blocked {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: session %s is awaiting explicit recovery", ErrRecoveryAdmission, blockedSession)
 	}
 	// A per-project role override picks the harness when the spawn names none,
 	// so a project can default workers to one agent and orchestrators to another.
@@ -612,7 +667,7 @@ func (m *Manager) rollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 	if deleted {
 		return true, false, nil
 	}
-	killed, err = m.Kill(ctx, id)
+	killed, err = m.kill(ctx, id)
 	if err != nil {
 		return false, false, err
 	}
@@ -621,6 +676,8 @@ func (m *Manager) rollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 
 // RollbackSpawn is the public surface of rollbackSpawn for service-layer callers.
 func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (deleted, killed bool, err error) {
+	unlock := m.lockSessionLifecycle(id)
+	defer unlock()
 	return m.rollbackSpawn(ctx, id)
 }
 
@@ -634,6 +691,23 @@ func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 // available destroy steps are skipped so it can be cleaned up from the
 // dashboard.
 func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
+	unlockDiscovery := m.lockSessionLifecycle(id)
+	initial, ok, err := m.store.GetSession(ctx, id)
+	unlockDiscovery()
+	if err != nil {
+		return false, fmt.Errorf("kill %s: %w", id, err)
+	}
+	if !ok {
+		return false, nil
+	}
+	unlockProject := m.lockProjectLifecycle(initial.ProjectID)
+	defer unlockProject()
+	unlock := m.lockSessionLifecycle(id)
+	defer unlock()
+	return m.kill(ctx, id)
+}
+
+func (m *Manager) kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return false, fmt.Errorf("kill %s: %w", id, err)
@@ -698,12 +772,33 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 // This deliberately does not write a session_worktrees row: those rows are
 // boot-restore markers, and a replaced orchestrator must stay terminated.
 func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID) error {
+	unlockDiscovery := m.lockSessionLifecycle(id)
+	initial, ok, err := m.store.GetSession(ctx, id)
+	unlockDiscovery()
+	if err != nil {
+		return fmt.Errorf("retire replacement %s: %w", id, err)
+	}
+	if !ok {
+		return nil
+	}
+	unlockProject := m.lockProjectLifecycle(initial.ProjectID)
+	defer unlockProject()
+	unlock := m.lockSessionLifecycle(id)
+	defer unlock()
+
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return fmt.Errorf("retire replacement %s: %w", id, err)
 	}
 	if !ok || rec.IsTerminated {
 		return nil
+	}
+	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		return fmt.Errorf("retire replacement %s: read recovery journal: %w", id, err)
+	}
+	if hasManagedRecoveryRows(rows) {
+		return fmt.Errorf("retire replacement %s: %w", id, ErrRecoveryAdmission)
 	}
 	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
 		if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
@@ -794,6 +889,20 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 // before any durable session write, so a failure never resurrects the row or destroys
 // the worktree (it may hold the agent's prior work).
 func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
+	unlockDiscovery := m.lockSessionLifecycle(id)
+	initial, ok, err := m.store.GetSession(ctx, id)
+	unlockDiscovery()
+	if err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
+	}
+	if !ok {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
+	}
+	unlockProject := m.lockProjectLifecycle(initial.ProjectID)
+	defer unlockProject()
+	unlock := m.lockSessionLifecycle(id)
+	defer unlock()
+
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
@@ -801,32 +910,478 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
 	}
-	if !rec.IsTerminated {
+	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: read recovery journal: %w", id, err)
+	}
+	managedJournal := hasManagedRecoveryRows(rows)
+	if !rec.IsTerminated && !managedJournal {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 	}
 	meta := rec.Metadata
-	// Mirror Kill's incomplete-handle guard: a session whose spawn failed before
-	// the workspace landed has neither WorkspacePath nor Branch, and there is
-	// nothing meaningful to restore from. Surface this as a typed 409 instead of
-	// letting workspace.Restore fail with an opaque wrapped error.
-	if meta.WorkspacePath == "" || meta.Branch == "" {
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrIncompleteHandle)
-	}
 	// Resumability is decided inside restoreArgv, not here. A promptless session
 	// can still be fully resumable when the harness pins a deterministic session id
 	// (Claude Code). restoreArgv returns ErrNotResumable only for a promptless,
 	// unresumable non-orchestrator (a worker with no task and no native id to resume).
 	// Orchestrators always relaunch fresh with the system prompt only.
-
-	project, err := m.loadProject(ctx, rec.ProjectID)
+	project, projectExists, err := m.getExactProject(ctx, rec.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
+	}
+	if !projectExists {
+		if managedJournal {
+			return domain.SessionRecord{}, m.recoveryFailure(rec, "project_not_exact", rows,
+				errors.New("managed recovery project is not registered"))
+		}
+		// Preserve the historical automatic behavior for legacy sessions whose
+		// project registration has disappeared and which have no managed journal.
+		project = domain.ProjectRecord{}
+	}
+	if project.ConfigDecodeError != "" {
+		return domain.SessionRecord{}, m.recoveryFailure(rec, "project_config_invalid", rows,
+			fmt.Errorf("project config cannot be decoded: %s", project.ConfigDecodeError))
+	}
+	if managedJournal {
+		if policy := project.Config.StartupRestorePolicy; policy != "" && policy != domain.StartupRestoreAutomatic && policy != domain.StartupRestorePreserveOnly {
+			return domain.SessionRecord{}, m.recoveryFailure(rec, "project_policy_invalid", rows,
+				fmt.Errorf("unknown startup restore policy %q", policy))
+		}
+		// Durable managed provenance outranks mutable config. This protects a
+		// preserved journal if an older binary or later config edit omits the
+		// policy: it can only cross the strict exact-session boundary.
+		return m.restoreManaged(ctx, rec, project)
+	}
+	switch project.Config.StartupRestorePolicy.WithDefault() {
+	case domain.StartupRestoreAutomatic:
+		// Historical explicit restore behaviour remains unchanged.
+		// Mirror Kill's incomplete-handle guard: a session whose spawn failed
+		// before the workspace landed has neither WorkspacePath nor Branch, and
+		// there is nothing meaningful to restore from.
+		if meta.WorkspacePath == "" || meta.Branch == "" {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrIncompleteHandle)
+		}
+	case domain.StartupRestorePreserveOnly:
+		return m.restoreManaged(ctx, rec, project)
+	default:
+		return domain.SessionRecord{}, m.recoveryFailure(rec, "project_policy_invalid", nil,
+			fmt.Errorf("unknown startup restore policy %q", project.Config.StartupRestorePolicy))
 	}
 	ws, err := m.restoreSessionWorkspace(ctx, project, rec)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: workspace: %w", id, err)
 	}
 	return m.relaunchRestoredSession(ctx, rec, project, ws)
+}
+
+func (m *Manager) lockSessionLifecycle(id domain.SessionID) func() {
+	m.lifecycleMu.Lock()
+	mu := m.lifecycleLocks[id]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		m.lifecycleLocks[id] = mu
+	}
+	m.lifecycleMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (m *Manager) lockProjectLifecycle(id domain.ProjectID) func() {
+	m.projectMu.Lock()
+	mu := m.projectLocks[id]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		m.projectLocks[id] = mu
+	}
+	m.projectMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (m *Manager) spawnConflictsWithManagedRecovery(ctx context.Context, cfg ports.SpawnConfig) (bool, domain.SessionID, error) {
+	recs, err := m.store.ListSessions(ctx, cfg.ProjectID)
+	if err != nil {
+		return false, "", err
+	}
+	for _, rec := range recs {
+		// Orchestrators share one canonical branch/worktree per project. Workers
+		// use session-unique branches; only the same durable issue identity can
+		// represent replacement work that would duplicate an awaiting recovery.
+		if cfg.Kind == domain.KindOrchestrator {
+			if rec.Kind != domain.KindOrchestrator {
+				continue
+			}
+		} else {
+			if cfg.IssueID == "" || rec.Kind != domain.KindWorker || rec.IssueID != cfg.IssueID {
+				continue
+			}
+		}
+		rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+		if err != nil {
+			return false, "", err
+		}
+		if hasManagedRecoveryRows(rows) {
+			return true, rec.ID, nil
+		}
+	}
+	return false, "", nil
+}
+
+type managedRestoreTarget struct {
+	row         domain.SessionWorktreeRecord
+	cfg         ports.WorkspaceConfig
+	disposition ports.WorkspaceRecoveryDisposition
+	info        ports.WorkspaceInfo
+}
+
+type managedRestorePlan struct {
+	agent        ports.Agent
+	agentConfig  ports.AgentConfig
+	systemPrompt string
+	argv         []string
+	targets      []managedRestoreTarget
+}
+
+func (m *Manager) recoveryFailure(rec domain.SessionRecord, code string, rows []domain.SessionWorktreeRecord, err error) error {
+	return m.recoveryFailureAt(rec, "preflight", code, rows, nil, err)
+}
+
+func (m *Manager) recoveryFailureAt(rec domain.SessionRecord, phase, code string, rows []domain.SessionWorktreeRecord, runtimeStopped *bool, err error) error {
+	return &RecoveryFailure{
+		SessionID:            rec.ID,
+		Code:                 code,
+		Phase:                phase,
+		ProjectID:            rec.ProjectID,
+		Kind:                 rec.Kind,
+		ProviderSessionSaved: strings.TrimSpace(rec.Metadata.AgentSessionID) != "",
+		RuntimeStopped:       runtimeStopped,
+		Worktrees:            append([]domain.SessionWorktreeRecord(nil), rows...),
+		Err:                  err,
+	}
+}
+
+// restoreManaged is the sole mutating boundary for preserve_only recovery. It
+// first proves every persisted identity using read-only probes. Only then does
+// it re-attach an absent exact worktree (or use the exact registered one),
+// replay an existing preserve ref, install hooks, and resume the saved provider
+// session. It never constructs a fresh launch command or delivers a prompt.
+func (m *Manager) restoreManaged(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord) (domain.SessionRecord, error) {
+	plan, err := m.preflightManagedRestore(ctx, rec, project)
+	if err != nil {
+		return domain.SessionRecord{}, err
+	}
+	exact, ok := m.workspace.(ports.ExactWorkspaceRestorer)
+	if !ok {
+		return domain.SessionRecord{}, m.recoveryFailure(rec, "exact_workspace_restore_unsupported", rowsFromManagedTargets(plan.targets), nil)
+	}
+	if !rec.IsTerminated {
+		// A managed marker can outlive a failed terminal-row transition. Complete
+		// every read-only identity/runtime/provider/worktree preflight first; only
+		// then make terminalization the first recovery mutation.
+		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+			stopped := true
+			return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "mark_awaiting_recovery_failed", rowsFromManagedTargets(plan.targets), &stopped, err)
+		}
+		rec.IsTerminated = true
+	}
+	partialRows := rowsFromManagedTargets(plan.targets)
+	for i := range partialRows {
+		partialRows[i].State = domain.SessionWorktreeStatePreservedPartial
+	}
+	// Publish permanent managed provenance for the complete target set before
+	// crossing the first filesystem mutation boundary. A later TOCTOU or adapter
+	// failure remains conservatively partial and can never enter bulk restore.
+	if err := m.store.UpsertSessionWorktrees(ctx, partialRows); err != nil {
+		stopped := true // read-only preflight proved the exact saved runtime absent
+		return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "recovery_journal_failed", rowsFromManagedTargets(plan.targets), &stopped, err)
+	}
+	for i := range plan.targets {
+		plan.targets[i].row.State = domain.SessionWorktreeStatePreservedPartial
+	}
+	for i := range plan.targets {
+		info, restoreErr := exact.RestoreExact(ctx, plan.targets[i].cfg, plan.targets[i].disposition, plan.targets[i].row.PreservedRef)
+		if restoreErr != nil {
+			return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "worktree_changed", rowsFromManagedTargets(plan.targets), nil, restoreErr)
+		}
+		plan.targets[i].info = info
+		// The complete target set was already journaled partial before the first
+		// materialization. Keep its ref until runtime and final durable transition.
+		row := plan.targets[i].row
+		row.WorktreePath = info.Path
+		row.Branch = info.Branch
+		plan.targets[i].row = row
+		if row.PreservedRef != "" {
+			if applyErr := exact.ApplyPreservedExact(ctx, info, row.PreservedRef); applyErr != nil {
+				return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "preserved_apply_failed", rowsFromManagedTargets(plan.targets), nil, applyErr)
+			}
+		}
+	}
+	root := managedRootTarget(plan.targets)
+	if root.info.Path == "" {
+		return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "root_worktree_missing", rowsFromManagedTargets(plan.targets), nil, nil)
+	}
+	if err := m.prepareWorkspace(ctx, plan.agent, rec.ID, root.info.Path, plan.systemPrompt, plan.agentConfig); err != nil {
+		return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "workspace_prepare_failed", rowsFromManagedTargets(plan.targets), nil, err)
+	}
+	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
+		SessionID:     rec.ID,
+		WorkspacePath: root.info.Path,
+		Argv:          plan.argv,
+		Env:           m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env),
+	})
+	if err != nil {
+		return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "runtime_create_failed", rowsFromManagedTargets(plan.targets), nil, err)
+	}
+	metadata := rec.Metadata
+	metadata.Branch = root.info.Branch
+	metadata.WorkspacePath = root.info.Path
+	metadata.RuntimeHandleID = handle.ID
+	if err := m.lcm.MarkSpawned(ctx, rec.ID, metadata); err != nil {
+		stopped, cleanupErr := m.rollbackManagedRuntime(ctx, rec.ID, handle)
+		if cleanupErr != nil {
+			return domain.SessionRecord{}, m.recoveryFailureAt(rec, "rollback", "rollback_failed", rowsFromManagedTargets(plan.targets), &stopped, errors.Join(err, cleanupErr))
+		}
+		return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "mark_spawned_failed", rowsFromManagedTargets(plan.targets), &stopped, err)
+	}
+	var journalErr error
+	if project.Kind.WithDefault() == domain.ProjectKindWorkspace {
+		activeRows := rowsFromManagedTargets(plan.targets)
+		for i := range activeRows {
+			activeRows[i].State = "active"
+			activeRows[i].PreservedRef = ""
+		}
+		if err := m.store.UpsertSessionWorktrees(ctx, activeRows); err != nil {
+			journalErr = err
+		}
+	} else if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
+		journalErr = err
+	}
+	if journalErr != nil {
+		// A running process without a consumed recovery journal is not a
+		// successful restore. Stop only the exact handle created above and return
+		// the session to terminal inventory; never erase partial worktree/ref
+		// evidence to make the transition appear complete.
+		stopped, cleanupErr := m.rollbackManagedRuntime(ctx, rec.ID, handle)
+		if cleanupErr != nil {
+			return domain.SessionRecord{}, m.recoveryFailureAt(rec, "rollback", "rollback_failed", rowsFromManagedTargets(plan.targets), &stopped, errors.Join(journalErr, cleanupErr))
+		}
+		return domain.SessionRecord{}, m.recoveryFailureAt(rec, "recovery", "recovery_journal_failed", rowsFromManagedTargets(plan.targets), &stopped, journalErr)
+	}
+	// Retain preserve refs after success. They are immutable evidence and a
+	// later save for the same session updates the exact ref deliberately. An
+	// unconditional post-commit delete could erase a ref moved by another writer.
+	return m.getRecord(ctx, rec.ID)
+}
+
+const managedRollbackTimeout = 10 * time.Second
+
+func (m *Manager) rollbackManagedRuntime(ctx context.Context, id domain.SessionID, handle ports.RuntimeHandle) (bool, error) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), managedRollbackTimeout)
+	defer cancel()
+	if err := m.runtime.Destroy(cleanupCtx, handle); err != nil {
+		return false, fmt.Errorf("destroy incomplete restored runtime: %w", err)
+	}
+	if err := m.lcm.MarkTerminated(cleanupCtx, id); err != nil {
+		return true, fmt.Errorf("mark incomplete restore terminal: %w", err)
+	}
+	return true, nil
+}
+
+func (m *Manager) preflightManagedRestore(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord) (managedRestorePlan, error) {
+	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "recovery_journal_read_failed", nil, err)
+	}
+	if project.ID == "" || project.ID != string(rec.ProjectID) || !project.ArchivedAt.IsZero() || strings.TrimSpace(project.Path) == "" {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "project_not_exact", rows, nil)
+	}
+	switch project.Kind.WithDefault() {
+	case domain.ProjectKindSingleRepo, domain.ProjectKindWorkspace:
+	default:
+		return managedRestorePlan{}, m.recoveryFailure(rec, "project_kind_invalid", rows,
+			fmt.Errorf("unknown project kind %q", project.Kind))
+	}
+	if rec.Kind != domain.KindWorker && rec.Kind != domain.KindOrchestrator {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "role_invalid", rows, fmt.Errorf("unknown session kind %q", rec.Kind))
+	}
+	if len(rows) == 0 {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "recovery_journal_missing", rows, nil)
+	}
+	for _, row := range rows {
+		if row.State != domain.SessionWorktreeStatePreserved && row.State != domain.SessionWorktreeStatePreservedRemoved {
+			return managedRestorePlan{}, m.recoveryFailure(rec, "recovery_journal_partial", rows,
+				fmt.Errorf("repo %q has state %q", row.RepoName, row.State))
+		}
+		if row.Branch == "" || row.WorktreePath == "" {
+			return managedRestorePlan{}, m.recoveryFailure(rec, "worktree_identity_missing", rows,
+				fmt.Errorf("repo %q lacks branch or path", row.RepoName))
+		}
+	}
+	var rootRow *domain.SessionWorktreeRecord
+	for i := range rows {
+		if rows[i].RepoName == domain.RootWorkspaceRepoName {
+			rootRow = &rows[i]
+			break
+		}
+	}
+	if rootRow == nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "worktree_identity_missing", rows,
+			errors.New("root recovery row is missing"))
+	}
+	if rec.Metadata.Branch == "" || rec.Metadata.WorkspacePath == "" {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "worktree_identity_missing", rows,
+			errors.New("session root branch or path is missing"))
+	}
+	if rootRow.Branch != rec.Metadata.Branch || rootRow.WorktreePath != rec.Metadata.WorkspacePath {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "worktree_identity_mismatch", rows,
+			fmt.Errorf("session root %q at %q does not match journal root %q at %q",
+				rec.Metadata.Branch, rec.Metadata.WorkspacePath, rootRow.Branch, rootRow.WorktreePath))
+	}
+	if strings.TrimSpace(rec.Metadata.RuntimeHandleID) == "" {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "runtime_handle_missing", rows, nil)
+	}
+	alive, probeErr := m.runtime.IsAlive(ctx, runtimeHandle(rec.Metadata))
+	if probeErr != nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "runtime_probe_failed", rows, probeErr)
+	}
+	if alive {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "runtime_still_alive", rows, nil)
+	}
+	if strings.TrimSpace(rec.Metadata.AgentSessionID) == "" {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "provider_session_missing", rows, nil)
+	}
+	launchRoute := rec.Metadata.LaunchRoute
+	if launchRoute == nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "launch_route_missing", rows, nil)
+	}
+	if launchRoute.Harness != rec.Harness || !launchRoute.Harness.IsKnown() {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "launch_route_mismatch", rows,
+			fmt.Errorf("persisted harness %q does not match session harness %q", launchRoute.Harness, rec.Harness))
+	}
+	if requested := rec.Metadata.RequestedRoute; requested != nil {
+		if err := requested.Validate(); err != nil {
+			return managedRestorePlan{}, m.recoveryFailure(rec, "requested_route_invalid", rows, err)
+		}
+	}
+	agent, ok := m.agents.Agent(rec.Harness)
+	if !ok {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "agent_unavailable", rows, fmt.Errorf("no adapter for harness %q", rec.Harness))
+	}
+	agentConfig := effectiveAgentConfig(rec.Kind, project.Config, rec.Harness, nil)
+	agentConfig.Model = launchRoute.Model
+	agentConfig.ReasoningEffort = launchRoute.ReasoningEffort
+	if validator, ok := agent.(ports.AgentConfigValidator); ok {
+		if err := validator.ValidateAgentConfig(ctx, agentConfig); err != nil {
+			return managedRestorePlan{}, m.recoveryFailure(rec, "launch_route_incompatible", rows, err)
+		}
+	} else if agentConfig.Profile != "" || agentConfig.ReasoningEffort != "" {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "launch_route_incompatible", rows,
+			fmt.Errorf("harness %q cannot validate persisted profile/reasoning route", rec.Harness))
+	}
+	if err := m.validateRuntimePrerequisites(); err != nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "runtime_prerequisite_missing", rows, err)
+	}
+	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID)
+	if err != nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "system_prompt_unavailable", rows, err)
+	}
+	exact, ok := m.workspace.(ports.ExactWorkspaceRestorer)
+	if !ok {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "exact_workspace_restore_unsupported", rows, nil)
+	}
+	targets, err := m.managedRestoreTargets(ctx, project, rec, rows)
+	if err != nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "worktree_identity_mismatch", rows, err)
+	}
+	for _, target := range targets {
+		if err := exact.PreflightExactRestore(ctx, target.cfg, target.disposition, target.row.PreservedRef); err != nil {
+			return managedRestorePlan{}, m.recoveryFailure(rec, "worktree_preflight_failed", rows, err)
+		}
+	}
+	root := managedRootTarget(targets)
+	if root.cfg.Path == "" {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "root_worktree_missing", rows, nil)
+	}
+	ref := ports.SessionRef{ID: string(rec.ID), WorkspacePath: root.cfg.Path, Metadata: map[string]string{ports.MetadataKeyAgentSessionID: rec.Metadata.AgentSessionID}}
+	argv, resumable, err := agent.GetRestoreCommand(ctx, ports.RestoreConfig{Session: ref, Kind: rec.Kind, SystemPrompt: systemPrompt, Config: agentConfig, Permissions: agentConfig.Permissions})
+	if err != nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "provider_restore_command_failed", rows, err)
+	}
+	if !resumable {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "provider_session_incompatible", rows, nil)
+	}
+	if err := m.validateAgentBinary(argv); err != nil {
+		return managedRestorePlan{}, m.recoveryFailure(rec, "agent_binary_unavailable", rows, err)
+	}
+	return managedRestorePlan{agent: agent, agentConfig: agentConfig, systemPrompt: systemPrompt, argv: argv, targets: targets}, nil
+}
+
+func (m *Manager) managedRestoreTargets(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord, rows []domain.SessionWorktreeRecord) ([]managedRestoreTarget, error) {
+	if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+		if len(rows) != 1 || rows[0].RepoName != domain.RootWorkspaceRepoName {
+			return nil, fmt.Errorf("single-repo recovery requires one root row")
+		}
+		return []managedRestoreTarget{{row: rows[0], disposition: recoveryDisposition(rows[0]), cfg: ports.WorkspaceConfig{
+			ProjectID: rec.ProjectID, SessionID: rec.ID, Kind: rec.Kind, SessionPrefix: sessionPrefix(project),
+			Branch: rows[0].Branch, BaseSHA: rows[0].BaseSHA, RepoPath: project.Path, Path: rows[0].WorktreePath,
+		}}}, nil
+	}
+	infos, err := m.sessionWorktreeRowsToRepoInfos(ctx, project, rec, rows)
+	if err != nil {
+		return nil, err
+	}
+	repos, err := m.store.ListWorkspaceRepos(ctx, project.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) != len(repos)+1 {
+		return nil, fmt.Errorf("workspace recovery journal has %d rows, want exact root plus %d registered child repos", len(rows), len(repos))
+	}
+	targets := make([]managedRestoreTarget, 0, len(rows))
+	for _, info := range infos {
+		var row domain.SessionWorktreeRecord
+		found := false
+		for _, candidate := range rows {
+			if candidate.RepoName == info.RepoName {
+				row, found = candidate, true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("workspace repo %q has no recovery row", info.RepoName)
+		}
+		targets = append(targets, managedRestoreTarget{row: row, disposition: recoveryDisposition(row), cfg: ports.WorkspaceConfig{
+			ProjectID: rec.ProjectID, SessionID: rec.ID, Branch: row.Branch, BaseSHA: row.BaseSHA,
+			RepoPath: info.RepoPath, Path: row.WorktreePath,
+		}})
+	}
+	if managedRootTarget(targets).row.RepoName != domain.RootWorkspaceRepoName {
+		return nil, errors.New("workspace root recovery row missing")
+	}
+	return targets, nil
+}
+
+func recoveryDisposition(row domain.SessionWorktreeRecord) ports.WorkspaceRecoveryDisposition {
+	if row.State == domain.SessionWorktreeStatePreservedRemoved {
+		return ports.WorkspaceRecoveryRemoved
+	}
+	return ports.WorkspaceRecoveryInPlace
+}
+
+func managedRootTarget(targets []managedRestoreTarget) managedRestoreTarget {
+	for _, target := range targets {
+		if target.row.RepoName == domain.RootWorkspaceRepoName {
+			return target
+		}
+	}
+	return managedRestoreTarget{}
+}
+
+func rowsFromManagedTargets(targets []managedRestoreTarget) []domain.SessionWorktreeRecord {
+	rows := make([]domain.SessionWorktreeRecord, 0, len(targets))
+	for _, target := range targets {
+		rows = append(rows, target.row)
+	}
+	return rows
 }
 
 func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord, ws ports.WorkspaceInfo) (domain.SessionRecord, error) {
@@ -1033,6 +1588,141 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 	return nil
 }
 
+// reconcileManagedLive quarantines an absent runtime using storage facts only.
+// It deliberately performs no Workspace mutation. A read-only exact adapter
+// probe may attest path/branch/ref disposition; dirty files, index, branch, and
+// any existing preserve ref remain untouched.
+func (m *Manager) reconcileManagedLive(ctx context.Context, rec domain.SessionRecord) error {
+	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		return fmt.Errorf("reconcile %s: list worktree journal: %w", rec.ID, err)
+	}
+	if strings.TrimSpace(rec.Metadata.WorkspacePath) == "" || strings.TrimSpace(rec.Metadata.Branch) == "" {
+		return m.journalManagedAmbiguity(ctx, rec, rows, "saved workspace path or branch is missing")
+	}
+	handle := runtimeHandle(rec.Metadata)
+	if handle.ID == "" {
+		return m.journalManagedAmbiguity(ctx, rec, rows, "saved runtime handle is missing")
+	}
+	alive, err := m.runtime.IsAlive(ctx, handle)
+	if err != nil {
+		return m.journalManagedAmbiguity(ctx, rec, rows, fmt.Sprintf("runtime probe failed: %v", err))
+	}
+	if alive {
+		if hasManagedRecoveryRows(rows) {
+			return fmt.Errorf("reconcile %s: managed recovery runtime is still alive", rec.ID)
+		}
+		return nil // adopt an ordinary exact surviving runtime; no restore occurred.
+	}
+	if len(rows) == 0 {
+		rows = []domain.SessionWorktreeRecord{{
+			SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName,
+			Branch: rec.Metadata.Branch, WorktreePath: rec.Metadata.WorkspacePath,
+		}}
+	}
+	rows = m.proveManagedJournalDispositions(ctx, rec, rows)
+	for i := range rows {
+		row := rows[i]
+		switch row.State {
+		case domain.SessionWorktreeStatePreserved, domain.SessionWorktreeStatePreservedRemoved, domain.SessionWorktreeStatePreservedPartial:
+			// Already journaled with an exact physical disposition.
+		default:
+			// Legacy/synthetic states do not prove their physical disposition:
+			// a row may have been written before a failed worktree removal. Retain
+			// permanent managed provenance without claiming path presence/absence.
+			row.State = domain.SessionWorktreeStatePreservedPartial
+		}
+		rows[i] = row
+	}
+	if err := m.store.UpsertSessionWorktrees(ctx, rows); err != nil {
+		// Do not claim a durable awaiting-recovery transition unless every
+		// worktree identity was journaled. A later reconcile may retry; no
+		// workspace or runtime mutation has occurred.
+		return fmt.Errorf("reconcile %s: journal exact worktrees: %w", rec.ID, err)
+	}
+	if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+		return fmt.Errorf("reconcile %s: mark awaiting recovery: %w", rec.ID, err)
+	}
+	return nil
+}
+
+func (m *Manager) proveManagedJournalDispositions(ctx context.Context, rec domain.SessionRecord, rows []domain.SessionWorktreeRecord) []domain.SessionWorktreeRecord {
+	project, ok, err := m.getExactProject(ctx, rec.ProjectID)
+	if err != nil || !ok {
+		return rows
+	}
+	targets, err := m.managedRestoreTargets(ctx, project, rec, rows)
+	if err != nil {
+		return rows
+	}
+	exact, ok := m.workspace.(ports.ExactWorkspaceRestorer)
+	if !ok {
+		return rows
+	}
+	for i := range targets {
+		target := targets[i]
+		var disposition ports.WorkspaceRecoveryDisposition
+		switch target.row.State {
+		case "removed":
+			disposition = ports.WorkspaceRecoveryRemoved
+		case "", "active":
+			disposition = ports.WorkspaceRecoveryInPlace
+		default:
+			continue
+		}
+		if err := exact.PreflightExactRestore(ctx, target.cfg, disposition, target.row.PreservedRef); err != nil {
+			continue
+		}
+		for j := range rows {
+			if rows[j].RepoName != target.row.RepoName {
+				continue
+			}
+			if disposition == ports.WorkspaceRecoveryRemoved {
+				rows[j].State = domain.SessionWorktreeStatePreservedRemoved
+			} else {
+				rows[j].State = domain.SessionWorktreeStatePreserved
+			}
+			break
+		}
+	}
+	return rows
+}
+
+func (m *Manager) journalManagedAmbiguity(ctx context.Context, rec domain.SessionRecord, rows []domain.SessionWorktreeRecord, reason string) error {
+	if len(rows) == 0 {
+		rows = []domain.SessionWorktreeRecord{{
+			SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName,
+			Branch: rec.Metadata.Branch, WorktreePath: rec.Metadata.WorkspacePath,
+		}}
+	}
+	for i := range rows {
+		rows[i].State = domain.SessionWorktreeStatePreservedPartial
+	}
+	if err := m.store.UpsertSessionWorktrees(ctx, rows); err != nil {
+		return fmt.Errorf("reconcile %s: journal ambiguity: %w", rec.ID, err)
+	}
+	return fmt.Errorf("reconcile %s: %s; recovery journal marked partial", rec.ID, reason)
+}
+
+// requireManagedRuntimeAbsent is a read-only proof used before publishing a
+// legacy restore marker as managed recovery evidence. Preserve-only startup is
+// never permission to kill a saved runtime: alive, unknown, and incomplete
+// handles all remain quarantined as partial evidence.
+func (m *Manager) requireManagedRuntimeAbsent(ctx context.Context, rec domain.SessionRecord) error {
+	handle := runtimeHandle(rec.Metadata)
+	if strings.TrimSpace(handle.ID) == "" {
+		return errors.New("saved runtime handle is missing")
+	}
+	alive, err := m.runtime.IsAlive(ctx, handle)
+	if err != nil {
+		return fmt.Errorf("runtime probe failed: %w", err)
+	}
+	if alive {
+		return errors.New("saved runtime is still alive")
+	}
+	return nil
+}
+
 // reconcileReap kills the leaked tmux session of a session the DB already marks
 // terminated. This covers the teardown that marked the row terminated but failed
 // to kill the runtime (e.g. ForceDestroy/Destroy errored after MarkTerminated).
@@ -1066,30 +1756,145 @@ func (m *Manager) reconcileReap(ctx context.Context, rec domain.SessionRecord) e
 //     collide with a leaked tmux of the same name.
 //  3. Restore pass: relaunch shutdown-saved sessions (existing RestoreAll).
 //
-// Best-effort throughout: a per-session failure is logged and never aborts the
-// pass or blocks boot.
+// Automatic-policy per-session failures retain the historical best-effort
+// behavior. Managed-policy or unknown-policy failures are accumulated and
+// returned after the full pass so daemon mutation lanes stay behind the boot
+// barrier while recovery truth is incomplete.
 func (m *Manager) Reconcile(ctx context.Context) error {
 	recs, err := m.store.ListAllSessions(ctx)
 	if err != nil {
 		return fmt.Errorf("reconcile: list sessions: %w", err)
 	}
+	var managedErrs []error
 	for _, rec := range recs {
 		if rec.IsTerminated {
 			continue
 		}
-		if err := m.reconcileLive(ctx, rec); err != nil {
-			m.logger.Error("reconcile: live pass failed, skipping", "sessionID", rec.ID, "error", err)
+		managed, journalErr := m.hasManagedRecoveryJournal(ctx, rec.ID)
+		if journalErr != nil {
+			m.logger.Error("reconcile: recovery journal read failed; leaving session unchanged", "sessionID", rec.ID, "error", journalErr)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s recovery journal: %w", rec.ID, journalErr))
+			continue
+		}
+		if managed {
+			if err := m.reconcileManagedLive(ctx, rec); err != nil {
+				m.logger.Error("reconcile: managed live pass failed, skipping", "sessionID", rec.ID, "error", err)
+				managedErrs = append(managedErrs, err)
+			}
+			continue
+		}
+		project, ok, projectErr := m.getExactProject(ctx, rec.ProjectID)
+		if projectErr != nil {
+			m.logger.Error("reconcile: project read failed; leaving session unchanged", "sessionID", rec.ID, "error", projectErr)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s project read: %w", rec.ID, projectErr))
+			continue
+		}
+		if ok && project.ConfigDecodeError != "" {
+			m.logger.Error("reconcile: project config unavailable; leaving session unchanged", "sessionID", rec.ID, "projectID", rec.ProjectID)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s project config invalid: %s", rec.ID, project.ConfigDecodeError))
+			continue
+		}
+		// A missing legacy project row has always resolved to zero config and
+		// therefore automatic recovery. Preserve that compatibility. Only a
+		// present, explicitly preserve_only project enters managed quarantine.
+		policy := domain.StartupRestoreAutomatic
+		if ok {
+			policy = project.Config.StartupRestorePolicy.WithDefault()
+		}
+		var liveErr error
+		switch policy {
+		case domain.StartupRestoreAutomatic:
+			liveErr = m.reconcileLive(ctx, rec)
+		case domain.StartupRestorePreserveOnly:
+			liveErr = m.reconcileManagedLive(ctx, rec)
+		default:
+			liveErr = fmt.Errorf("unknown startup restore policy %q", policy)
+		}
+		if liveErr != nil {
+			m.logger.Error("reconcile: live pass failed, skipping", "sessionID", rec.ID, "error", liveErr)
+			if policy != domain.StartupRestoreAutomatic {
+				managedErrs = append(managedErrs, liveErr)
+			}
 		}
 	}
 	for _, rec := range recs {
 		if !rec.IsTerminated {
 			continue
 		}
+		rows, journalErr := m.store.ListSessionWorktrees(ctx, rec.ID)
+		if journalErr != nil {
+			managedErrs = append(managedErrs, fmt.Errorf("session %s recovery journal: %w", rec.ID, journalErr))
+			continue
+		}
+		if hasManagedRecoveryRows(rows) {
+			// Durable managed provenance is not permission to reap a process.
+			// Explicit restore re-probes absence under the per-session lock.
+			continue
+		}
+		project, ok, projectErr := m.getExactProject(ctx, rec.ProjectID)
+		if projectErr != nil || (ok && project.ConfigDecodeError != "") {
+			if projectErr != nil {
+				managedErrs = append(managedErrs, fmt.Errorf("session %s project read: %w", rec.ID, projectErr))
+			} else {
+				managedErrs = append(managedErrs, fmt.Errorf("session %s project config invalid: %s", rec.ID, project.ConfigDecodeError))
+			}
+			continue
+		}
+		policy := domain.StartupRestoreAutomatic
+		if ok {
+			policy = project.Config.StartupRestorePolicy.WithDefault()
+		}
+		switch policy {
+		case domain.StartupRestoreAutomatic:
+			// Retain the historical cleanup of a leaked exact runtime handle.
+		case domain.StartupRestorePreserveOnly:
+			if len(rows) != 0 {
+				// Legacy restore markers are recovery evidence but do not yet prove
+				// runtime absence or physical worktree disposition. RestoreAll performs
+				// that read-only attestation and publishes managed provenance. Never
+				// reap the runtime or mutate the workspace on this startup path.
+				continue
+			}
+			// A bare terminal row has no recovery journal and represents an
+			// already-disposed session. Preserve historical leaked-runtime cleanup.
+		default:
+			m.logger.Error("reconcile: unknown startup restore policy; leaving terminal session unchanged", "sessionID", rec.ID, "policy", policy)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s unknown startup restore policy %q", rec.ID, policy))
+			continue
+		}
 		if err := m.reconcileReap(ctx, rec); err != nil {
 			m.logger.Error("reconcile: reap pass failed, skipping", "sessionID", rec.ID, "error", err)
 		}
 	}
-	return m.RestoreAll(ctx)
+	if err := m.RestoreAll(ctx); err != nil {
+		managedErrs = append(managedErrs, err)
+	}
+	return errors.Join(managedErrs...)
+}
+
+func (m *Manager) getExactProject(ctx context.Context, id domain.ProjectID) (domain.ProjectRecord, bool, error) {
+	project, ok, err := m.store.GetProject(ctx, string(id))
+	if err != nil {
+		return domain.ProjectRecord{}, false, fmt.Errorf("load project: %w", err)
+	}
+	return project, ok, nil
+}
+
+func (m *Manager) hasManagedRecoveryJournal(ctx context.Context, id domain.SessionID) (bool, error) {
+	rows, err := m.store.ListSessionWorktrees(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	return hasManagedRecoveryRows(rows), nil
+}
+
+func hasManagedRecoveryRows(rows []domain.SessionWorktreeRecord) bool {
+	for _, row := range rows {
+		if row.State == domain.SessionWorktreeStatePreserved || row.State == domain.SessionWorktreeStatePreservedRemoved || row.State == domain.SessionWorktreeStatePreservedPartial {
+			return true
+		}
+	}
+	return false
 }
 
 // RestoreAll relaunches every terminated session that was saved by the last
@@ -1109,6 +1914,7 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("restore-all: list sessions: %w", err)
 	}
+	var managedErrs []error
 	for _, rec := range recs {
 		if !rec.IsTerminated {
 			continue
@@ -1117,24 +1923,76 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 		rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
 		if err != nil {
 			m.logger.Error("restore-all: list worktrees failed", "sessionID", rec.ID, "error", err)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s recovery journal: %w", rec.ID, err))
 			continue
 		}
 		if len(rows) == 0 {
 			// No marker: this session was killed by the user before shutdown.
 			continue
 		}
-		rows = restorableWorktreeRows(rows)
-		if len(rows) == 0 {
+		if hasManagedRecoveryRows(rows) {
+			// Managed provenance is permanent until strict explicit restore or an
+			// explicit kill consumes it. Mutable/legacy project config can never
+			// authorize bulk replay.
 			continue
 		}
 
-		// Step 1: ensure the worktree exists. workspace.Restore re-creates it
-		// if it was removed by SaveAndTeardownAll.
-		project, err := m.loadProject(ctx, rec.ProjectID)
+		// Resolve policy before filtering row states: preserve_only journals the
+		// complete exact multi-repo set atomically, including ambiguity evidence.
+		project, _, err := m.getExactProject(ctx, rec.ProjectID)
 		if err != nil {
 			m.logger.Error("restore-all: load project failed", "sessionID", rec.ID, "error", err)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s project: %w", rec.ID, err))
 			continue
 		}
+		if project.ConfigDecodeError != "" {
+			m.logger.Error("restore-all: project config invalid; leaving recovery marker untouched", "sessionID", rec.ID)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s project config invalid: %s", rec.ID, project.ConfigDecodeError))
+			continue
+		}
+		switch project.Config.StartupRestorePolicy.WithDefault() {
+		case domain.StartupRestorePreserveOnly:
+			if !hasLegacyRecoveryRows(rows) {
+				// Workspace projects retain active rows as ordinary inventory after an
+				// intentional session end. Those rows are not a shutdown/recovery marker
+				// and must never resurrect the session as awaiting recovery.
+				continue
+			}
+			// Never bulk-restore a managed project. Convert legacy/automatic
+			// markers to the rollback-safe preserved journal using only read-only
+			// workspace proof; provider, runtime, messenger, and Git state stay untouched.
+			if runtimeErr := m.requireManagedRuntimeAbsent(ctx, rec); runtimeErr != nil {
+				managedErrs = append(managedErrs, m.journalManagedAmbiguity(ctx, rec, rows, runtimeErr.Error()))
+				continue
+			}
+			converted := m.proveManagedJournalDispositions(ctx, rec, append([]domain.SessionWorktreeRecord(nil), rows...))
+			for i := range converted {
+				switch converted[i].State {
+				case domain.SessionWorktreeStatePreserved, domain.SessionWorktreeStatePreservedRemoved, domain.SessionWorktreeStatePreservedPartial:
+					// Already carries permanent managed provenance.
+				default:
+					// Legacy rows were written before the corresponding filesystem
+					// operation completed, so their state cannot prove presence/absence.
+					converted[i].State = domain.SessionWorktreeStatePreservedPartial
+				}
+			}
+			if err := m.store.UpsertSessionWorktrees(ctx, converted); err != nil {
+				m.logger.Error("restore-all: atomic preserve marker conversion failed", "sessionID", rec.ID, "error", err)
+				managedErrs = append(managedErrs, fmt.Errorf("session %s preserve conversion: %w", rec.ID, err))
+			}
+			continue
+		case domain.StartupRestoreAutomatic:
+			rows = restorableWorktreeRows(rows)
+			if len(rows) == 0 {
+				continue
+			}
+		default:
+			m.logger.Error("restore-all: unknown startup restore policy; leaving marker untouched", "sessionID", rec.ID, "policy", project.Config.StartupRestorePolicy)
+			managedErrs = append(managedErrs, fmt.Errorf("session %s unknown startup restore policy %q", rec.ID, project.Config.StartupRestorePolicy))
+			continue
+		}
+		// Step 1: ensure the worktree exists. workspace.Restore re-creates it
+		// if it was removed by SaveAndTeardownAll.
 		var ws ports.WorkspaceInfo
 		restoredWorkspaceProject := project.Kind.WithDefault() == domain.ProjectKindWorkspace
 		var projectRows []ports.WorkspaceRepoInfo
@@ -1224,7 +2082,7 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	return errors.Join(managedErrs...)
 }
 
 func restorableWorktreeRows(rows []domain.SessionWorktreeRecord) []domain.SessionWorktreeRecord {
@@ -1235,6 +2093,22 @@ func restorableWorktreeRows(rows []domain.SessionWorktreeRecord) []domain.Sessio
 		}
 	}
 	return out
+}
+
+func hasLegacyRecoveryRows(rows []domain.SessionWorktreeRecord) bool {
+	if len(restorableWorktreeRows(rows)) != 0 {
+		return true
+	}
+	for _, row := range rows {
+		switch row.State {
+		case "retry_remove", "unavailable", "stray_moved":
+			// These states record an incomplete historical workspace transition.
+			// Preserve-only cannot safely infer a disposition, but it must retain
+			// permanent managed provenance rather than forget the ambiguity.
+			return true
+		}
+	}
+	return false
 }
 
 func legacyRestorableWorktreeRow(row domain.SessionWorktreeRecord) bool {
@@ -1518,6 +2392,15 @@ func (m *Manager) applyWorkspaceProjectPreserved(ctx context.Context, rows []por
 // the session is active or the budget is exhausted. Confirmation never fails
 // the send: it only decides whether to nudge again.
 func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string) error {
+	unlock := m.lockSessionLifecycle(id)
+	defer unlock()
+	rows, err := m.store.ListSessionWorktrees(ctx, id)
+	if err != nil {
+		return fmt.Errorf("send %s: read recovery journal: %w", id, err)
+	}
+	if hasManagedRecoveryRows(rows) {
+		return fmt.Errorf("send %s: %w", id, ErrRecoveryAdmission)
+	}
 	outcome, err := m.messenger.Deliver(ctx, id, message)
 	if err != nil {
 		return fmt.Errorf("send %s: %w", id, err)
@@ -1694,19 +2577,47 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 		if !rec.IsTerminated {
 			continue
 		}
+		unlock := m.lockSessionLifecycle(rec.ID)
+		fresh, ok, freshErr := m.store.GetSession(ctx, rec.ID)
+		if freshErr != nil {
+			unlock()
+			m.logger.Warn("cleanup: session re-read failed", "sessionID", rec.ID, "error", freshErr)
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
+			continue
+		}
+		if !ok || !fresh.IsTerminated {
+			unlock()
+			continue
+		}
+		rec = fresh
+		rows, rowErr := m.store.ListSessionWorktrees(ctx, rec.ID)
+		if rowErr != nil {
+			unlock()
+			m.logger.Warn("cleanup: recovery journal read failed", "sessionID", rec.ID, "error", rowErr)
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
+			continue
+		}
+		if hasManagedRecoveryRows(rows) {
+			unlock()
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "session is awaiting explicit recovery"})
+			continue
+		}
 		ws := workspaceInfo(rec)
 		if ws.Path == "" {
+			unlock()
 			continue
 		}
 		if h := runtimeHandle(rec.Metadata); h.ID != "" {
 			_ = m.runtime.Destroy(ctx, h) // best effort; usually already gone
 		}
 		if rows, ok, rowErr := m.workspaceProjectRows(ctx, rec); rowErr != nil {
+			unlock()
 			m.logger.Warn("cleanup: workspace rows failed", "sessionID", rec.ID, "error", rowErr)
 			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
 			continue
 		} else if ok {
 			if _, err := m.destroyWorkspaceProjectRows(ctx, rows); err != nil {
+				unlock()
 				if !errors.Is(err, ports.ErrWorkspaceDirty) {
 					m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
 				}
@@ -1714,6 +2625,7 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 				continue
 			}
 		} else if err := m.workspace.Destroy(ctx, ws); err != nil {
+			unlock()
 			if !errors.Is(err, ports.ErrWorkspaceDirty) {
 				// The public reason stays a fixed string (the raw error carries
 				// internal filesystem paths); the full cause lands here.
@@ -1722,6 +2634,7 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: cleanupSkipReason(err)})
 			continue
 		}
+		unlock()
 		result.Cleaned = append(result.Cleaned, rec.ID)
 	}
 	return result, nil
@@ -1873,6 +2786,13 @@ func (m *Manager) activeOrchestratorSessionID(ctx context.Context, project domai
 	}
 	for _, rec := range recs {
 		if rec.Kind == domain.KindOrchestrator && !rec.IsTerminated {
+			rows, rowErr := m.store.ListSessionWorktrees(ctx, rec.ID)
+			if rowErr != nil {
+				return "", false, fmt.Errorf("list orchestrator recovery journal %s: %w", rec.ID, rowErr)
+			}
+			if hasManagedRecoveryRows(rows) {
+				continue
+			}
 			return rec.ID, true, nil
 		}
 	}
