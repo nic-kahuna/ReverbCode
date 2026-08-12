@@ -11,6 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/util"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -30,6 +36,8 @@ const (
 	intakePromptTruncationNotice = "\n\n[Issue content truncated to fit the session prompt limit. Open the linked issue for the full details.]\n"
 	intakePromptFooter           = "\nImplement the requested change in this repository, run the relevant checks, and open or update a pull request when ready."
 )
+
+var dispatchRouteMarkdownParser = goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser()
 
 // Store is the durable read surface the observer needs.
 type Store interface {
@@ -230,23 +238,94 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 // present block is strict and complete so native intake cannot silently fill a
 // missing route field from mutable defaults.
 func ParseDispatchRoute(body string) (*domain.AgentRoute, error) {
-	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	normalized := strings.ReplaceAll(body, "\r\n", "\n")
+	source := []byte(normalized)
+	lines := strings.Split(normalized, "\n")
+	// Let Goldmark own CommonMark block classification. Only top-level
+	// paragraphs and headings can declare an intake route; code examples and
+	// nested quote/list content are ignored structurally.
+	document := dispatchRouteMarkdownParser.Parse(text.NewReader(source))
 	header := -1
-	for i, line := range lines {
-		if strings.TrimSpace(line) != "Dispatch route" {
-			continue
+	inspectHeaderLine := func(lineIndex int, allowPlain, allowATX bool) (bool, error) {
+		if lineIndex < 0 || lineIndex >= len(lines) {
+			return false, fmt.Errorf("invalid Dispatch route Markdown source position")
+		}
+		line := lines[lineIndex]
+		matches, err := matchDispatchRouteHeader(line)
+		if err != nil {
+			return false, err
+		}
+		if !matches {
+			return false, nil
+		}
+		isATX := strings.HasPrefix(strings.TrimSpace(line), "#")
+		if isATX && !allowATX {
+			return false, fmt.Errorf("invalid Dispatch route heading %q: malformed ATX syntax", strings.TrimSpace(line))
+		}
+		if !isATX && !allowPlain {
+			return false, fmt.Errorf("invalid Dispatch route heading %q: only plain and ATX headers are supported", strings.TrimSpace(line))
 		}
 		if header >= 0 {
-			return nil, fmt.Errorf("multiple Dispatch route blocks")
+			return false, fmt.Errorf("multiple Dispatch route blocks")
 		}
-		header = i
+		header = lineIndex
+		return true, nil
+	}
+
+	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
+		switch node := node.(type) {
+		case *ast.Paragraph:
+			rawAccepted := false
+			for i := 0; i < node.Lines().Len(); i++ {
+				lineIndex := markdownSourceLineIndex(normalized, node.Lines().At(i).Start)
+				accepted, err := inspectHeaderLine(lineIndex, node.Lines().Len() == 1, false)
+				if err != nil {
+					return nil, err
+				}
+				rawAccepted = rawAccepted || accepted
+			}
+			if err := rejectVisiblyMalformedDispatchRoute(node, source, rawAccepted); err != nil {
+				return nil, err
+			}
+		case *ast.Heading:
+			if node.Lines().Len() == 0 {
+				continue
+			}
+			// Goldmark uses Heading for both ATX and setext headings. ATX
+			// nodes start at their opening hashes, before their content
+			// segment; setext nodes start at the first content segment.
+			if node.Pos() < node.Lines().At(0).Start {
+				lineIndex := markdownSourceLineIndex(normalized, node.Pos())
+				rawAccepted, err := inspectHeaderLine(lineIndex, false, true)
+				if err != nil {
+					return nil, err
+				}
+				if err := rejectVisiblyMalformedDispatchRoute(node, source, rawAccepted); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			for i := 0; i < node.Lines().Len(); i++ {
+				lineIndex := markdownSourceLineIndex(normalized, node.Lines().At(i).Start)
+				if _, err := inspectHeaderLine(lineIndex, false, false); err != nil {
+					return nil, err
+				}
+			}
+			if err := rejectVisiblyMalformedDispatchRoute(node, source, false); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if header < 0 {
 		return nil, nil
 	}
 
 	values := map[string]string{}
-	for i := header + 1; i < len(lines); i++ {
+	firstField := header + 1
+	for firstField < len(lines) && strings.TrimSpace(lines[firstField]) == "" {
+		firstField++
+	}
+	for i := firstField; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			break
@@ -291,6 +370,134 @@ func ParseDispatchRoute(body string) (*domain.AgentRoute, error) {
 		return nil, err
 	}
 	return route, nil
+}
+
+func markdownSourceLineIndex(source string, offset int) int {
+	if offset < 0 || offset > len(source) {
+		return -1
+	}
+	return strings.Count(source[:offset], "\n")
+}
+
+func rejectVisiblyMalformedDispatchRoute(node ast.Node, source []byte, rawAccepted bool) error {
+	visibleText := markdownVisibleInlineText(node, source)
+	visible := strings.Join(strings.Fields(visibleText), " ")
+	if rawAccepted {
+		if visible != "Dispatch route" {
+			return fmt.Errorf("raw Dispatch route header has non-canonical visible content %q", visible)
+		}
+		return nil
+	}
+	candidates := append(strings.Split(visibleText, "\n"), visibleText)
+	for _, line := range candidates {
+		candidate := strings.Join(strings.Fields(line), " ")
+		if looksLikeDispatchRouteHeading(candidate) {
+			return fmt.Errorf("invalid visible Dispatch route header content %q", candidate)
+		}
+	}
+	return nil
+}
+
+func markdownVisibleInlineText(node ast.Node, source []byte) string {
+	var visible strings.Builder
+	var appendNode func(ast.Node, bool)
+	appendNode = func(node ast.Node, inCode bool) {
+		switch node := node.(type) {
+		case *ast.Text:
+			value := node.Value(source)
+			if !inCode && !node.IsRaw() {
+				value = util.ResolveEntityNames(util.ResolveNumericReferences(util.UnescapePunctuations(value)))
+			}
+			visible.Write(value)
+			if node.SoftLineBreak() || node.HardLineBreak() {
+				visible.WriteByte('\n')
+			}
+			return
+		case *ast.String:
+			value := node.Value
+			if !inCode && !node.IsRaw() && !node.IsCode() {
+				value = util.ResolveEntityNames(util.ResolveNumericReferences(util.UnescapePunctuations(value)))
+			}
+			visible.Write(value)
+			return
+		case *ast.AutoLink:
+			visible.Write(node.Label(source))
+			return
+		case *ast.RawHTML:
+			return
+		case *ast.CodeSpan:
+			for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+				appendNode(child, true)
+			}
+			return
+		}
+		for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+			appendNode(child, inCode)
+		}
+	}
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		appendNode(child, false)
+	}
+	return visible.String()
+}
+
+// matchDispatchRouteHeader accepts the canonical plain header and Markdown ATX
+// headings with one through six opening hashes. A route-looking Markdown line
+// with malformed heading syntax is an error so intake cannot silently downgrade
+// a visibly requested route to the project's default.
+func matchDispatchRouteHeader(line string) (bool, error) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "Dispatch route" {
+		return true, nil
+	}
+
+	hashes := 0
+	for hashes < len(trimmed) && trimmed[hashes] == '#' {
+		hashes++
+	}
+	if hashes == 0 {
+		if looksLikeDispatchRouteHeading(trimmed) {
+			return false, fmt.Errorf("invalid Dispatch route header content %q", trimmed)
+		}
+		return false, nil
+	}
+
+	remainder := trimmed[hashes:]
+	content := strings.TrimSpace(remainder)
+	if closingStart := strings.LastIndexAny(content, " \t"); closingStart >= 0 {
+		closing := strings.TrimSpace(content[closingStart:])
+		if closing != "" && strings.Trim(closing, "#") == "" {
+			content = strings.TrimSpace(content[:closingStart])
+		}
+	}
+	if !looksLikeDispatchRouteHeading(content) {
+		return false, nil
+	}
+	if hashes > 6 {
+		return false, fmt.Errorf("invalid Dispatch route heading level %d", hashes)
+	}
+	if remainder == "" || (remainder[0] != ' ' && remainder[0] != '\t') {
+		return false, fmt.Errorf("invalid Dispatch route heading %q: whitespace is required after #", trimmed)
+	}
+	if content != "Dispatch route" {
+		return false, fmt.Errorf("invalid Dispatch route heading content %q", content)
+	}
+	return true, nil
+}
+
+func looksLikeDispatchRouteHeading(content string) bool {
+	const routeHeader = "dispatch route"
+	lower := strings.ToLower(content)
+	if lower == routeHeader {
+		return true
+	}
+	if !strings.HasPrefix(lower, routeHeader) {
+		return false
+	}
+	next := lower[len(routeHeader)]
+	isLetter := next >= 'a' && next <= 'z'
+	isDigit := next >= '0' && next <= '9'
+	return !isLetter && !isDigit && next != '_'
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
