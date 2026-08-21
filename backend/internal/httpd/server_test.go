@@ -3,11 +3,12 @@ package httpd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -46,34 +47,41 @@ func TestHealthProbesIncludeDaemonIdentity(t *testing.T) {
 	srv := httptest.NewServer(router)
 	defer srv.Close()
 
-	wantExe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantCWD, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	client := &http.Client{Timeout: 2 * time.Second}
+	var instanceID string
 	for _, path := range []string{"/healthz", "/readyz"} {
 		resp, err := client.Get(srv.URL + path)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
 		defer resp.Body.Close()
-		var body struct {
-			ExecutablePath   string `json:"executablePath"`
-			WorkingDirectory string `json:"workingDirectory"`
-		}
+		var body DaemonReadyResponse
 		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 			t.Fatalf("decode %s: %v", path, err)
 		}
-		if body.ExecutablePath != wantExe {
-			t.Errorf("GET %s executablePath = %q, want %q", path, body.ExecutablePath, wantExe)
+		if body.SchemaVersion != ReadinessSchemaVersion || body.Mode != DaemonModeNormal {
+			t.Errorf("GET %s proof = %#v, want schema %d normal mode", path, body, ReadinessSchemaVersion)
 		}
-		if body.WorkingDirectory != wantCWD {
-			t.Errorf("GET %s workingDirectory = %q, want %q", path, body.WorkingDirectory, wantCWD)
+		if body.DiagnosticBase != RecoveryDiagnosticBase {
+			t.Errorf("GET %s diagnosticBase = %q, want %q", path, body.DiagnosticBase, RecoveryDiagnosticBase)
+		}
+		if body.ExecutablePath != body.Build.Executable.Path || body.WorkingDirectory == "" {
+			t.Errorf("GET %s legacy identity fields do not match immutable proof: %#v", path, body)
+		}
+		if instanceID == "" {
+			instanceID = body.InstanceID
+		} else if body.InstanceID != instanceID {
+			t.Errorf("GET %s instanceId = %q, want immutable %q", path, body.InstanceID, instanceID)
+		}
+		if err := (ProbeContext{
+			InstanceID:       body.InstanceID,
+			Mode:             body.Mode,
+			WorkingDirectory: body.WorkingDirectory,
+			DataDir:          body.DataDir,
+			Build:            body.Build,
+			Fence:            body.Fence,
+		}).Validate(); err != nil {
+			t.Errorf("GET %s returned invalid proof: %v", path, err)
 		}
 	}
 }
@@ -195,31 +203,41 @@ func waitForHealth(t *testing.T, base string) {
 	t.Fatal("server did not become healthy within timeout")
 }
 
-// TestNewFallsBackOnPortConflict confirms that when the configured port is
-// already held, the constructor binds an ephemeral port instead of failing, so
-// the desktop supervisor never gets stuck on "daemon not ready".
-func TestNewFallsBackOnPortConflict(t *testing.T) {
+func TestListenFailsOnPortConflictWithoutFallback(t *testing.T) {
 	cfg := config.Config{Host: "127.0.0.1", Port: 0, RunFilePath: filepath.Join(t.TempDir(), "r.json")}
 
-	first, err := NewWithDeps(cfg, discardLogger(), nil, APIDeps{})
+	first, err := Listen(cfg)
 	if err != nil {
-		t.Fatalf("first New: %v", err)
+		t.Fatalf("first Listen: %v", err)
 	}
-	defer first.listen.Close()
+	defer first.Close()
 
-	// Request the exact port the first server took; the second server should
-	// fall back to a different, ephemeral port rather than error out.
-	conflict := config.Config{Host: "127.0.0.1", Port: first.boundPort(), RunFilePath: cfg.RunFilePath}
-	second, err := NewWithDeps(conflict, discardLogger(), nil, APIDeps{})
+	port := first.Addr().(*net.TCPAddr).Port
+	conflict := config.Config{Host: "127.0.0.1", Port: port, RunFilePath: cfg.RunFilePath}
+	second, err := Listen(conflict)
+	if err == nil {
+		_ = second.Close()
+		t.Fatalf("second Listen unexpectedly acquired already-bound port %d", port)
+	}
+}
+
+func TestNewWithListenerOwnsListenerOnFactoryFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("New on an already-bound port = %v, want ephemeral fallback", err)
+		t.Fatal(err)
 	}
-	defer second.listen.Close()
+	addr := ln.Addr().String()
 
-	if second.boundPort() == first.boundPort() {
-		t.Fatalf("second server bound the same port %d; want a fallback port", second.boundPort())
+	_, err = NewWithListener(config.Config{}, discardLogger(), ln, func(ControlDeps) (http.Handler, error) {
+		return nil, errors.New("router failed")
+	})
+	if err == nil {
+		t.Fatal("NewWithListener factory error = nil")
 	}
-	if second.boundPort() == 0 {
-		t.Fatal("second server bound port 0; want a real fallback port")
+
+	rebound, bindErr := net.Listen("tcp", addr)
+	if bindErr != nil {
+		t.Fatalf("listener was not closed after factory failure: %v", bindErr)
 	}
+	_ = rebound.Close()
 }

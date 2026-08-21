@@ -15,6 +15,7 @@ import (
 	openapi "github.com/swaggest/openapi-go"
 	"github.com/swaggest/openapi-go/openapi31"
 
+	daemonhttp "github.com/aoagents/agent-orchestrator/backend/internal/httpd"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
@@ -55,6 +56,10 @@ func Build() ([]byte, error) {
 		*(&openapi31.Server{URL: "http://127.0.0.1:3001"}).WithDescription("Local daemon (loopback only)"),
 	}
 	r.Spec.Tags = []openapi31.Tag{
+		*(&openapi31.Tag{Name: "system"}).WithDescription(
+			"Daemon identity, liveness, and readiness proofs"),
+		*(&openapi31.Tag{Name: "recovery"}).WithDescription(
+			"Read-only persisted-state diagnostics available while recovery-fenced"),
 		*(&openapi31.Tag{Name: "agents"}).WithDescription(
 			"Supported and locally runnable agent adapters"),
 		*(&openapi31.Tag{Name: "projects"}).WithDescription(
@@ -127,15 +132,44 @@ func schemaName(_ reflect.Type, defaultName string) string {
 var schemaNames = map[string]string{
 	// httpd/envelope
 	"EnvelopeAPIError": "APIError",
+	// httpd root probes and recovery wire envelopes
+	"HttpdDataDirIdentity":                      "DataDirIdentity",
+	"HttpdDaemonHealthResponse":                 "DaemonHealthResponse",
+	"HttpdDaemonReadyResponse":                  "DaemonReadyResponse",
+	"HttpdDaemonVersionResponse":                "DaemonVersionResponse",
+	"HttpdRecoveryStatusResponse":               "RecoveryStatusResponse",
+	"HttpdRecoveryProjectIDParam":               "RecoveryProjectIDParam",
+	"HttpdRecoverySessionIDParam":               "RecoverySessionIDParam",
+	"HttpdRecoveryRepoNameParam":                "RecoveryRepoNameParam",
+	"HttpdRecoveryListProjectsResponse":         "RecoveryListProjectsResponse",
+	"HttpdRecoveryProjectResponse":              "RecoveryProjectResponse",
+	"HttpdRecoveryListSessionsResponse":         "RecoveryListSessionsResponse",
+	"HttpdRecoverySessionResponse":              "RecoverySessionResponse",
+	"HttpdRecoveryListWorkspaceReposResponse":   "RecoveryListWorkspaceReposResponse",
+	"HttpdRecoveryWorkspaceRepoResponse":        "RecoveryWorkspaceRepoResponse",
+	"HttpdRecoveryListSessionWorktreesResponse": "RecoveryListSessionWorktreesResponse",
+	"HttpdRecoverySessionWorktreeResponse":      "RecoverySessionWorktreeResponse",
+	"HttpdRecoveryClearRequest":                 "RecoveryClearRequest",
+	"HttpdRecoveryClearResponse":                "RecoveryClearResponse",
+	// buildinfo
+	"BuildinfoIdentity":   "BuildIdentity",
+	"BuildinfoMetadata":   "BuildMetadata",
+	"BuildinfoExecutable": "ExecutableIdentity",
 	// domain
-	"DomainProjectID":           "ProjectID",
-	"DomainSessionID":           "SessionID",
-	"DomainIssueID":             "IssueID",
-	"DomainSession":             "Session",
-	"DomainProjectConfig":       "ProjectConfig",
-	"DomainTrackerIntakeConfig": "TrackerIntakeConfig",
-	"DomainAgentConfig":         "AgentConfig",
-	"DomainRoleOverride":        "RoleOverride",
+	"DomainProjectID":               "ProjectID",
+	"DomainSessionID":               "SessionID",
+	"DomainIssueID":                 "IssueID",
+	"DomainSession":                 "Session",
+	"DomainProjectConfig":           "ProjectConfig",
+	"DomainTrackerIntakeConfig":     "TrackerIntakeConfig",
+	"DomainAgentConfig":             "AgentConfig",
+	"DomainRoleOverride":            "RoleOverride",
+	"DomainRecoveryFenceStatus":     "RecoveryFenceStatus",
+	"DomainRecoveryInventoryStatus": "RecoveryInventoryStatus",
+	"DomainRecoveryProject":         "RecoveryProject",
+	"DomainRecoverySession":         "RecoverySession",
+	"DomainRecoveryWorkspaceRepo":   "RecoveryWorkspaceRepo",
+	"DomainRecoverySessionWorktree": "RecoverySessionWorktree",
 	// httpd/controllers (wire envelopes)
 	"ControllersListProjectsResponse":             "ListProjectsResponse",
 	"ControllersProjectResponse":                  "ProjectResponse",
@@ -291,7 +325,9 @@ type operation struct {
 }
 
 func operations() []operation {
-	ops := append([]operation{}, eventOperations()...)
+	ops := append([]operation{}, probeOperations()...)
+	ops = append(ops, recoveryOperations()...)
+	ops = append(ops, eventOperations()...)
 	ops = append(ops, agentOperations()...)
 	ops = append(ops, projectOperations()...)
 	ops = append(ops, sessionOperations()...)
@@ -301,6 +337,147 @@ func operations() []operation {
 	ops = append(ops, importOperations()...)
 	ops = append(ops, mobileOperations()...)
 	return ops
+}
+
+func probeOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodGet, path: "/healthz", id: "getDaemonHealth", tag: "system",
+			summary: "Return the immutable boot identity and liveness proof",
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.DaemonHealthResponse{}},
+				{http.StatusLocked, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodGet, path: "/readyz", id: "getDaemonReadiness", tag: "system",
+			summary: "Return the immutable boot identity and readiness proof",
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.DaemonReadyResponse{}},
+				{http.StatusLocked, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodGet, path: "/version", id: "getDaemonVersion", tag: "system",
+			summary: "Return the immutable boot-scoped build and executable identity",
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.DaemonVersionResponse{}},
+				{http.StatusLocked, envelope.APIError{}},
+			},
+		},
+	}
+}
+
+func recoveryOperations() []operation {
+	locked := respUnit{http.StatusLocked, envelope.APIError{}}
+	unavailable := respUnit{http.StatusServiceUnavailable, envelope.APIError{}}
+	notFound := respUnit{http.StatusNotFound, envelope.APIError{}}
+
+	return []operation{
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase, id: "getRecoveryStatus", tag: "recovery",
+			summary: "Return the recovery-fenced boot proof and inventory compatibility status",
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryStatusResponse{}},
+				locked,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/projects", id: "listRecoveryProjects", tag: "recovery",
+			summary: "List the fixed persisted project projection without normal services",
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryListProjectsResponse{}},
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/projects/{projectId}", id: "getRecoveryProject", tag: "recovery",
+			summary:    "Fetch one project from the fixed persisted recovery projection",
+			pathParams: []any{daemonhttp.RecoveryProjectIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryProjectResponse{}},
+				notFound,
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/projects/{projectId}/workspace-repos", id: "listRecoveryWorkspaceRepos", tag: "recovery",
+			summary:    "List fixed persisted workspace-repository rows for one project",
+			pathParams: []any{daemonhttp.RecoveryProjectIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryListWorkspaceReposResponse{}},
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/projects/{projectId}/workspace-repos/{repoName}", id: "getRecoveryWorkspaceRepo", tag: "recovery",
+			summary:    "Fetch one fixed persisted workspace-repository row",
+			pathParams: []any{daemonhttp.RecoveryProjectIDParam{}, daemonhttp.RecoveryRepoNameParam{}},
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryWorkspaceRepoResponse{}},
+				notFound,
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/sessions", id: "listRecoverySessions", tag: "recovery",
+			summary: "List the fixed persisted session projection without runtime or SCM probes",
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryListSessionsResponse{}},
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/sessions/{sessionId}", id: "getRecoverySession", tag: "recovery",
+			summary:    "Fetch one session from the fixed persisted recovery projection",
+			pathParams: []any{daemonhttp.RecoverySessionIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoverySessionResponse{}},
+				notFound,
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/sessions/{sessionId}/worktrees", id: "listRecoverySessionWorktrees", tag: "recovery",
+			summary:    "List fixed persisted worktree rows for one session",
+			pathParams: []any{daemonhttp.RecoverySessionIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryListSessionWorktreesResponse{}},
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodGet, path: daemonhttp.RecoveryDiagnosticBase + "/sessions/{sessionId}/worktrees/{repoName}", id: "getRecoverySessionWorktree", tag: "recovery",
+			summary:    "Fetch one fixed persisted worktree row",
+			pathParams: []any{daemonhttp.RecoverySessionIDParam{}, daemonhttp.RecoveryRepoNameParam{}},
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoverySessionWorktreeResponse{}},
+				notFound,
+				locked,
+				unavailable,
+			},
+		},
+		{
+			method: http.MethodPost, path: daemonhttp.RecoveryDiagnosticBase + "/clear", id: "clearRecoveryFence", tag: "recovery",
+			summary: "Compare-and-swap the active fence after sealed evidence verification and request restart",
+			reqBody: daemonhttp.RecoveryClearRequest{},
+			resps: []respUnit{
+				{http.StatusOK, daemonhttp.RecoveryClearResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusForbidden, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				locked,
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+	}
 }
 
 func agentOperations() []operation {

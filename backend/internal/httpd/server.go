@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
@@ -30,45 +29,79 @@ type Server struct {
 	shutdownOnce      sync.Once
 }
 
+// RouterFactory builds one handler around the Server's graceful-shutdown hook.
+// Separating listener acquisition from handler construction lets daemon boot
+// bind the exact configured port before it opens storage or constructs any
+// external/mutation-capable subsystem.
+type RouterFactory func(ControlDeps) (http.Handler, error)
+
+// Listen acquires the daemon's exact configured loopback address. Every bind
+// failure is fatal; in particular, EADDRINUSE never falls back to an ephemeral
+// port whose identity clients could confuse with another boot.
+func Listen(cfg config.Config) (net.Listener, error) {
+	ln, err := net.Listen("tcp", cfg.Addr())
+	if err != nil {
+		return nil, fmt.Errorf("bind %s: %w", cfg.Addr(), err)
+	}
+	return ln, nil
+}
+
 // NewWithDeps constructs a Server with API dependencies supplied by the daemon
 // and binds the listener immediately, before any running.json is written. The
 // caller owns the returned Server's lifecycle via Run. termMgr may be nil, in
 // which case the /mux terminal surface is not mounted.
 //
-// If the configured port is already held, it falls back to an OS-assigned
-// ephemeral port rather than failing. A genuine peer AO daemon is ruled out
-// upstream (the running.json + /healthz check in daemon.Run), so a conflict here
-// means a non-AO process owns the port; exiting would only leave the desktop
-// supervisor stuck on "daemon not ready". The actual bound port is logged
-// ("daemon listening") and written to running.json, both of which the supervisor
-// reads, so the fallback propagates to the renderer with no UI changes.
+// This compatibility constructor captures a normal-mode proof on behalf of old
+// callers. New daemon wiring should acquire Listen early and call NewWithListener
+// with an explicit daemon-provided ProbeContext/router factory.
 func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager, deps APIDeps) (*Server, error) {
-	log = loggerOrDefault(log)
-	ln, err := net.Listen("tcp", cfg.Addr())
+	proof, err := compatibilityNormalProbe(cfg)
 	if err != nil {
-		if !errors.Is(err, syscall.EADDRINUSE) {
-			return nil, fmt.Errorf("bind %s: %w", cfg.Addr(), err)
-		}
-		// Configured port is taken by a non-AO process: retry on an ephemeral port.
-		fallback, ferr := net.Listen("tcp", net.JoinHostPort(cfg.Host, "0"))
-		if ferr != nil {
-			return nil, fmt.Errorf("bind %s (in use) and ephemeral fallback: %w", cfg.Addr(), ferr)
-		}
-		log.Warn("configured port in use; bound an ephemeral port instead",
-			"configured", cfg.Addr(), "bound", fallback.Addr().String())
-		ln = fallback
+		return nil, fmt.Errorf("capture readiness proof: %w", err)
 	}
+	return NewWithDepsAndProbe(cfg, log, termMgr, deps, proof)
+}
 
+// NewWithDepsAndProbe is the explicit normal-mode convenience constructor. It
+// binds the exact configured address and validates the supplied proof.
+func NewWithDepsAndProbe(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager, deps APIDeps, proof ProbeContext) (*Server, error) {
+	ln, err := Listen(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return NewWithListener(cfg, log, ln, func(control ControlDeps) (http.Handler, error) {
+		return NewRouterWithControlAndProbe(cfg, log, termMgr, deps, control, proof)
+	})
+}
+
+// NewWithListener completes Server construction around an already-bound exact
+// listener. It owns ln on entry and closes it if handler construction fails.
+func NewWithListener(cfg config.Config, log *slog.Logger, ln net.Listener, factory RouterFactory) (*Server, error) {
+	log = loggerOrDefault(log)
+	if ln == nil {
+		return nil, fmt.Errorf("listener is required")
+	}
+	if factory == nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("router factory is required")
+	}
 	srv := &Server{
 		cfg:               cfg,
 		log:               log,
 		listen:            ln,
 		shutdownRequested: make(chan struct{}),
 	}
+	handler, err := factory(ControlDeps{RequestShutdown: srv.requestShutdown})
+	if err != nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("construct HTTP router: %w", err)
+	}
+	if handler == nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("construct HTTP router: nil handler")
+	}
 	srv.http = &http.Server{
-		Handler: NewRouterWithControl(cfg, log, termMgr, deps, ControlDeps{
-			RequestShutdown: srv.requestShutdown,
-		}),
+		Handler: handler,
 		// ReadHeaderTimeout guards against slow-loris even on loopback;
 		// per-request body/handler timeouts are applied per-surface.
 		ReadHeaderTimeout: 10 * time.Second,

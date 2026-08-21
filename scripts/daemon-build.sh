@@ -5,6 +5,69 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 backend_dir="${repo_root}/backend"
 build_dir="${XDG_CACHE_HOME:-${HOME}/.cache}/aoagents/agent-orchestrator/bin"
+buildinfo_path="github.com/aoagents/agent-orchestrator/backend/internal/buildinfo"
+release_repo_path="github.com/aoagents/agent-orchestrator/backend/internal/cli.releaseRepo"
+
+package_version() {
+  awk -F'"' '$2 == "version" { print $4; exit }' "${repo_root}/frontend/package.json"
+}
+
+git_value() {
+  git -C "${repo_root}" "$@" 2>/dev/null || true
+}
+
+source_epoch_date() {
+  if ! command -v node >/dev/null; then
+    printf 'SOURCE_DATE_EPOCH requires node to produce a portable RFC3339 build date\n' >&2
+    return 1
+  fi
+  node -e '
+    const raw = process.env.SOURCE_DATE_EPOCH;
+    if (!/^\d+$/.test(raw || "")) process.exit(2);
+    const ms = Number(raw) * 1000;
+    const date = new Date(ms);
+    if (!Number.isSafeInteger(ms) || Number.isNaN(date.getTime())) process.exit(2);
+    process.stdout.write(date.toISOString());
+  '
+}
+
+validate_linker_value() {
+  local name="$1"
+  local value="$2"
+  if [[ "${value}" =~ [[:space:]] ]]; then
+    printf '%s must not contain whitespace\n' "${name}" >&2
+    return 1
+  fi
+}
+
+build_version="${AO_BUILD_VERSION:-$(package_version)}"
+build_version="${build_version:-dev}"
+build_commit="${AO_BUILD_COMMIT:-${GITHUB_SHA:-}}"
+if [[ -z "${build_commit}" ]]; then
+  build_commit="$(git_value rev-parse HEAD)"
+fi
+build_date="${AO_BUILD_DATE:-}"
+if [[ -z "${build_date}" && -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+  build_date="$(source_epoch_date)"
+fi
+if [[ -z "${build_date}" ]]; then
+  build_date="$(git_value show -s --format=%cI "${build_commit:-HEAD}")"
+fi
+release_repo="${AO_RELEASE_REPO:-}"
+
+validate_linker_value AO_BUILD_VERSION "${build_version}"
+[[ -z "${build_commit}" ]] || validate_linker_value AO_BUILD_COMMIT "${build_commit}"
+[[ -z "${build_date}" ]] || validate_linker_value AO_BUILD_DATE "${build_date}"
+[[ -z "${release_repo}" ]] || validate_linker_value AO_RELEASE_REPO "${release_repo}"
+if [[ -n "${release_repo}" && ! "${release_repo}" =~ ^[^/]+/[^/]+$ ]]; then
+  printf 'AO_RELEASE_REPO must be an owner/repository pair, got %s\n' "${release_repo}" >&2
+  exit 1
+fi
+
+ldflags="-X ${buildinfo_path}.Version=${build_version}"
+[[ -z "${build_commit}" ]] || ldflags+=" -X ${buildinfo_path}.Commit=${build_commit}"
+[[ -z "${build_date}" ]] || ldflags+=" -X ${buildinfo_path}.Date=${build_date}"
+[[ -z "${release_repo}" ]] || ldflags+=" -X ${release_repo_path}=${release_repo}"
 
 can_write_dir() {
   local dir="$1"
@@ -92,7 +155,7 @@ binary_name="ao${goexe}"
 binary_path="${build_dir}/${binary_name}"
 
 mkdir -p "${build_dir}"
-(cd "${backend_dir}" && go build -o "${binary_path}" ./cmd/ao)
+(cd "${backend_dir}" && go build -trimpath -ldflags "${ldflags}" -o "${binary_path}" ./cmd/ao)
 
 if ! install_dir="$(select_install_dir)"; then
   printf 'Could not find a writable directory on PATH for ao\n' >&2

@@ -85,6 +85,23 @@ func TestVersionEmitsCLIInvocationBestEffort(t *testing.T) {
 	}
 }
 
+func TestImportNeverEmitsCLIInvocation(t *testing.T) {
+	setConfigEnv(t)
+	emitted := false
+	_, _, err := executeCLI(t, Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			emitted = true
+			return jsonResponse(http.StatusAccepted, ""), nil
+		})},
+	}, "import", "--from", filepath.Join(t.TempDir(), "missing"), "--yes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emitted {
+		t.Fatal("offline import emitted daemon telemetry before acquiring the data-directory lock")
+	}
+}
+
 func TestUsageErrorEmitsCLIUsageTelemetryBestEffort(t *testing.T) {
 	cfg := setConfigEnv(t)
 	called := make(chan string, 1)

@@ -25,14 +25,7 @@ import (
 // would otherwise execute. Same philosophy as localControlRequest on
 // /shutdown, applied to the whole surface.
 func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
-	allowed := make(map[string]struct{}, len(allowedOrigins))
-	for _, origin := range allowedOrigins {
-		origin = strings.TrimSpace(origin)
-		if origin == "" || origin == "null" || origin == "*" {
-			continue
-		}
-		allowed[origin] = struct{}{}
-	}
+	allowed := allowedOriginSet(allowedOrigins)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,6 +64,44 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// recoveryCORSMiddleware emits read-response CORS headers for the packaged
+// renderer and loopback development origins without turning OPTIONS into an
+// allowed route. The fenced router remains authoritative, so every preflight
+// reaches its method/not-found handler and receives RECOVERY_FENCED (423).
+func recoveryCORSMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
+	allowed := allowedOriginSet(allowedOrigins)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Add("Vary", "Origin")
+			if _, ok := allowed[origin]; !ok && !isLoopbackOrigin(origin) {
+				envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "ORIGIN_FORBIDDEN",
+					"Origin is not allowed to access this daemon", nil)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func allowedOriginSet(allowedOrigins []string) map[string]struct{} {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		origin = strings.TrimSpace(origin)
+		if origin == "" || origin == "null" || origin == "*" {
+			continue
+		}
+		allowed[origin] = struct{}{}
+	}
+	return allowed
 }
 
 // isLoopbackOrigin reports whether a browser origin is content served from

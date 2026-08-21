@@ -4,6 +4,7 @@ package httpd
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -44,6 +45,28 @@ type ControlDeps struct {
 // The per-request timeout is deliberately not global: it wraps only bounded
 // REST routes, never long-lived terminal streams or health probes.
 func NewRouterWithControl(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager, deps APIDeps, control ControlDeps) chi.Router {
+	proof, err := compatibilityNormalProbe(cfg)
+	if err != nil {
+		panic(fmt.Sprintf("httpd: build compatibility readiness proof: %v", err))
+	}
+	r, err := NewRouterWithControlAndProbe(cfg, log, termMgr, deps, control, proof)
+	if err != nil {
+		panic(fmt.Sprintf("httpd: build normal router: %v", err))
+	}
+	return r
+}
+
+// NewRouterWithControlAndProbe builds the normal-mode router around one exact
+// daemon-provided boot proof. The proof is validated and snapshotted before any
+// handler is returned, so /healthz and /readyz cannot drift during the process.
+func NewRouterWithControlAndProbe(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager, deps APIDeps, control ControlDeps, proof ProbeContext) (chi.Router, error) {
+	if proof.Mode != DaemonModeNormal {
+		return nil, fmt.Errorf("normal router requires mode %q, got %q", DaemonModeNormal, proof.Mode)
+	}
+	if err := proof.Validate(); err != nil {
+		return nil, fmt.Errorf("validate readiness proof: %w", err)
+	}
+	proof = snapshotProbeContext(proof)
 	log = loggerOrDefault(log)
 	r := chi.NewRouter()
 
@@ -59,21 +82,32 @@ func NewRouterWithControl(cfg config.Config, log *slog.Logger, termMgr *terminal
 	r.NotFound(notFoundJSON)
 	r.MethodNotAllowed(methodNotAllowedJSON)
 
-	mountHealth(r)
+	mountHealth(r, proof)
 	mountTerminalMux(r, termMgr, log)
 	mountControl(r, control)
 	mountTelemetry(r, deps.Telemetry)
 	mountMobile(r, deps.Mobile)
 	NewAPI(cfg, deps).Register(r)
 
-	return r
+	return r, nil
 }
 
 // mountHealth registers the liveness and readiness probes the Electron
 // supervisor polls before letting the renderer connect.
-func mountHealth(r chi.Router) {
-	r.Get("/healthz", handleHealthz)
-	r.Get("/readyz", handleReadyz)
+func mountHealth(r chi.Router, proof ProbeContext) {
+	proof = snapshotProbeContext(proof)
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		envelope.WriteJSON(w, http.StatusOK, healthResponse(proof))
+	})
+	r.Get("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		envelope.WriteJSON(w, http.StatusOK, readyResponse(proof))
+	})
+	r.Get("/version", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		envelope.WriteJSON(w, http.StatusOK, versionResponse(proof))
+	})
 }
 
 // mountControl registers the loopback daemon-control endpoints. /shutdown is
@@ -243,31 +277,4 @@ func localControlRequest(r *http.Request) bool {
 		return ip.IsLoopback()
 	}
 	return false
-}
-
-// handleHealthz is the liveness probe: it answers 200 as long as the process is
-// up and serving. It does no dependency checks by design.
-func handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	envelope.WriteJSON(w, http.StatusOK, daemonProbePayload("ok"))
-}
-
-// handleReadyz is the readiness probe. Dependency initialization happens before
-// the server is constructed, so a listening daemon is ready to answer requests.
-func handleReadyz(w http.ResponseWriter, _ *http.Request) {
-	envelope.WriteJSON(w, http.StatusOK, daemonProbePayload("ready"))
-}
-
-func daemonProbePayload(status string) map[string]any {
-	payload := map[string]any{
-		"status":  status,
-		"service": daemonmeta.ServiceName,
-		"pid":     os.Getpid(),
-	}
-	if exe, err := os.Executable(); err == nil && exe != "" {
-		payload["executablePath"] = exe
-	}
-	if cwd, err := os.Getwd(); err == nil && cwd != "" {
-		payload["workingDirectory"] = cwd
-	}
-	return payload
 }

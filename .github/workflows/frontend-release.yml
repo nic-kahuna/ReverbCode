@@ -24,9 +24,8 @@ name: Desktop release
 # AO_RELEASE_REPO MUST be set to the fork for a test run. It is derived
 # automatically below from `github.repository`, so a fork run publishes to the
 # fork and a run on AgentWrapper publishes to AgentWrapper, with no edit. The
-# matching test `ao` binary is built with
-# `-ldflags -X ...cli.releaseRepo=harshitsinghbhandari/agent-orchestrator` so it
-# fetches from the same fork (spec §6.3).
+# bundled `ao` binary stamps AO_RELEASE_REPO through build-daemon.mjs, so it
+# fetches from the same repository that receives the release (spec §6.3).
 
 on:
   push:

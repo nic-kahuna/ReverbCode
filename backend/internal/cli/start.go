@@ -19,7 +19,7 @@ import (
 // from. It defaults to the production target and is overridable at build time so
 // a test binary fetches from the fork without a source edit:
 //
-//	go build -ldflags "-X github.com/aoagents/agent-orchestrator/backend/internal/cli.releaseRepo=harshitsinghbhandari/agent-orchestrator" ./cmd/ao
+//	AO_RELEASE_REPO=owner/repository npm --prefix frontend run build:daemon
 //
 // Mirrors how version.go's Version var is stamped by release tooling.
 var releaseRepo = "AgentWrapper/agent-orchestrator"

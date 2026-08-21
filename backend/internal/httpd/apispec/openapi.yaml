@@ -838,6 +838,362 @@ paths:
       summary: Resolve review threads on a pull request
       tags:
       - prs
+  /api/v1/recovery:
+    get:
+      operationId: getRecoveryStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryStatusResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+      summary: Return the recovery-fenced boot proof and inventory compatibility status
+      tags:
+      - recovery
+  /api/v1/recovery/clear:
+    post:
+      operationId: clearRecoveryFence
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryClearRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryClearResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Compare-and-swap the active fence after sealed evidence verification
+        and request restart
+      tags:
+      - recovery
+  /api/v1/recovery/projects:
+    get:
+      operationId: listRecoveryProjects
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryListProjectsResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: List the fixed persisted project projection without normal services
+      tags:
+      - recovery
+  /api/v1/recovery/projects/{projectId}:
+    get:
+      operationId: getRecoveryProject
+      parameters:
+      - description: Persisted project identifier.
+        in: path
+        name: projectId
+        required: true
+        schema:
+          description: Persisted project identifier.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryProjectResponse'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Fetch one project from the fixed persisted recovery projection
+      tags:
+      - recovery
+  /api/v1/recovery/projects/{projectId}/workspace-repos:
+    get:
+      operationId: listRecoveryWorkspaceRepos
+      parameters:
+      - description: Persisted project identifier.
+        in: path
+        name: projectId
+        required: true
+        schema:
+          description: Persisted project identifier.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryListWorkspaceReposResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: List fixed persisted workspace-repository rows for one project
+      tags:
+      - recovery
+  /api/v1/recovery/projects/{projectId}/workspace-repos/{repoName}:
+    get:
+      operationId: getRecoveryWorkspaceRepo
+      parameters:
+      - description: Persisted project identifier.
+        in: path
+        name: projectId
+        required: true
+        schema:
+          description: Persisted project identifier.
+          type: string
+      - description: Persisted workspace repository name.
+        in: path
+        name: repoName
+        required: true
+        schema:
+          description: Persisted workspace repository name.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryWorkspaceRepoResponse'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Fetch one fixed persisted workspace-repository row
+      tags:
+      - recovery
+  /api/v1/recovery/sessions:
+    get:
+      operationId: listRecoverySessions
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryListSessionsResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: List the fixed persisted session projection without runtime or SCM
+        probes
+      tags:
+      - recovery
+  /api/v1/recovery/sessions/{sessionId}:
+    get:
+      operationId: getRecoverySession
+      parameters:
+      - description: Persisted session identifier.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Persisted session identifier.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoverySessionResponse'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Fetch one session from the fixed persisted recovery projection
+      tags:
+      - recovery
+  /api/v1/recovery/sessions/{sessionId}/worktrees:
+    get:
+      operationId: listRecoverySessionWorktrees
+      parameters:
+      - description: Persisted session identifier.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Persisted session identifier.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryListSessionWorktreesResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: List fixed persisted worktree rows for one session
+      tags:
+      - recovery
+  /api/v1/recovery/sessions/{sessionId}/worktrees/{repoName}:
+    get:
+      operationId: getRecoverySessionWorktree
+      parameters:
+      - description: Persisted session identifier.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Persisted session identifier.
+          type: string
+      - description: Persisted workspace repository name.
+        in: path
+        name: repoName
+        required: true
+        schema:
+          description: Persisted workspace repository name.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoverySessionWorktreeResponse'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Fetch one fixed persisted worktree row
+      tags:
+      - recovery
   /api/v1/sessions:
     get:
       operationId: listSessions
@@ -1705,6 +2061,63 @@ paths:
       summary: Clean up terminated session workspaces
       tags:
       - sessions
+  /healthz:
+    get:
+      operationId: getDaemonHealth
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaemonHealthResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+      summary: Return the immutable boot identity and liveness proof
+      tags:
+      - system
+  /readyz:
+    get:
+      operationId: getDaemonReadiness
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaemonReadyResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+      summary: Return the immutable boot identity and readiness proof
+      tags:
+      - system
+  /version:
+    get:
+      operationId: getDaemonVersion
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaemonVersionResponse'
+          description: OK
+        "423":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Locked
+      summary: Return the immutable boot-scoped build and executable identity
+      tags:
+      - system
 components:
   schemas:
     APIError:
@@ -1772,6 +2185,30 @@ components:
       required:
       - id
       - label
+      type: object
+    BuildIdentity:
+      properties:
+        build:
+          $ref: '#/components/schemas/BuildMetadata'
+        executable:
+          $ref: '#/components/schemas/ExecutableIdentity'
+      required:
+      - build
+      - executable
+      type: object
+    BuildMetadata:
+      properties:
+        builtAt:
+          type: string
+        sourceCommit:
+          type: string
+        sourceModified:
+          type: boolean
+        version:
+          type: string
+      required:
+      - version
+      - sourceModified
       type: object
     CancelReviewResponse:
       properties:
@@ -1917,6 +2354,142 @@ components:
       - status
       - prs
       type: object
+    DaemonHealthResponse:
+      properties:
+        build:
+          $ref: '#/components/schemas/BuildIdentity'
+        dataDir:
+          $ref: '#/components/schemas/DataDirIdentity'
+        diagnosticBase:
+          type: string
+        executablePath:
+          type: string
+        fence:
+          $ref: '#/components/schemas/RecoveryFenceStatus'
+        instanceId:
+          type: string
+        mode:
+          enum:
+          - normal
+          - recovery_fenced
+          type: string
+        pid:
+          type: integer
+        schemaVersion:
+          type: integer
+        service:
+          type: string
+        status:
+          enum:
+          - ok
+          type: string
+        workingDirectory:
+          type: string
+      required:
+      - schemaVersion
+      - status
+      - service
+      - pid
+      - instanceId
+      - mode
+      - diagnosticBase
+      - executablePath
+      - workingDirectory
+      - dataDir
+      - build
+      - fence
+      type: object
+    DaemonReadyResponse:
+      properties:
+        build:
+          $ref: '#/components/schemas/BuildIdentity'
+        dataDir:
+          $ref: '#/components/schemas/DataDirIdentity'
+        diagnosticBase:
+          type: string
+        executablePath:
+          type: string
+        fence:
+          $ref: '#/components/schemas/RecoveryFenceStatus'
+        instanceId:
+          type: string
+        mode:
+          enum:
+          - normal
+          - recovery_fenced
+          type: string
+        pid:
+          type: integer
+        schemaVersion:
+          type: integer
+        service:
+          type: string
+        status:
+          enum:
+          - ready
+          type: string
+        workingDirectory:
+          type: string
+      required:
+      - schemaVersion
+      - status
+      - service
+      - pid
+      - instanceId
+      - mode
+      - diagnosticBase
+      - executablePath
+      - workingDirectory
+      - dataDir
+      - build
+      - fence
+      type: object
+    DaemonVersionResponse:
+      properties:
+        build:
+          $ref: '#/components/schemas/BuildIdentity'
+        executablePath:
+          type: string
+        instanceId:
+          type: string
+        mode:
+          enum:
+          - normal
+          - recovery_fenced
+          type: string
+        pid:
+          type: integer
+        schemaVersion:
+          type: integer
+        service:
+          type: string
+        status:
+          enum:
+          - ok
+          type: string
+        workingDirectory:
+          type: string
+      required:
+      - schemaVersion
+      - status
+      - service
+      - pid
+      - instanceId
+      - mode
+      - executablePath
+      - workingDirectory
+      - build
+      type: object
+    DataDirIdentity:
+      properties:
+        canonicalPath:
+          type: string
+        sha256:
+          type: string
+      required:
+      - canonicalPath
+      - sha256
+      type: object
     DegradedProject:
       properties:
         id:
@@ -1977,6 +2550,16 @@ components:
           type: string
       required:
       - harness
+      type: object
+    ExecutableIdentity:
+      properties:
+        path:
+          type: string
+        sha256:
+          type: string
+      required:
+      - path
+      - sha256
       type: object
     ImportReport:
       properties:
@@ -2390,6 +2973,410 @@ components:
       - path
       - kind
       - sessionPrefix
+      type: object
+    RecoveryClearRequest:
+      properties:
+        activationId:
+          minLength: 1
+          type: string
+        generation:
+          format: int64
+          minimum: 0
+          type: integer
+        payloadSha256:
+          maxLength: 64
+          minLength: 64
+          type: string
+        protocolVersion:
+          format: int64
+          minimum: 1
+          type: integer
+      required:
+      - protocolVersion
+      - generation
+      - activationId
+      - payloadSha256
+      type: object
+    RecoveryClearResponse:
+      properties:
+        fence:
+          $ref: '#/components/schemas/RecoveryFenceStatus'
+        restartRequired:
+          type: boolean
+      required:
+      - fence
+      - restartRequired
+      type: object
+    RecoveryFenceStatus:
+      properties:
+        activationId:
+          type: string
+        activationIdStorageClass:
+          type: string
+        databaseSchemaVersion:
+          format: int64
+          type: integer
+        disposition:
+          type: string
+        generation:
+          type:
+          - "null"
+          - integer
+        generationStorageClass:
+          type: string
+        payloadByteLength:
+          type: integer
+        payloadSha256:
+          type: string
+        payloadStorageClass:
+          type: string
+        protocolStorageClass:
+          type: string
+        protocolVersion:
+          type:
+          - "null"
+          - integer
+        reasonCode:
+          type: string
+        rowCount:
+          type: integer
+        state:
+          type: string
+        stateStorageClass:
+          type: string
+        supportedDatabaseSchemaVersion:
+          format: int64
+          type: integer
+        supportedProtocolVersion:
+          format: int64
+          type: integer
+      required:
+      - supportedProtocolVersion
+      - supportedDatabaseSchemaVersion
+      - databaseSchemaVersion
+      - disposition
+      - reasonCode
+      - rowCount
+      type: object
+    RecoveryInventoryStatus:
+      properties:
+        available:
+          type: boolean
+        fingerprint:
+          type: string
+        reasonCode:
+          type: string
+        schemaVersion:
+          type: integer
+      required:
+      - schemaVersion
+      - fingerprint
+      - available
+      type: object
+    RecoveryListProjectsResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        projects:
+          items:
+            $ref: '#/components/schemas/RecoveryProject'
+          type: array
+      required:
+      - inventory
+      - projects
+      type: object
+    RecoveryListSessionWorktreesResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        sessionId:
+          type: string
+        sessionWorktrees:
+          items:
+            $ref: '#/components/schemas/RecoverySessionWorktree'
+          type: array
+      required:
+      - inventory
+      - sessionId
+      - sessionWorktrees
+      type: object
+    RecoveryListSessionsResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        sessions:
+          items:
+            $ref: '#/components/schemas/RecoverySession'
+          type: array
+      required:
+      - inventory
+      - sessions
+      type: object
+    RecoveryListWorkspaceReposResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        projectId:
+          type: string
+        workspaceRepos:
+          items:
+            $ref: '#/components/schemas/RecoveryWorkspaceRepo'
+          type: array
+      required:
+      - inventory
+      - projectId
+      - workspaceRepos
+      type: object
+    RecoveryProject:
+      properties:
+        archivedAt:
+          type:
+          - "null"
+          - string
+        configBase64:
+          type:
+          - "null"
+          - string
+        displayName:
+          type: string
+        id:
+          type: string
+        kind:
+          type: string
+        path:
+          type: string
+        registeredAt:
+          type: string
+        repoOriginUrl:
+          type: string
+      required:
+      - id
+      - path
+      - repoOriginUrl
+      - displayName
+      - registeredAt
+      - archivedAt
+      - configBase64
+      - kind
+      type: object
+    RecoveryProjectResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        project:
+          $ref: '#/components/schemas/RecoveryProject'
+      required:
+      - inventory
+      - project
+      type: object
+    RecoverySession:
+      properties:
+        activityLastAt:
+          type: string
+        activityState:
+          type: string
+        agentSessionId:
+          type: string
+        branch:
+          type: string
+        createdAt:
+          type: string
+        displayName:
+          type: string
+        firstSignalAt:
+          type:
+          - "null"
+          - string
+        harness:
+          type: string
+        id:
+          type: string
+        isTerminated:
+          format: int64
+          type: integer
+        issueId:
+          type: string
+        kind:
+          type: string
+        launchModel:
+          type: string
+        launchReasoningEffort:
+          type: string
+        launchRouteRecorded:
+          format: int64
+          type: integer
+        num:
+          format: int64
+          type: integer
+        previewRevision:
+          format: int64
+          type: integer
+        previewUrl:
+          type: string
+        projectId:
+          type: string
+        promptBase64:
+          type: string
+        requestedHarness:
+          type: string
+        requestedModel:
+          type: string
+        requestedReasoningEffort:
+          type: string
+        runtimeHandleId:
+          type: string
+        updatedAt:
+          type: string
+        workspacePath:
+          type: string
+      required:
+      - id
+      - projectId
+      - num
+      - issueId
+      - kind
+      - harness
+      - displayName
+      - activityState
+      - activityLastAt
+      - firstSignalAt
+      - isTerminated
+      - branch
+      - workspacePath
+      - runtimeHandleId
+      - agentSessionId
+      - promptBase64
+      - previewUrl
+      - previewRevision
+      - requestedHarness
+      - requestedModel
+      - requestedReasoningEffort
+      - launchModel
+      - launchReasoningEffort
+      - launchRouteRecorded
+      - createdAt
+      - updatedAt
+      type: object
+    RecoverySessionResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        session:
+          $ref: '#/components/schemas/RecoverySession'
+      required:
+      - inventory
+      - session
+      type: object
+    RecoverySessionWorktree:
+      properties:
+        baseSha:
+          type: string
+        branch:
+          type: string
+        preservedRef:
+          type: string
+        repoName:
+          type: string
+        sessionId:
+          type: string
+        state:
+          type: string
+        worktreePath:
+          type: string
+      required:
+      - sessionId
+      - repoName
+      - branch
+      - baseSha
+      - worktreePath
+      - preservedRef
+      - state
+      type: object
+    RecoverySessionWorktreeResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        sessionWorktree:
+          $ref: '#/components/schemas/RecoverySessionWorktree'
+      required:
+      - inventory
+      - sessionWorktree
+      type: object
+    RecoveryStatusResponse:
+      properties:
+        build:
+          $ref: '#/components/schemas/BuildIdentity'
+        dataDir:
+          $ref: '#/components/schemas/DataDirIdentity'
+        diagnosticBase:
+          type: string
+        executablePath:
+          type: string
+        fence:
+          $ref: '#/components/schemas/RecoveryFenceStatus'
+        instanceId:
+          type: string
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        mode:
+          enum:
+          - recovery_fenced
+          type: string
+        pid:
+          type: integer
+        schemaVersion:
+          type: integer
+        service:
+          type: string
+        status:
+          enum:
+          - recovery_fenced
+          type: string
+        workingDirectory:
+          type: string
+      required:
+      - schemaVersion
+      - status
+      - service
+      - pid
+      - instanceId
+      - mode
+      - diagnosticBase
+      - executablePath
+      - workingDirectory
+      - dataDir
+      - build
+      - fence
+      - inventory
+      type: object
+    RecoveryWorkspaceRepo:
+      properties:
+        name:
+          type: string
+        projectId:
+          type: string
+        registeredAt:
+          type: string
+        relativePath:
+          type: string
+        repoOriginUrl:
+          type: string
+      required:
+      - projectId
+      - name
+      - relativePath
+      - repoOriginUrl
+      - registeredAt
+      type: object
+    RecoveryWorkspaceRepoResponse:
+      properties:
+        inventory:
+          $ref: '#/components/schemas/RecoveryInventoryStatus'
+        workspaceRepo:
+          $ref: '#/components/schemas/RecoveryWorkspaceRepo'
+      required:
+      - inventory
+      - workspaceRepo
       type: object
     RemoveProjectResult:
       properties:
@@ -3010,6 +3997,10 @@ components:
       - repo
       type: object
 tags:
+- description: Daemon identity, liveness, and readiness proofs
+  name: system
+- description: Read-only persisted-state diagnostics available while recovery-fenced
+  name: recovery
 - description: Supported and locally runnable agent adapters
   name: agents
 - description: Project registry, configuration, and lifecycle administration
