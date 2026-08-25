@@ -111,6 +111,27 @@ func isolateRegistry(t *testing.T) {
 // Tests
 // ---------------------------------------------------------------------------
 
+func TestHandleForUsesExactValidSessionID(t *testing.T) {
+	rt := New(Options{})
+	longID := strings.Repeat("long_", 30) + "1"
+	for _, id := range []string{"sess-abc", longID} {
+		handle, err := rt.HandleFor(ports.RuntimeConfig{SessionID: domain.SessionID(id)})
+		if err != nil {
+			t.Fatalf("HandleFor(%q): %v", id, err)
+		}
+		if handle.ID != id {
+			t.Fatalf("HandleFor(%q) = %q, want exact id", id, handle.ID)
+		}
+	}
+}
+
+func TestHandleForPreservesInvalidDottedIDRejection(t *testing.T) {
+	rt := New(Options{})
+	if _, err := rt.HandleFor(ports.RuntimeConfig{SessionID: "sess.with.dot"}); err == nil {
+		t.Fatal("HandleFor(dotted id) succeeded, want existing conpty validation error")
+	}
+}
+
 // TestCreate_RegistersSession verifies Create returns {ID: sessionID}, writes
 // to the in-memory map, and registers in the ptyregistry.
 func TestCreate_RegistersSession(t *testing.T) {

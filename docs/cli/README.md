@@ -90,13 +90,25 @@ commands yet.
 
 The CLI and daemon share the same environment-driven config:
 
-| Var                   | Default              | Purpose                |
-| --------------------- | -------------------- | ---------------------- |
-| `AO_PORT`             | `3001`               | Loopback daemon port.  |
-| `AO_RUN_FILE`         | `~/.ao/running.json` | PID/port handshake.    |
-| `AO_DATA_DIR`         | `~/.ao/data`         | SQLite data directory. |
-| `AO_REQUEST_TIMEOUT`  | `60s`                | REST request timeout.  |
-| `AO_SHUTDOWN_TIMEOUT` | `10s`                | Graceful shutdown cap. |
+| Var                   | Default              | Purpose                                            |
+| --------------------- | -------------------- | -------------------------------------------------- |
+| `AO_PORT`             | `3001`               | Loopback daemon port.                              |
+| `AO_RUN_FILE`         | `~/.ao/running.json` | PID/port handshake.                                |
+| `AO_DATA_DIR`         | `~/.ao/data`         | SQLite data directory.                             |
+| `AO_REQUEST_TIMEOUT`  | `60s`                | REST request timeout.                              |
+| `AO_SHUTDOWN_TIMEOUT` | `10s`                | Graceful shutdown cap.                             |
+| `AO_AGENT`            | `codex`              | Compatibility/default agent adapter.               |
+| `AO_DISABLED_AGENTS`  | empty                | Comma-separated agent ids the daemon must not run. |
+
+`AO_DISABLED_AGENTS` is a reversible availability policy, not an uninstall.
+Disabled agents are omitted from the catalog and cannot spawn, review, restore,
+or survive boot reconciliation, while their adapters and historical records
+remain readable. Remove an id from the variable and restart the daemon to
+re-enable it. For example:
+
+```bash
+AO_AGENT=codex AO_DISABLED_AGENTS=claude-code ao start
+```
 
 The daemon always binds `127.0.0.1`.
 

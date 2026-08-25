@@ -20,6 +20,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 type doctorLevel string
@@ -171,10 +172,17 @@ func (c *commandContext) runDoctor(ctx context.Context) []doctorCheck {
 		c.checkTerminalRuntime(ctx),
 		c.checkAOBinary(),
 	)
+	policy := cfg.AgentPolicy()
 	for _, harness := range doctorHarnesses {
+		if policy.IsDisabled(harness.Name) {
+			continue
+		}
 		checks = append(checks, c.checkHarness(ctx, harness))
 	}
-	checks = append(checks, c.checkCodexLaunchFlags(ctx), c.checkGitHubToken(ctx))
+	if !policy.IsDisabled(string(domain.HarnessCodex)) {
+		checks = append(checks, c.checkCodexLaunchFlags(ctx))
+	}
+	checks = append(checks, c.checkGitHubToken(ctx))
 	return checks
 }
 

@@ -43,6 +43,7 @@ type ListFilter struct {
 // commander is the command-side surface Service delegates to: the
 // *sessionmanager.Manager in production, a fake in tests.
 type commander interface {
+	ResolveSpawnAgentPolicy(ctx context.Context, cfg ports.SpawnConfig) (ports.SpawnConfig, error)
 	Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error)
 	Restore(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error)
 	Kill(ctx context.Context, id domain.SessionID) (bool, error)
@@ -274,8 +275,17 @@ func (s *Service) SpawnOrchestrator(ctx context.Context, projectID domain.Projec
 	if err != nil {
 		return domain.Session{}, err
 	}
+	spawnCfg := ports.SpawnConfig{ProjectID: projectID, Kind: domain.KindOrchestrator}
 	active := true
 	if clean {
+		// A clean replacement is destructive. Resolve the configured replacement
+		// harness against daemon policy before notifying or retiring any existing
+		// orchestrator, so a disabled replacement leaves the current coordinator
+		// untouched.
+		spawnCfg, err = s.manager.ResolveSpawnAgentPolicy(ctx, spawnCfg)
+		if err != nil {
+			return domain.Session{}, toAPIError(err)
+		}
 		existing, err := s.List(ctx, ListFilter{ProjectID: projectID, Active: &active, OrchestratorOnly: true})
 		if err != nil {
 			return domain.Session{}, err
@@ -295,12 +305,16 @@ func (s *Service) SpawnOrchestrator(ctx context.Context, projectID domain.Projec
 		if len(existing) > 0 {
 			return newestSession(existing), nil
 		}
+		spawnCfg, err = s.manager.ResolveSpawnAgentPolicy(ctx, spawnCfg)
+		if err != nil {
+			return domain.Session{}, toAPIError(err)
+		}
 	}
-	sess, err := s.Spawn(ctx, ports.SpawnConfig{ProjectID: projectID, Kind: domain.KindOrchestrator})
+	sess, err := s.Spawn(ctx, spawnCfg)
 	if err != nil {
 		return domain.Session{}, err
 	}
-	if err := verifyOrchestratorReplacement(project, sess); err != nil {
+	if err := verifyOrchestratorReplacement(project, spawnCfg.Harness, sess); err != nil {
 		return domain.Session{}, err
 	}
 	return sess, nil
@@ -315,15 +329,15 @@ func (s *Service) sendRetireNotice(ctx context.Context, id domain.SessionID) err
 	return nil
 }
 
-func verifyOrchestratorReplacement(project domain.ProjectRecord, sess domain.Session) error {
+func verifyOrchestratorReplacement(project domain.ProjectRecord, expectedHarness domain.AgentHarness, sess domain.Session) error {
 	if sess.IsTerminated {
 		return fmt.Errorf("orchestrator replacement verification failed: new session %s is terminated", sess.ID)
 	}
 	if sess.Kind != domain.KindOrchestrator {
 		return fmt.Errorf("orchestrator replacement verification failed: new session %s has kind %q", sess.ID, sess.Kind)
 	}
-	if expected := project.Config.Orchestrator.Harness; expected != "" && sess.Harness != expected {
-		return fmt.Errorf("orchestrator replacement verification failed: new session %s uses harness %q, want %q", sess.ID, sess.Harness, expected)
+	if expectedHarness != "" && sess.Harness != expectedHarness {
+		return fmt.Errorf("orchestrator replacement verification failed: new session %s uses harness %q, want %q", sess.ID, sess.Harness, expectedHarness)
 	}
 	expectedBranch := "ao/" + serviceSessionPrefix(project) + "-orchestrator"
 	if sess.Metadata.Branch != "" && sess.Metadata.Branch != expectedBranch {
@@ -566,6 +580,8 @@ func toAPIError(err error) error {
 		return apierr.Invalid("PROJECT_NOT_RESOLVABLE", "Project is not registered or has no repo. Register it with `ao project add`", nil)
 	case errors.Is(err, sessionmanager.ErrUnknownHarness):
 		return apierr.Invalid("UNKNOWN_HARNESS", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrAgentDisabled):
+		return apierr.Conflict("AGENT_DISABLED", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrMissingHarness):
 		return apierr.Invalid("AGENT_REQUIRED", err.Error(), nil)
 	case errors.Is(err, ports.ErrWorkspaceBranchCheckedOutElsewhere):

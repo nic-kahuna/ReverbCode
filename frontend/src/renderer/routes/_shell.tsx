@@ -10,6 +10,7 @@ import { TitlebarNav } from "../components/TitlebarNav";
 import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
 import { useDaemonStatus } from "../hooks/useDaemonStatus";
 import { useWorkspaceQuery, workspaceQueryKey, workspaceQueryOptions } from "../hooks/useWorkspaceQuery";
+import { agentCatalogDaemonEpoch } from "../lib/agent-catalog-epoch";
 import { apiClient, apiErrorCode, apiErrorMessage } from "../lib/api-client";
 import { refreshDaemonStatus } from "../lib/daemon-status";
 import { addRendererExceptionStep, captureRendererEvent, captureRendererException } from "../lib/telemetry";
@@ -54,7 +55,7 @@ function ShellLayout() {
 	const workspaceQuery = useWorkspaceQuery();
 	const workspaces = workspaceQuery.data ?? [];
 	const daemonStatus = useDaemonStatus(queryClient);
-	const agentCatalogPortRef = useRef<number | undefined>(undefined);
+	const agentCatalogEpochRef = useRef<string | undefined>(undefined);
 	const { theme, setTheme, isSidebarOpen, toggleSidebar } = useUiStore();
 	const isSessionRoute =
 		Boolean(matchRoute({ to: "/projects/$projectId/sessions/$sessionId", fuzzy: true })) ||
@@ -203,14 +204,18 @@ function ShellLayout() {
 	}, [theme]);
 
 	useEffect(() => {
-		if (daemonStatus.state !== "ready" || !daemonStatus.port) return;
-		if (agentCatalogPortRef.current === daemonStatus.port) return;
+		const epoch = agentCatalogDaemonEpoch(daemonStatus);
+		if (!epoch) {
+			agentCatalogEpochRef.current = undefined;
+			return;
+		}
+		if (agentCatalogEpochRef.current === epoch) return;
 
-		agentCatalogPortRef.current = daemonStatus.port;
+		agentCatalogEpochRef.current = epoch;
 		void queryClient.invalidateQueries({ queryKey: agentsQueryKey });
 		void queryClient.fetchQuery({ ...agentsQueryOptions, queryFn: refreshAgents });
 		void queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
-	}, [daemonStatus.port, daemonStatus.state, queryClient]);
+	}, [daemonStatus.pid, daemonStatus.port, daemonStatus.state, queryClient]);
 
 	// Follow OS appearance only until the user picks a theme explicitly.
 	useEffect(() => {

@@ -186,13 +186,23 @@ func (r *Runtime) verifyControlServerDataDir(ctx context.Context) error {
 	return nil
 }
 
-// Create starts a new tmux session in the workspace, running the agent's
-// launch command with a keep-alive shell, and returns a handle to it.
-func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+// HandleFor returns the exact canonical tmux handle Create will use.
+func (r *Runtime) HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	id, err := tmuxSessionName(cfg.SessionID)
 	if err != nil {
 		return ports.RuntimeHandle{}, err
 	}
+	return ports.RuntimeHandle{ID: id}, nil
+}
+
+// Create starts a new tmux session in the workspace, running the agent's
+// launch command with a keep-alive shell, and returns a handle to it.
+func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+	handle, err := r.HandleFor(cfg)
+	if err != nil {
+		return ports.RuntimeHandle{}, err
+	}
+	id := handle.ID
 	if cfg.WorkspacePath == "" {
 		return ports.RuntimeHandle{}, errors.New("tmux runtime: workspace path is required")
 	}
@@ -223,7 +233,6 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 		return ports.RuntimeHandle{}, fmt.Errorf("tmux runtime: set mouse %s: %w", id, err)
 	}
 
-	handle := ports.RuntimeHandle{ID: id}
 	alive, err := r.IsAlive(ctx, handle)
 	if err != nil {
 		_ = r.Destroy(context.Background(), handle)

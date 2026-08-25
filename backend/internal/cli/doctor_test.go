@@ -150,6 +150,46 @@ func TestDoctorChecksHarnessVersions(t *testing.T) {
 	}
 }
 
+func TestDoctorSkipsDisabledHarness(t *testing.T) {
+	setConfigEnv(t)
+	t.Setenv("AO_DISABLED_AGENTS", "claude-code")
+	c := doctorContext(t, map[string]string{"git": "/bin/git"}, func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("git version 2.43.0\n"), nil
+	})
+
+	for _, check := range c.runDoctor(context.Background()) {
+		if check.Name == "claude-code" {
+			t.Fatalf("doctor reported disabled harness: %+v", check)
+		}
+	}
+}
+
+func TestDoctorSkipsCodexLaunchFlagsWhenCodexDisabled(t *testing.T) {
+	setConfigEnv(t)
+	t.Setenv("AO_AGENT", "claude-code")
+	t.Setenv("AO_DISABLED_AGENTS", "codex")
+	codexCalls := 0
+	c := doctorContext(t, map[string]string{"git": "/bin/git", "claude": "/bin/claude", "codex": "/bin/codex"}, func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "/bin/codex" {
+			codexCalls++
+		}
+		if len(args) == 1 && args[0] == "--version" {
+			return []byte("ok\n"), nil
+		}
+		return []byte("ok\n"), nil
+	})
+
+	checks := c.runDoctor(context.Background())
+	for _, check := range checks {
+		if check.Name == "codex" || check.Name == "codex-launch-flags" {
+			t.Fatalf("doctor reported disabled codex surface: %+v", check)
+		}
+	}
+	if codexCalls != 0 {
+		t.Fatalf("codex command calls = %d, want 0", codexCalls)
+	}
+}
+
 func TestDoctorWarnsWhenHarnessMissing(t *testing.T) {
 	setConfigEnv(t)
 	c := doctorContext(t, map[string]string{"git": "/bin/git"}, func(context.Context, string, ...string) ([]byte, error) {

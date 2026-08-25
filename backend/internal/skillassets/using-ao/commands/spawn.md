@@ -26,7 +26,8 @@ ao spawn [flags]
 
 `--agent` is an alias for `--harness`.
 
-Available harnesses: `claude-code`, `codex`, `aider`, `opencode`, `grok`, `droid`, `amp`, `agy`, `crush`, `cursor`, `qwen`, `copilot`, `goose`, `auggie`, `continue`, `devin`, `cline`, `kimi`, `kiro`, `kilocode`, `vibe`, `pi`, `autohand`.
+Run `ao agent ls` for the agents currently enabled by the daemon. The catalog is
+authoritative because an operator may temporarily disable a shipped adapter.
 
 `--model` and `--reasoning-effort` form one complete per-session route. AO rejects a partial pair before creating the session. AO validates the common effort vocabulary `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; each harness adapter may reject values its provider CLI does not support. AO passes the requested values to the provider without silently substituting a fallback.
 
@@ -45,5 +46,5 @@ ao spawn --project agent-orchestrator --issue 142 --name "fix-session-leak" \
 
 ```bash
 # Spawn a worker and immediately claim an open PR
-ao spawn --project agent-orchestrator --name "review-pr-88" --claim-pr 88 --harness claude-code
+ao spawn --project agent-orchestrator --name "review-pr-88" --claim-pr 88 --harness codex
 ```

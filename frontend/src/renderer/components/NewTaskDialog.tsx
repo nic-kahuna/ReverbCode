@@ -57,6 +57,9 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 	});
 	const defaultWorkerAgent = projectQuery.data?.config?.worker?.agent ?? "";
 	const agentCatalog = agentsQuery.data;
+	const supportedAgentIds = new Set(agentCatalog?.supported?.map((candidate) => candidate.id) ?? []);
+	const defaultWorkerUnavailable =
+		agentCatalog !== undefined && defaultWorkerAgent !== "" && !supportedAgentIds.has(defaultWorkerAgent);
 
 	useEffect(() => {
 		if (!open) {
@@ -72,9 +75,9 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 
 	useEffect(() => {
 		if (open && !agentTouched) {
-			setAgent(defaultWorkerAgent);
+			setAgent(defaultWorkerUnavailable ? "" : defaultWorkerAgent);
 		}
-	}, [open, agentTouched, defaultWorkerAgent]);
+	}, [open, agentTouched, defaultWorkerAgent, defaultWorkerUnavailable]);
 
 	const submit = async (event: FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
@@ -85,6 +88,10 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 		const cleanBranch = branch.trim();
 		if (!cleanTitle || !cleanPrompt) {
 			setError("Title and brief are required.");
+			return;
+		}
+		if (defaultWorkerUnavailable && !agent) {
+			setError("The project's default agent is unavailable. Select an available agent.");
 			return;
 		}
 
@@ -210,6 +217,18 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 							</div>
 						)}
 
+						{defaultWorkerUnavailable && !agent && !error && (
+							<div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-muted-foreground">
+								The project's default agent is unavailable. Select an available agent.
+							</div>
+						)}
+
+						{agentsQuery.isError && (
+							<div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+								{agentsQuery.error instanceof Error ? agentsQuery.error.message : "Could not load agent catalog."}
+							</div>
+						)}
+
 						{refreshAgentsMutation.isError && (
 							<div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
 								{refreshAgentsMutation.error instanceof Error
@@ -224,7 +243,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 									Cancel
 								</Button>
 							</Dialog.Close>
-							<Button type="submit" disabled={isSubmitting || !projectId}>
+							<Button type="submit" disabled={isSubmitting || !projectId || agentCatalog?.supported === undefined}>
 								{isSubmitting ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : null}
 								{isSubmitting ? "Starting..." : "Start task"}
 							</Button>

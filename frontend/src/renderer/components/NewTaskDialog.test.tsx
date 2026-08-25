@@ -40,7 +40,7 @@ function spawnBody() {
 }
 
 async function waitForAgentCatalog() {
-	await waitFor(() => expect(screen.getAllByText("Claude Code").length).toBeGreaterThan(0));
+	await waitFor(() => expect(screen.getAllByText("Codex").length).toBeGreaterThan(0));
 }
 
 beforeEach(() => {
@@ -49,17 +49,17 @@ beforeEach(() => {
 			return {
 				data: {
 					supported: [
-						{ id: "claude-code", label: "Claude Code" },
+						{ id: "codex", label: "Codex" },
 						{ id: "cursor", label: "Cursor" },
 						{ id: "kiro", label: "Kiro" },
 					],
 					installed: [
-						{ id: "claude-code", label: "Claude Code", authStatus: "authorized" },
+						{ id: "codex", label: "Codex", authStatus: "authorized" },
 						{ id: "cursor", label: "Cursor", authStatus: "authorized" },
 						{ id: "kiro", label: "Kiro", authStatus: "unknown" },
 					],
 					authorized: [
-						{ id: "claude-code", label: "Claude Code", authStatus: "authorized" },
+						{ id: "codex", label: "Codex", authStatus: "authorized" },
 						{ id: "cursor", label: "Cursor", authStatus: "authorized" },
 					],
 				},
@@ -67,7 +67,7 @@ beforeEach(() => {
 			};
 		}
 		return {
-			data: { status: "ok", project: { id: "proj-1", config: { worker: { agent: "claude-code" } } } },
+			data: { status: "ok", project: { id: "proj-1", config: { worker: { agent: "codex" } } } },
 			error: undefined,
 		};
 	});
@@ -131,6 +131,40 @@ describe("NewTaskDialog", () => {
 		expect(spawnBody().harness).toBe("cursor");
 	});
 
+	it("requires an explicit available agent when the saved project default is omitted from the catalog", async () => {
+		getMock.mockImplementation(async (path: string) => {
+			if (path === "/api/v1/agents") {
+				return {
+					data: {
+						supported: [{ id: "codex", label: "Codex" }],
+						installed: [{ id: "codex", label: "Codex", authStatus: "authorized" }],
+						authorized: [{ id: "codex", label: "Codex", authStatus: "authorized" }],
+					},
+					error: undefined,
+				};
+			}
+			return {
+				data: { status: "ok", project: { id: "proj-1", config: { worker: { agent: "claude-code" } } } },
+				error: undefined,
+			};
+		});
+		renderDialog();
+		const user = userEvent.setup();
+
+		expect(
+			await screen.findByText("The project's default agent is unavailable. Select an available agent."),
+		).toBeInTheDocument();
+		await user.click(screen.getByRole("combobox", { name: "Agent" }));
+		expect(screen.queryByRole("option", { name: /claude/i })).not.toBeInTheDocument();
+		await user.click(await screen.findByRole("option", { name: "Codex" }));
+		await user.type(screen.getByLabelText("Title"), "T");
+		await user.type(screen.getByLabelText("Brief"), "B");
+		await user.click(screen.getByRole("button", { name: "Start task" }));
+
+		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
+		expect(spawnBody().harness).toBe("codex");
+	});
+
 	it("allows selecting an installed agent with unknown auth", async () => {
 		renderDialog();
 		const user = userEvent.setup();
@@ -138,7 +172,7 @@ describe("NewTaskDialog", () => {
 
 		await user.click(screen.getByRole("combobox", { name: "Agent" }));
 		const options = await screen.findAllByRole("option");
-		expect(options.map((option) => option.textContent)).toEqual(["Claude Code", "Cursor", "KiroAuth unknown"]);
+		expect(options.map((option) => option.textContent)).toEqual(["Codex", "Cursor", "KiroAuth unknown"]);
 		expect(options[2]).not.toHaveAttribute("aria-disabled", "true");
 		await user.click(options[2]);
 
@@ -153,6 +187,7 @@ describe("NewTaskDialog", () => {
 	it("requires both title and brief", async () => {
 		renderDialog();
 		const user = userEvent.setup();
+		await waitForAgentCatalog();
 
 		await user.click(screen.getByRole("button", { name: "Start task" }));
 
