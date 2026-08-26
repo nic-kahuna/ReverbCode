@@ -394,7 +394,12 @@ describe("SessionInspector reviews tab", () => {
 		expect(onOpenReviewerTerminal).toHaveBeenCalledWith({ handleId: "reviewer-pane", harness: "codex" });
 	});
 
-	it("shows claude-code as the default reviewer before a run exists", async () => {
+	it.each([
+		["claude-code", "claude-code"],
+		["codex", "codex"],
+		["opencode", "opencode"],
+		["crush", "codex"],
+	] as const)("shows %s workers with %s as the default reviewer before a run exists", async (provider, reviewer) => {
 		getMock.mockImplementation(async (path: string) => {
 			if (path === "/api/v1/sessions/{sessionId}/reviews") {
 				return { data: { reviewerHandleId: "", reviews: [] } };
@@ -418,10 +423,24 @@ describe("SessionInspector reviews tab", () => {
 			return { data: undefined };
 		});
 
-		renderWithQuery(<SessionInspector session={sessionWithProvider([pr(3, "open")], "codex")} />);
+		renderWithQuery(<SessionInspector session={sessionWithProvider([pr(3, "open")], provider)} />);
 		await openReviewsTab();
 
-		expect(await screen.findByText("claude-code")).toBeInTheDocument();
+		expect(await screen.findByText(reviewer)).toBeInTheDocument();
+	});
+
+	it("prefers the latest run over the configured reviewer and worker default", async () => {
+		mockCommonGets([], "reviewer-pane", [
+			{
+				...reviewState(3, "up_to_date", "abc123"),
+				latestRun: { ...approvedReview, harness: "opencode" },
+			},
+		]);
+
+		renderWithQuery(<SessionInspector session={sessionWithProvider([pr(3, "open")], "claude-code")} />);
+		await openReviewsTab();
+
+		expect(await screen.findByText("opencode")).toBeInTheDocument();
 	});
 
 	it("shows eligible and up-to-date open PR review rows", async () => {

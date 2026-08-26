@@ -654,7 +654,7 @@ function ReviewPanel({
 	);
 	const openReviewStates = reviewStates.filter((reviewState) => openPRURLs.has(reviewState.prUrl));
 	const latest = openReviewStates.find((review) => review.latestRun)?.latestRun;
-	const harness = latest?.harness || config?.reviewers?.[0]?.harness || "claude-code";
+	const harness = latest?.harness || config?.reviewers?.[0]?.harness || defaultReviewerHarness(session.provider);
 	const terminalEnabled = Boolean(reviewerHandleId && onOpenTerminal);
 	const aggregateVerdict = sessionReviewVerdict(openReviewStates);
 	const reviewRunning = openReviewStates.some((reviewState) => reviewState.status === "running");
@@ -733,6 +733,10 @@ function ReviewPanel({
 			</div>
 		</div>
 	);
+}
+
+function defaultReviewerHarness(provider: WorkspaceSession["provider"]): string {
+	return provider === "claude-code" || provider === "codex" || provider === "opencode" ? provider : "codex";
 }
 
 function ReviewStateRow({ reviewState }: { reviewState: PRReviewState }) {

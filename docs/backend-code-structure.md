@@ -693,6 +693,7 @@ graph LR
     Settings --> DataDir[AO_DATA_DIR]
     Settings --> RunFile[AO_RUN_FILE]
     Settings --> Agent[AO_AGENT]
+    Settings --> DisabledAgents[AO_DISABLED_AGENTS]
 
 ```
 
@@ -703,7 +704,8 @@ graph LR
 - `AO_SHUTDOWN_TIMEOUT` — Graceful shutdown cap (default: 10s)
 - `AO_RUN_FILE` — PID/port handshake (default: ~/.ao/running.json)
 - `AO_DATA_DIR` — SQLite data directory (default: ~/.ao/data)
-- `AO_AGENT` — Compatibility agent adapter (default: claude-code)
+- `AO_AGENT` — Compatibility agent adapter (default: codex)
+- `AO_DISABLED_AGENTS` — Comma-separated agent ids blocked from process launch
 - `GITHUB_TOKEN` — GitHub authentication
 
 ---

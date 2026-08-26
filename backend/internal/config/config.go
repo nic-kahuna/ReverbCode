@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 const (
@@ -32,7 +34,7 @@ const (
 	// DefaultAgent is the compatibility value used when AO_AGENT is unset. The
 	// daemon validates it at startup, but worker/orchestrator spawns resolve from
 	// explicit requests or project role config instead of falling back to it.
-	DefaultAgent = "claude-code"
+	DefaultAgent = "codex"
 	// DefaultTelemetryPostHogHost is the default PostHog ingestion host when
 	// remote telemetry is enabled and AO_TELEMETRY_POSTHOG_HOST is unset.
 	DefaultTelemetryPostHogHost = "https://us.i.posthog.com"
@@ -89,6 +91,10 @@ type Config struct {
 	// Agent is the compatibility agent adapter id selected by AO_AGENT;
 	// startSession fails fast if no adapter with this id is registered.
 	Agent string
+	// DisabledAgents are supported agent ids that the daemon must not launch.
+	// The adapters and domain vocabulary remain registered so historical state
+	// stays readable and removing the env policy re-enables them.
+	DisabledAgents []domain.AgentHarness
 	// AllowedOrigins are the browser origins granted CORS read access (see
 	// DefaultAllowedOrigins). Overridden by AO_ALLOWED_ORIGINS.
 	AllowedOrigins []string
@@ -102,6 +108,11 @@ func (c Config) Addr() string {
 	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
 
+// AgentPolicy returns the daemon-wide launch policy resolved by Load.
+func (c Config) AgentPolicy() domain.AgentPolicy {
+	return domain.NewAgentPolicy(c.DisabledAgents)
+}
+
 // Load resolves configuration from the environment, applying defaults. It
 // returns an error only for values that are present but malformed (e.g. a
 // non-numeric AO_PORT); missing values fall back to defaults.
@@ -113,7 +124,8 @@ func (c Config) Addr() string {
 //	AO_SHUTDOWN_TIMEOUT  shutdown deadline   (Go duration > 0, default 10s)
 //	AO_RUN_FILE          running.json path   (default ~/.ao/running.json)
 //	AO_DATA_DIR          durable state dir   (default ~/.ao/data)
-//	AO_AGENT             compatibility agent id (default claude-code)
+//	AO_AGENT             compatibility agent id (default codex)
+//	AO_DISABLED_AGENTS   disabled agent ids, comma-separated (default empty)
 //	AO_ALLOWED_ORIGINS   CORS origins, comma-separated (default DefaultAllowedOrigins)
 //	AO_TELEMETRY_EVENTS  local event capture off|on (default off)
 //	AO_TELEMETRY_METRICS local metric capture off|on (default off)
@@ -164,7 +176,28 @@ func Load() (Config, error) {
 	}
 
 	if raw := os.Getenv("AO_AGENT"); raw != "" {
-		cfg.Agent = raw
+		cfg.Agent = strings.TrimSpace(raw)
+	}
+
+	if raw := os.Getenv("AO_DISABLED_AGENTS"); raw != "" {
+		seen := make(map[domain.AgentHarness]struct{})
+		for _, value := range strings.Split(raw, ",") {
+			harness := domain.AgentHarness(strings.TrimSpace(value))
+			if harness == "" {
+				return Config{}, fmt.Errorf("invalid AO_DISABLED_AGENTS entry %q: agent id is empty", value)
+			}
+			if !harness.IsKnown() {
+				return Config{}, fmt.Errorf("invalid AO_DISABLED_AGENTS entry %q: unknown agent", harness)
+			}
+			if _, duplicate := seen[harness]; duplicate {
+				return Config{}, fmt.Errorf("invalid AO_DISABLED_AGENTS entry %q: duplicate agent", harness)
+			}
+			seen[harness] = struct{}{}
+			cfg.DisabledAgents = append(cfg.DisabledAgents, harness)
+		}
+	}
+	if cfg.AgentPolicy().IsDisabled(cfg.Agent) {
+		return Config{}, fmt.Errorf("AO_AGENT %q is disabled by AO_DISABLED_AGENTS", cfg.Agent)
 	}
 
 	if raw, ok := os.LookupEnv("AO_ALLOWED_ORIGINS"); ok && raw != "" {

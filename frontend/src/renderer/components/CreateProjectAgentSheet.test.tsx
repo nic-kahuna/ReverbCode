@@ -9,16 +9,16 @@ function renderSheet(onSubmit = vi.fn().mockResolvedValue(undefined)) {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	queryClient.setQueryData(agentsQueryKey, {
 		supported: [
-			{ id: "claude-code", label: "claude-code" },
 			{ id: "codex", label: "codex" },
+			{ id: "opencode", label: "opencode" },
 		],
 		installed: [
-			{ id: "claude-code", label: "claude-code", authStatus: "authorized" },
 			{ id: "codex", label: "codex", authStatus: "authorized" },
+			{ id: "opencode", label: "opencode", authStatus: "authorized" },
 		],
 		authorized: [
-			{ id: "claude-code", label: "claude-code", authStatus: "authorized" },
 			{ id: "codex", label: "codex", authStatus: "authorized" },
+			{ id: "opencode", label: "opencode", authStatus: "authorized" },
 		],
 	});
 	render(
@@ -50,6 +50,7 @@ describe("CreateProjectAgentSheet", () => {
 				onChange={() => undefined}
 				placeholder="Project default"
 				value="claude-code"
+				supported={[{ id: "codex", label: "Codex" }]}
 			/>,
 		);
 
@@ -58,7 +59,16 @@ describe("CreateProjectAgentSheet", () => {
 
 	it("caps the agent menu height with a theme token", async () => {
 		render(
-			<RequiredAgentField id="agent" label="Agent" onChange={() => undefined} placeholder="Project default" value="" />,
+			<RequiredAgentField
+				id="agent"
+				label="Agent"
+				onChange={() => undefined}
+				placeholder="Project default"
+				value=""
+				supported={[{ id: "codex", label: "Codex" }]}
+				installed={[{ id: "codex", label: "Codex", authStatus: "authorized" }]}
+				authorized={[{ id: "codex", label: "Codex", authStatus: "authorized" }]}
+			/>,
 		);
 
 		await userEvent.click(screen.getByLabelText("Agent"));
@@ -66,25 +76,46 @@ describe("CreateProjectAgentSheet", () => {
 		expect(await screen.findByRole("listbox")).toHaveClass("max-h-select-menu-max!");
 	});
 
+	it("does not fabricate selectable agents when the catalog omits them", async () => {
+		render(
+			<RequiredAgentField
+				id="agent"
+				label="Agent"
+				onChange={() => undefined}
+				placeholder="Project default"
+				value="claude-code"
+				supported={[{ id: "codex", label: "Codex" }]}
+				installed={[{ id: "codex", label: "Codex", authStatus: "authorized" }]}
+				authorized={[{ id: "codex", label: "Codex", authStatus: "authorized" }]}
+			/>,
+		);
+
+		expect(screen.getByRole("combobox", { name: "Agent" })).toHaveTextContent("Project default");
+		await userEvent.click(screen.getByRole("combobox", { name: "Agent" }));
+
+		expect(await screen.findByRole("option", { name: "Codex" })).toBeInTheDocument();
+		expect(screen.queryByRole("option", { name: /claude/i })).not.toBeInTheDocument();
+	});
+
 	it("creates without intake when the toggle is left off", async () => {
 		const onSubmit = renderSheet();
-		await chooseOption(screen.getByLabelText("Worker agent"), "claude-code");
-		await chooseOption(screen.getByLabelText("Orchestrator agent"), "codex");
+		await chooseOption(screen.getByLabelText("Worker agent"), "codex");
+		await chooseOption(screen.getByLabelText("Orchestrator agent"), "opencode");
 
 		await userEvent.click(screen.getByRole("button", { name: "Create and start" }));
 
 		await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
 		expect(onSubmit).toHaveBeenCalledWith({
-			workerAgent: "claude-code",
-			orchestratorAgent: "codex",
+			workerAgent: "codex",
+			orchestratorAgent: "opencode",
 			trackerIntake: undefined,
 		});
 	});
 
 	it("blocks submit when intake is enabled with no assignee, then passes the intake payload once one is set", async () => {
 		const onSubmit = renderSheet();
-		await chooseOption(screen.getByLabelText("Worker agent"), "claude-code");
-		await chooseOption(screen.getByLabelText("Orchestrator agent"), "codex");
+		await chooseOption(screen.getByLabelText("Worker agent"), "codex");
+		await chooseOption(screen.getByLabelText("Orchestrator agent"), "opencode");
 
 		await userEvent.click(screen.getByLabelText("Enable issue intake"));
 		// Enabled with no eligibility rule → submit stays disabled (compact sheet
@@ -96,8 +127,8 @@ describe("CreateProjectAgentSheet", () => {
 
 		await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
 		expect(onSubmit).toHaveBeenCalledWith({
-			workerAgent: "claude-code",
-			orchestratorAgent: "codex",
+			workerAgent: "codex",
+			orchestratorAgent: "opencode",
 			trackerIntake: { enabled: true, provider: "github", assignee: "octocat" },
 		});
 	});

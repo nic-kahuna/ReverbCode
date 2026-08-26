@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -83,7 +84,7 @@ func TestWiring_WriteFlowsToBroadcaster(t *testing.T) {
 // matching registered adapter, while empty and unknown harnesses miss.
 func TestWiring_AgentResolverResolvesRealAdapters(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	resolver, err := buildAgentResolver("", log) // empty default → claude-code
+	resolver, err := buildAgentResolver("", domain.AgentPolicy{}, log) // empty default → codex
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +133,14 @@ func TestWiring_AgentResolverResolvesRealAdapters(t *testing.T) {
 	}
 	if _, ok := resolver.Agent(""); ok {
 		t.Fatal("empty harness resolved to an agent; want a miss")
+	}
+}
+
+func TestWiring_AgentResolverRejectsDisabledDefault(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	policy := domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+	if _, err := buildAgentResolver("claude-code", policy, log); err == nil {
+		t.Fatal("buildAgentResolver accepted a disabled default agent")
 	}
 }
 
@@ -443,6 +452,16 @@ type fakeSessionLifecycle struct {
 	restoreErr       error
 }
 
+type fakeReviewerLifecycle struct {
+	reconcileCalled bool
+	reconcileErr    error
+}
+
+func (f *fakeReviewerLifecycle) ReconcileDisabled(context.Context) error {
+	f.reconcileCalled = true
+	return f.reconcileErr
+}
+
 func (f *fakeSessionLifecycle) Reconcile(_ context.Context) error {
 	f.reconcileCalled = true
 	return f.reconcileErr
@@ -480,5 +499,42 @@ func TestWiring_SessionLifecycleInterfaceInvokedByDaemon(t *testing.T) {
 	}
 	if !fake.restoreAllCalled {
 		t.Fatal("RestoreAll was not called through the interface")
+	}
+}
+
+func TestReconcileAgentsOnBootReviewerFailureIsFatal(t *testing.T) {
+	reviews := &fakeReviewerLifecycle{reconcileErr: errors.New("reviewer still alive")}
+	sessions := &fakeSessionLifecycle{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if err := reconcileAgentsOnBoot(context.Background(), reviews, sessions, log); err == nil {
+		t.Fatal("expected disabled reviewer reconciliation failure")
+	}
+	if !reviews.reconcileCalled {
+		t.Fatal("disabled reviewers were not reconciled")
+	}
+	if sessions.reconcileCalled {
+		t.Fatal("session reconciliation should not run after reviewer retirement failed")
+	}
+}
+
+func TestReconcileAgentsOnBootDisabledSessionFailureIsFatal(t *testing.T) {
+	reviews := &fakeReviewerLifecycle{}
+	sessions := &fakeSessionLifecycle{reconcileErr: fmt.Errorf("wrapped: %w", sessionmanager.ErrDisabledAgentRetirement)}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	err := reconcileAgentsOnBoot(context.Background(), reviews, sessions, log)
+	if !errors.Is(err, sessionmanager.ErrDisabledAgentRetirement) {
+		t.Fatalf("error = %v, want ErrDisabledAgentRetirement", err)
+	}
+}
+
+func TestReconcileAgentsOnBootEnabledSessionFailureRemainsBestEffort(t *testing.T) {
+	reviews := &fakeReviewerLifecycle{}
+	sessions := &fakeSessionLifecycle{reconcileErr: errors.New("transient probe failed")}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if err := reconcileAgentsOnBoot(context.Background(), reviews, sessions, log); err != nil {
+		t.Fatalf("ordinary session reconciliation error = %v, want best-effort nil", err)
 	}
 }

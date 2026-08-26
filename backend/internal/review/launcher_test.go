@@ -65,11 +65,27 @@ func (f fakeReviewerResolver) Reviewer(domain.ReviewerHarness) (ports.Reviewer, 
 
 type fakeRuntime struct {
 	createCfg  ports.RuntimeConfig
+	handleCfg  ports.RuntimeConfig
+	handleID   string
+	handleErr  error
 	sentMsg    string
 	sentTo     string
 	alive      bool
 	interrupt  string
 	interrupts int
+	destroyed  string
+	keepAlive  bool
+}
+
+func (f *fakeRuntime) HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+	f.handleCfg = cfg
+	if f.handleErr != nil {
+		return ports.RuntimeHandle{}, f.handleErr
+	}
+	if f.handleID != "" {
+		return ports.RuntimeHandle{ID: f.handleID}, nil
+	}
+	return ports.RuntimeHandle{ID: string(cfg.SessionID)}, nil
 }
 
 func (f *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
@@ -78,6 +94,13 @@ func (f *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.
 }
 func (f *fakeRuntime) IsAlive(_ context.Context, _ ports.RuntimeHandle) (bool, error) {
 	return f.alive, nil
+}
+func (f *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) error {
+	f.destroyed = handle.ID
+	if !f.keepAlive {
+		f.alive = false
+	}
+	return nil
 }
 func (f *fakeRuntime) Interrupt(_ context.Context, handle ports.RuntimeHandle) error {
 	f.interrupt = handle.ID
@@ -118,6 +141,22 @@ func TestLauncherSpawnReturnsStableHandle(t *testing.T) {
 	}
 	if reviewer.gotInv.RunID != "run-1" || reviewer.gotInv.TargetSHA != "sha1" || reviewer.gotInv.ReviewerID != "review-mer-1" {
 		t.Fatalf("invocation = %+v", reviewer.gotInv)
+	}
+}
+
+func TestHandleForUsesRuntimeCanonicalReviewerHandle(t *testing.T) {
+	rt := &fakeRuntime{handleID: "ao-runtime-review-mer-1"}
+	l := NewLauncher(fakeReviewerResolver{}, rt)
+
+	handle, err := l.HandleFor("mer-1")
+	if err != nil {
+		t.Fatalf("HandleFor: %v", err)
+	}
+	if handle != "ao-runtime-review-mer-1" {
+		t.Fatalf("handle = %q, want runtime canonical handle", handle)
+	}
+	if rt.handleCfg.SessionID != "review-mer-1" {
+		t.Fatalf("runtime logical session id = %q, want review-mer-1", rt.handleCfg.SessionID)
 	}
 }
 
@@ -187,6 +226,28 @@ func TestLauncherCancelRequiresReviewerSupport(t *testing.T) {
 
 	if err := l.Cancel(context.Background(), "review-mer-1", domain.ReviewerClaudeCode); err == nil || !strings.Contains(err.Error(), "does not support cancellation") {
 		t.Fatalf("err = %v, want unsupported cancellation", err)
+	}
+}
+
+func TestLauncherStopDestroysReviewerRuntime(t *testing.T) {
+	rt := &fakeRuntime{alive: true}
+	l := NewLauncher(fakeReviewerResolver{}, rt)
+
+	if err := l.Stop(context.Background(), "review-mer-1"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if rt.destroyed != "review-mer-1" {
+		t.Fatalf("destroyed handle = %q, want review-mer-1", rt.destroyed)
+	}
+}
+
+func TestLauncherStopFailsWhenReviewerRuntimeRemainsAlive(t *testing.T) {
+	rt := &fakeRuntime{alive: true, keepAlive: true}
+	l := NewLauncher(fakeReviewerResolver{}, rt)
+
+	err := l.Stop(context.Background(), "review-mer-1")
+	if err == nil || !strings.Contains(err.Error(), "remains alive") {
+		t.Fatalf("Stop error = %v, want remains alive", err)
 	}
 }
 

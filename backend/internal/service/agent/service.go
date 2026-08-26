@@ -8,6 +8,7 @@ import (
 	"time"
 
 	agentregistry "github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/registry"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -62,6 +63,20 @@ type Service struct {
 // adapter registry.
 func New() *Service {
 	return NewWithAgents(agentregistry.Harnessed())
+}
+
+// NewWithPolicy returns the shipped inventory with disabled agents omitted.
+// The underlying adapter registry remains complete for historical decoding and
+// reversible re-enablement; only operator-facing availability is filtered.
+func NewWithPolicy(policy domain.AgentPolicy) *Service {
+	agents := agentregistry.Harnessed()
+	enabled := make([]agentregistry.HarnessAgent, 0, len(agents))
+	for _, item := range agents {
+		if !policy.IsDisabled(string(item.Harness)) {
+			enabled = append(enabled, item)
+		}
+	}
+	return NewWithAgents(enabled)
 }
 
 // NewWithAgents returns an inventory service over a caller-provided adapter

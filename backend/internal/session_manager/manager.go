@@ -35,6 +35,13 @@ var (
 	// adapter. The API maps it to a 400 so a typo'd `--harness` is a validation
 	// error, not an opaque 500.
 	ErrUnknownHarness = errors.New("session: unknown agent harness")
+	// ErrAgentDisabled means the harness remains a known, readable adapter but
+	// daemon policy forbids launching a process for it.
+	ErrAgentDisabled = errors.New("session: agent disabled by policy")
+	// ErrDisabledAgentRetirement means boot reconciliation could not prove that
+	// every runtime belonging to a disabled harness was stopped. The daemon must
+	// not become ready while this error is present.
+	ErrDisabledAgentRetirement = errors.New("session: disabled agent retirement incomplete")
 	// ErrMissingHarness means neither the spawn request nor the project's role
 	// config selected an agent. Worker/orchestrator spawns must be explicit.
 	ErrMissingHarness = errors.New("session: agent harness required")
@@ -77,6 +84,7 @@ type lifecycleRecorder interface {
 }
 
 type runtimeController interface {
+	HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error)
 	Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error)
 	Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 	GetOutput(ctx context.Context, handle ports.RuntimeHandle, lines int) (string, error)
@@ -122,6 +130,7 @@ type Store interface {
 type Manager struct {
 	runtime   runtimeController
 	agents    ports.AgentResolver
+	policy    domain.AgentPolicy
 	workspace ports.Workspace
 	store     Store
 	// messenger is a sessionguard.Guard wrapping the raw messenger, so every
@@ -177,6 +186,7 @@ const (
 type Deps struct {
 	Runtime   runtimeController
 	Agents    ports.AgentResolver
+	Policy    domain.AgentPolicy
 	Workspace ports.Workspace
 	Store     Store
 	Messenger ports.AgentMessenger
@@ -204,6 +214,7 @@ func New(d Deps) *Manager {
 	m := &Manager{
 		runtime:    d.Runtime,
 		agents:     d.Agents,
+		policy:     d.Policy,
 		workspace:  d.Workspace,
 		store:      d.Store,
 		lcm:        d.Lifecycle,
@@ -244,24 +255,11 @@ func New(d Deps) *Manager {
 // materialization fails the still-seed row is deleted outright; a later failure
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error) {
-	if cfg.Route != nil {
-		if err := cfg.Route.Validate(); err != nil {
-			return domain.SessionRecord{}, fmt.Errorf("spawn: invalid route: %w", err)
-		}
-		if cfg.Harness != "" && cfg.Harness != cfg.Route.Harness {
-			return domain.SessionRecord{}, fmt.Errorf("spawn: harness %q conflicts with route harness %q", cfg.Harness, cfg.Route.Harness)
-		}
-		cfg.Harness = cfg.Route.Harness
-	}
-	project, err := m.loadProject(ctx, cfg.ProjectID)
+	var project domain.ProjectRecord
+	var err error
+	cfg, project, err = m.resolveSpawnAgentPolicy(ctx, cfg)
 	if err != nil {
-		return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
-	}
-	// A per-project role override picks the harness when the spawn names none,
-	// so a project can default workers to one agent and orchestrators to another.
-	cfg.Harness = effectiveHarness(cfg.Harness, cfg.Kind, project.Config)
-	if cfg.Harness == "" {
-		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: configure project %s.agent or pass --harness", ErrMissingHarness, roleConfigName(cfg.Kind))
+		return domain.SessionRecord{}, err
 	}
 
 	// Reject an unknown harness before any durable state is created. Doing this
@@ -371,34 +369,119 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		m.rollbackSpawnSeedRow(ctx, id)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
 	}
-	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
+	runtimeCfg := ports.RuntimeConfig{
 		SessionID:     id,
 		WorkspacePath: ws.Path,
 		Argv:          argv,
 		Env:           m.runtimeEnv(id, cfg.ProjectID, cfg.IssueID, project.Config.Env),
-	})
+	}
+	expectedHandle, err := m.runtime.HandleFor(runtimeCfg)
 	if err != nil {
+		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
+		m.rollbackSpawnSeedRow(ctx, id)
+		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime handle: %w", id, err)
+	}
+	metadata := domain.SessionMetadata{Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: expectedHandle.ID, Prompt: prompt}
+	handle, err := m.runtime.Create(ctx, runtimeCfg)
+	if err != nil {
+		if teardownErr := m.stopRuntimeStrict(ctx, expectedHandle); teardownErr != nil {
+			debtErr := m.preserveSpawnRecoveryDebt(ctx, id, metadata, ws, workspaceProject)
+			failure := errors.Join(err, fmt.Errorf("runtime teardown incomplete: %w", teardownErr))
+			if debtErr != nil {
+				failure = errors.Join(failure, fmt.Errorf("preserve recovery debt: %w", debtErr))
+			}
+			return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime: %w", id, failure)
+		}
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
 		m.rollbackSpawnSeedRow(ctx, id)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime: %w", id, err)
 	}
-
-	metadata := domain.SessionMetadata{Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, Prompt: prompt}
-	if err := m.lcm.MarkSpawned(ctx, id, metadata); err != nil {
-		_ = m.runtime.Destroy(ctx, handle)
+	if handle.ID != expectedHandle.ID {
+		teardownErr := m.stopRuntimeStrict(ctx, handle)
+		if teardownErr != nil {
+			metadata.RuntimeHandleID = handle.ID
+			debtErr := m.preserveSpawnRecoveryDebt(ctx, id, metadata, ws, workspaceProject)
+			failure := fmt.Errorf("runtime returned non-canonical handle %q (want %q); runtime teardown incomplete: %w", handle.ID, expectedHandle.ID, teardownErr)
+			if debtErr != nil {
+				failure = errors.Join(failure, fmt.Errorf("preserve recovery debt: %w", debtErr))
+			}
+			return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, failure)
+		}
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.markSpawnFailedTerminated(ctx, id)
+		m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
+		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime returned non-canonical handle %q (want %q)", id, handle.ID, expectedHandle.ID)
+	}
+
+	if err := m.lcm.MarkSpawned(ctx, id, metadata); err != nil {
+		teardownErr := m.stopRuntimeStrict(ctx, handle)
+		if teardownErr != nil {
+			debtErr := m.preserveSpawnRecoveryDebt(ctx, id, metadata, ws, workspaceProject)
+			failure := errors.Join(err, fmt.Errorf("runtime teardown incomplete: %w", teardownErr))
+			if debtErr != nil {
+				failure = errors.Join(failure, fmt.Errorf("preserve recovery debt: %w", debtErr))
+			}
+			return domain.SessionRecord{}, fmt.Errorf("spawn %s: completed: %w", id, failure)
+		}
+		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
+		m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: completed: %w", id, err)
 	}
 	if delivery == ports.PromptDeliveryAfterStart && prompt != "" {
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, id, prompt); err != nil {
-			_ = m.runtime.Destroy(ctx, handle)
+			teardownErr := m.stopRuntimeStrict(ctx, handle)
+			if teardownErr != nil {
+				debtErr := m.preserveSpawnRecoveryDebt(ctx, id, metadata, ws, workspaceProject)
+				failure := errors.Join(err, fmt.Errorf("runtime teardown incomplete: %w", teardownErr))
+				if debtErr != nil {
+					failure = errors.Join(failure, fmt.Errorf("preserve recovery debt: %w", debtErr))
+				}
+				return domain.SessionRecord{}, fmt.Errorf("spawn %s: deliver prompt: %w", id, failure)
+			}
 			m.destroySpawnWorkspace(ctx, ws, workspaceProject)
 			m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
 			return domain.SessionRecord{}, fmt.Errorf("spawn %s: deliver prompt: %w", id, err)
 		}
 	}
 	return m.getRecord(ctx, id)
+}
+
+// ResolveSpawnAgentPolicy resolves and returns the effective harness for a
+// prospective spawn without creating durable state. Callers that must perform
+// destructive replacement work before Spawn pass the returned config into
+// Spawn, binding the replacement to the exact policy-checked harness even if
+// mutable project config changes between preflight and launch.
+func (m *Manager) ResolveSpawnAgentPolicy(ctx context.Context, cfg ports.SpawnConfig) (ports.SpawnConfig, error) {
+	resolved, _, err := m.resolveSpawnAgentPolicy(ctx, cfg)
+	return resolved, err
+}
+
+// resolveSpawnAgentPolicy performs only the selection and policy portion of
+// spawn validation. It is side-effect free; all adapter, runtime, workspace,
+// and persistence work remains in Spawn.
+func (m *Manager) resolveSpawnAgentPolicy(ctx context.Context, cfg ports.SpawnConfig) (ports.SpawnConfig, domain.ProjectRecord, error) {
+	if cfg.Route != nil {
+		if err := cfg.Route.Validate(); err != nil {
+			return ports.SpawnConfig{}, domain.ProjectRecord{}, fmt.Errorf("spawn: invalid route: %w", err)
+		}
+		if cfg.Harness != "" && cfg.Harness != cfg.Route.Harness {
+			return ports.SpawnConfig{}, domain.ProjectRecord{}, fmt.Errorf("spawn: harness %q conflicts with route harness %q", cfg.Harness, cfg.Route.Harness)
+		}
+		cfg.Harness = cfg.Route.Harness
+	}
+	project, err := m.loadProject(ctx, cfg.ProjectID)
+	if err != nil {
+		return ports.SpawnConfig{}, domain.ProjectRecord{}, fmt.Errorf("spawn: %w", err)
+	}
+	// A per-project role override picks the harness when the spawn names none,
+	// so a project can default workers to one agent and orchestrators to another.
+	cfg.Harness = effectiveHarness(cfg.Harness, cfg.Kind, project.Config)
+	if cfg.Harness == "" {
+		return ports.SpawnConfig{}, domain.ProjectRecord{}, fmt.Errorf("spawn: %w: configure project %s.agent or pass --harness", ErrMissingHarness, roleConfigName(cfg.Kind))
+	}
+	if m.policy.IsDisabled(string(cfg.Harness)) {
+		return ports.SpawnConfig{}, domain.ProjectRecord{}, fmt.Errorf("spawn: %w: %q", ErrAgentDisabled, cfg.Harness)
+	}
+	return cfg, project, nil
 }
 
 // loadProject loads the project record so spawn can resolve its per-project
@@ -579,6 +662,63 @@ func (m *Manager) markSpawnFailedTerminatedWithoutWorkspace(ctx context.Context,
 	rec.Metadata.RuntimeHandleID = ""
 	rec.Metadata.AgentSessionID = ""
 	_ = m.store.UpdateSession(ctx, rec)
+}
+
+// preserveSpawnRecoveryDebt records every resource identity needed to recover
+// a failed spawn whose runtime could not be proven absent. The workspace and
+// its markers deliberately remain intact: reconciliation can first reap the
+// exact runtime handle and then restore (or leave disabled) the terminal
+// session without losing reviewable work.
+func (m *Manager) preserveSpawnRecoveryDebt(ctx context.Context, id domain.SessionID, metadata domain.SessionMetadata, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo) error {
+	var failures []error
+
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		failures = append(failures, fmt.Errorf("load session metadata: %w", err))
+	} else if !ok {
+		failures = append(failures, errors.New("session row missing"))
+	} else {
+		if metadata.RequestedRoute == nil {
+			metadata.RequestedRoute = rec.Metadata.RequestedRoute
+		}
+		if metadata.LaunchRoute == nil {
+			metadata.LaunchRoute = rec.Metadata.LaunchRoute
+		}
+		rec.Metadata = metadata
+		if err := m.store.UpdateSession(ctx, rec); err != nil {
+			failures = append(failures, fmt.Errorf("persist session metadata: %w", err))
+		}
+	}
+
+	if workspaceProject == nil {
+		if err := m.store.UpsertSessionWorktree(ctx, domain.SessionWorktreeRecord{
+			SessionID:    id,
+			RepoName:     domain.RootWorkspaceRepoName,
+			Branch:       ws.Branch,
+			WorktreePath: ws.Path,
+			State:        "removed",
+		}); err != nil {
+			failures = append(failures, fmt.Errorf("persist workspace recovery marker: %w", err))
+		}
+	} else {
+		for _, worktree := range workspaceProject.Worktrees {
+			if err := m.store.UpsertSessionWorktree(ctx, domain.SessionWorktreeRecord{
+				SessionID:    id,
+				RepoName:     worktree.RepoName,
+				Branch:       worktree.Branch,
+				BaseSHA:      worktree.BaseSHA,
+				WorktreePath: worktree.Path,
+				State:        "removed",
+			}); err != nil {
+				failures = append(failures, fmt.Errorf("persist workspace recovery marker %q: %w", worktree.RepoName, err))
+			}
+		}
+	}
+
+	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
+		failures = append(failures, fmt.Errorf("mark terminal recovery debt: %w", err))
+	}
+	return errors.Join(failures...)
 }
 
 // rollbackSpawnSeedRow best-effort removes the row of a spawn that failed
@@ -804,6 +944,9 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if !rec.IsTerminated {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 	}
+	if m.policy.IsDisabled(string(rec.Harness)) {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: %q", id, ErrAgentDisabled, rec.Harness)
+	}
 	meta := rec.Metadata
 	// Mirror Kill's incomplete-handle guard: a session whose spawn failed before
 	// the workspace landed has neither WorkspacePath nor Branch, and there is
@@ -830,6 +973,9 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 }
 
 func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord, ws ports.WorkspaceInfo) (domain.SessionRecord, error) {
+	if m.policy.IsDisabled(string(rec.Harness)) {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: %q", rec.ID, ErrAgentDisabled, rec.Harness)
+	}
 	agent, ok := m.agents.Agent(rec.Harness)
 	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: no agent adapter for harness %q", rec.ID, rec.Harness)
@@ -1033,12 +1179,59 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 	return nil
 }
 
+// reconcileDisabled retires a live session whose harness is now disabled. A
+// complete workspace takes the normal capture-before-destroy path. If capture
+// fails, the runtime is still stopped and the record is terminated, but the
+// on-disk workspace is deliberately left untouched for manual recovery.
+func (m *Manager) reconcileDisabled(ctx context.Context, rec domain.SessionRecord) error {
+	if rec.Metadata.WorkspacePath != "" && rec.Metadata.Branch != "" {
+		saveErr := m.saveAndTeardownOne(ctx, rec, true)
+		if saveErr == nil {
+			// saveAndTeardownOne keeps runtime destruction best-effort for normal
+			// shutdown. A disabled-agent boundary is stricter: repeat the
+			// idempotent destroy and surface failure so AO never silently adopts a
+			// process whose policy now forbids it.
+			handle, handleErr := m.recoveryRuntimeHandle(rec)
+			if handleErr != nil {
+				return fmt.Errorf("reconcile disabled %s: derive runtime handle: %w", rec.ID, handleErr)
+			}
+			if handle.ID != "" {
+				if err := m.runtime.Destroy(ctx, handle); err != nil {
+					return fmt.Errorf("reconcile disabled %s: confirm runtime destroyed: %w", rec.ID, err)
+				}
+			}
+			return nil
+		}
+		m.logger.Warn("reconcile: disabled session preservation failed; leaving workspace in place", "sessionID", rec.ID, "error", saveErr)
+	}
+	handle, err := m.recoveryRuntimeHandle(rec)
+	if err != nil {
+		return fmt.Errorf("reconcile disabled %s: derive runtime handle: %w", rec.ID, err)
+	}
+	if handle.ID != "" {
+		if err := m.runtime.Destroy(ctx, handle); err != nil {
+			return fmt.Errorf("reconcile disabled %s: destroy runtime: %w", rec.ID, err)
+		}
+	}
+	if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+		return fmt.Errorf("reconcile disabled %s: mark terminated: %w", rec.ID, err)
+	}
+	return nil
+}
+
 // reconcileReap kills the leaked tmux session of a session the DB already marks
 // terminated. This covers the teardown that marked the row terminated but failed
 // to kill the runtime (e.g. ForceDestroy/Destroy errored after MarkTerminated).
 // Destroy is idempotent, so an already-gone session is a no-op.
 func (m *Manager) reconcileReap(ctx context.Context, rec domain.SessionRecord) error {
 	handle := runtimeHandle(rec.Metadata)
+	if handle.ID == "" {
+		var err error
+		handle, err = m.recoveryRuntimeHandle(rec)
+		if err != nil {
+			return fmt.Errorf("reconcile reap %s: derive runtime handle: %w", rec.ID, err)
+		}
+	}
 	if handle.ID == "" {
 		return nil
 	}
@@ -1066,20 +1259,41 @@ func (m *Manager) reconcileReap(ctx context.Context, rec domain.SessionRecord) e
 //     collide with a leaked tmux of the same name.
 //  3. Restore pass: relaunch shutdown-saved sessions (existing RestoreAll).
 //
-// Best-effort throughout: a per-session failure is logged and never aborts the
-// pass or blocks boot.
+// Enabled-session recovery remains best-effort. Disabled-session retirement is
+// fail-closed: reconciliation returns ErrDisabledAgentRetirement unless every
+// disabled record is terminal and its persisted runtime handle is confirmed
+// absent. The daemon treats that sentinel as fatal before serving requests.
 func (m *Manager) Reconcile(ctx context.Context) error {
 	recs, err := m.store.ListAllSessions(ctx)
 	if err != nil {
+		if m.policy.HasDisabledAgents() {
+			return fmt.Errorf("%w: initial session inventory: %w", ErrDisabledAgentRetirement, err)
+		}
 		return fmt.Errorf("reconcile: list sessions: %w", err)
 	}
 	for _, rec := range recs {
 		if rec.IsTerminated {
 			continue
 		}
+		if m.policy.IsDisabled(string(rec.Harness)) {
+			if err := m.reconcileDisabled(ctx, rec); err != nil {
+				m.logger.Error("reconcile: disabled session retirement failed", "sessionID", rec.ID, "error", err)
+			}
+			continue
+		}
 		if err := m.reconcileLive(ctx, rec); err != nil {
 			m.logger.Error("reconcile: live pass failed, skipping", "sessionID", rec.ID, "error", err)
 		}
+	}
+	// Refresh after the live pass. A disabled or dead session may have become
+	// terminal above; using the original snapshot would skip its leaked runtime
+	// during the reap pass.
+	recs, err = m.store.ListAllSessions(ctx)
+	if err != nil {
+		if m.policy.HasDisabledAgents() {
+			return fmt.Errorf("%w: refresh session inventory before reap: %w", ErrDisabledAgentRetirement, err)
+		}
+		return fmt.Errorf("reconcile: refresh sessions before reap: %w", err)
 	}
 	for _, rec := range recs {
 		if !rec.IsTerminated {
@@ -1089,7 +1303,80 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			m.logger.Error("reconcile: reap pass failed, skipping", "sessionID", rec.ID, "error", err)
 		}
 	}
+	if err := m.verifyDisabledSessionsStopped(ctx); err != nil {
+		return err
+	}
 	return m.RestoreAll(ctx)
+}
+
+// verifyDisabledSessionsStopped is the readiness boundary for an active
+// disabled-agent policy. A successful Destroy call is not enough evidence when
+// reconciliation encountered other errors; re-read durable state and probe the
+// persisted runtime handle so boot cannot silently continue with a disabled
+// agent process still alive.
+func (m *Manager) verifyDisabledSessionsStopped(ctx context.Context) error {
+	if !m.policy.HasDisabledAgents() {
+		return nil
+	}
+	recs, err := m.store.ListAllSessions(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: list sessions: %w", ErrDisabledAgentRetirement, err)
+	}
+	var failures []error
+	for _, rec := range recs {
+		if !m.policy.IsDisabled(string(rec.Harness)) {
+			continue
+		}
+		if !rec.IsTerminated {
+			failures = append(failures, fmt.Errorf("session %s remains non-terminal", rec.ID))
+		}
+		handle, handleErr := m.recoveryRuntimeHandle(rec)
+		if handleErr != nil {
+			failures = append(failures, fmt.Errorf("session %s derive runtime handle: %w", rec.ID, handleErr))
+			continue
+		}
+		if handle.ID == "" {
+			continue
+		}
+		alive, probeErr := m.runtime.IsAlive(ctx, handle)
+		if probeErr != nil {
+			failures = append(failures, fmt.Errorf("session %s runtime probe: %w", rec.ID, probeErr))
+			continue
+		}
+		if alive {
+			failures = append(failures, fmt.Errorf("session %s runtime %s remains alive", rec.ID, handle.ID))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%w: %w", ErrDisabledAgentRetirement, errors.Join(failures...))
+	}
+	return nil
+}
+
+// recoveryRuntimeHandle uses the durable handle when present and otherwise
+// asks the runtime to reproduce its canonical handle from the durable session
+// ID. The fallback covers failures before MarkSpawned can bind metadata.
+func (m *Manager) recoveryRuntimeHandle(rec domain.SessionRecord) (ports.RuntimeHandle, error) {
+	handle := runtimeHandle(rec.Metadata)
+	if handle.ID != "" {
+		return handle, nil
+	}
+	return m.runtime.HandleFor(ports.RuntimeConfig{SessionID: rec.ID})
+}
+
+// stopRuntimeStrict destroys a just-launched runtime and confirms absence. A
+// destroy error is tolerated only when the independent liveness probe proves
+// the runtime is already gone.
+func (m *Manager) stopRuntimeStrict(ctx context.Context, handle ports.RuntimeHandle) error {
+	destroyErr := m.runtime.Destroy(ctx, handle)
+	alive, probeErr := m.runtime.IsAlive(ctx, handle)
+	if probeErr != nil {
+		return errors.Join(destroyErr, fmt.Errorf("confirm runtime %s stopped: %w", handle.ID, probeErr))
+	}
+	if alive {
+		return errors.Join(destroyErr, fmt.Errorf("runtime %s remains alive after destroy", handle.ID))
+	}
+	return nil
 }
 
 // RestoreAll relaunches every terminated session that was saved by the last
@@ -1111,6 +1398,10 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 	}
 	for _, rec := range recs {
 		if !rec.IsTerminated {
+			continue
+		}
+		if m.policy.IsDisabled(string(rec.Harness)) {
+			m.logger.Info("restore-all: disabled session left terminated", "sessionID", rec.ID, "harness", rec.Harness)
 			continue
 		}
 		// Check the shutdown-saved marker: is there a session_worktrees row?
@@ -1896,7 +2187,7 @@ Spawn worker sessions for implementation with:
 `+"`ao spawn --project %s --name \"<label, max 20 chars>\" --prompt \"<clear worker task>\"`"+`
 Both --project and --name are required.
 
-To run a worker on a specific agent, add `+"`--agent <name>`"+` (an alias for `+"`--harness`"+`) — for example `+"`--agent codex`"+` or `+"`--agent claude-code`"+`. If you omit it, the project's default worker agent is used. Run `+"`ao spawn --help`"+` for the full list of agents and every flag.
+To run a worker on a specific agent, add `+"`--agent <name>`"+` (an alias for `+"`--harness`"+`) — for example `+"`--agent codex`"+`. If you omit it, the project's default worker agent is used. Run `+"`ao agent ls`"+` for the currently enabled agents and `+"`ao spawn --help`"+` for every flag.
 
 Message workers with `+"`ao send`"+`, for example:
 `+"`ao send --session <worker-session-id> --message \"<your message>\"`"+`

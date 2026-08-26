@@ -17,6 +17,9 @@ const cancelInterruptDelay = 150 * time.Millisecond
 // It is the side of the engine that talks to the reviewer registry and runtime;
 // the engine owns the orchestration and persistence.
 type Launcher interface {
+	// HandleFor resolves the runtime's canonical handle for a worker's reviewer.
+	// Recovery uses this instead of reconstructing runtime-specific identity.
+	HandleFor(workerID domain.SessionID) (handleID string, err error)
 	// Spawn launches a fresh reviewer and returns the runtime handle id of the
 	// live pane (stable per worker, reused across passes).
 	Spawn(ctx context.Context, spec LaunchSpec) (handleID string, err error)
@@ -26,6 +29,9 @@ type Launcher interface {
 	Alive(ctx context.Context, handleID string) (bool, error)
 	// Cancel interrupts a running reviewer pane while keeping the terminal alive.
 	Cancel(ctx context.Context, handleID string, harness domain.ReviewerHarness) error
+	// Stop destroys a reviewer runtime and confirms its handle is absent. Boot
+	// reconciliation uses this stricter boundary for disabled agents.
+	Stop(ctx context.Context, handleID string) error
 }
 
 // LaunchSpec is the engine's request to (re)launch a reviewer for one pass.
@@ -44,7 +50,9 @@ type LaunchSpec struct {
 // inject a message into a running pane, and probe liveness. The tmux runtime
 // satisfies it.
 type reviewerRuntime interface {
+	HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error)
 	Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error)
+	Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 	Interrupt(ctx context.Context, handle ports.RuntimeHandle) error
 	IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool, error)
 	SendMessage(ctx context.Context, handle ports.RuntimeHandle, message string) error
@@ -67,16 +75,27 @@ func NewLauncher(reviewers ports.ReviewerResolver, runtime reviewerRuntime) Laun
 	return &agentLauncher{reviewers: reviewers, runtime: runtime}
 }
 
-// reviewerHandleID is the stable runtime handle for a worker's reviewer pane, so
-// one live reviewer is reused across passes.
-func reviewerHandleID(workerID domain.SessionID) string {
+// reviewerSessionID is the stable logical runtime id for a worker's reviewer
+// pane. The runtime owns any canonicalization from this id to its actual handle.
+func reviewerSessionID(workerID domain.SessionID) string {
 	return "review-" + string(workerID)
+}
+
+func (l *agentLauncher) HandleFor(workerID domain.SessionID) (string, error) {
+	handle, err := l.runtime.HandleFor(ports.RuntimeConfig{SessionID: domain.SessionID(reviewerSessionID(workerID))})
+	if err != nil {
+		return "", fmt.Errorf("resolve reviewer runtime handle: %w", err)
+	}
+	if handle.ID == "" {
+		return "", fmt.Errorf("resolve reviewer runtime handle: runtime returned an empty handle")
+	}
+	return handle.ID, nil
 }
 
 func (l *agentLauncher) invocation(spec LaunchSpec) ports.ReviewInvocation {
 	prompt, systemPrompt := reviewTexts(spec)
 	return ports.ReviewInvocation{
-		ReviewerID:      reviewerHandleID(spec.WorkerID),
+		ReviewerID:      reviewerSessionID(spec.WorkerID),
 		RunID:           spec.RunID,
 		WorkerSessionID: spec.WorkerID,
 		PRURL:           spec.PRURL,
@@ -94,7 +113,7 @@ func (l *agentLauncher) Spawn(ctx context.Context, spec LaunchSpec) (string, err
 	if !ok {
 		return "", fmt.Errorf("no reviewer adapter for harness %q", spec.Harness)
 	}
-	handleID := reviewerHandleID(spec.WorkerID)
+	handleID := reviewerSessionID(spec.WorkerID)
 	inv := l.invocation(spec)
 	if pl, ok := reviewer.(preLaunchReviewer); ok {
 		if err := pl.PreLaunch(ctx, inv); err != nil {
@@ -197,4 +216,22 @@ func (l *agentLauncher) Cancel(ctx context.Context, handleID string, harness dom
 	default:
 		return fmt.Errorf("reviewer adapter %q returned unsupported cancel mode %q", harness, spec.Mode)
 	}
+}
+
+func (l *agentLauncher) Stop(ctx context.Context, handleID string) error {
+	if handleID == "" {
+		return nil
+	}
+	handle := ports.RuntimeHandle{ID: handleID}
+	if err := l.runtime.Destroy(ctx, handle); err != nil {
+		return fmt.Errorf("destroy reviewer runtime %s: %w", handleID, err)
+	}
+	alive, err := l.runtime.IsAlive(ctx, handle)
+	if err != nil {
+		return fmt.Errorf("confirm reviewer runtime %s stopped: %w", handleID, err)
+	}
+	if alive {
+		return fmt.Errorf("reviewer runtime %s remains alive after destroy", handleID)
+	}
+	return nil
 }

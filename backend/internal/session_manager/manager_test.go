@@ -27,6 +27,8 @@ type fakeStore struct {
 	num           int
 	deleteErr     error
 	upsertWTErr   error
+	listAllErrs   []error
+	listAllCalls  int
 	// worktrees maps session ID to its saved worktree rows (shutdown-saved marker).
 	worktrees map[domain.SessionID][]domain.SessionWorktreeRecord
 	// sharedLog, when non-nil, receives an ordered call entry for each
@@ -74,6 +76,14 @@ func (f *fakeStore) ListSessions(_ context.Context, p domain.ProjectID) ([]domai
 	return out, nil
 }
 func (f *fakeStore) ListAllSessions(context.Context) ([]domain.SessionRecord, error) {
+	f.listAllCalls++
+	if len(f.listAllErrs) > 0 {
+		err := f.listAllErrs[0]
+		f.listAllErrs = f.listAllErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	var out []domain.SessionRecord
 	for _, r := range f.sessions {
 		out = append(out, r)
@@ -133,11 +143,15 @@ func (f *fakeStore) DeleteSessionWorktrees(_ context.Context, id domain.SessionI
 type fakeLCM struct {
 	store     *fakeStore
 	completed int
+	spawnErr  error
 	// terminated counts MarkTerminated calls per session id.
 	terminated map[domain.SessionID]int
 }
 
 func (l *fakeLCM) MarkSpawned(_ context.Context, id domain.SessionID, metadata domain.SessionMetadata) error {
+	if l.spawnErr != nil {
+		return l.spawnErr
+	}
 	l.completed++
 	rec := l.store.sessions[id]
 	rec.IsTerminated = false
@@ -166,6 +180,8 @@ func (l *fakeLCM) MarkTerminated(_ context.Context, id domain.SessionID) error {
 
 type fakeRuntime struct {
 	createErr          error
+	createLeavesAlive  bool
+	returnedHandle     string
 	destroyErr         error
 	created, destroyed int
 	lastCfg            ports.RuntimeConfig
@@ -178,17 +194,38 @@ type fakeRuntime struct {
 	destroyedIDs  []string
 }
 
+func (r *fakeRuntime) HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+	return ports.RuntimeHandle{ID: string(cfg.SessionID)}, nil
+}
+
 func (r *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	if r.createErr != nil {
+		if r.createLeavesAlive {
+			if r.aliveByHandle == nil {
+				r.aliveByHandle = make(map[string]bool)
+			}
+			r.aliveByHandle[string(cfg.SessionID)] = true
+		}
 		return ports.RuntimeHandle{}, r.createErr
 	}
 	r.lastCfg = cfg
 	r.created++
-	return ports.RuntimeHandle{ID: "h1"}, nil
+	if r.aliveByHandle == nil {
+		r.aliveByHandle = make(map[string]bool)
+	}
+	handleID := r.returnedHandle
+	if handleID == "" {
+		handleID = string(cfg.SessionID)
+	}
+	r.aliveByHandle[handleID] = true
+	return ports.RuntimeHandle{ID: handleID}, nil
 }
 func (r *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) error {
 	r.destroyed++
 	r.destroyedIDs = append(r.destroyedIDs, handle.ID)
+	if r.destroyErr == nil && r.aliveByHandle != nil {
+		r.aliveByHandle[handle.ID] = false
+	}
 	return r.destroyErr
 }
 func (r *fakeRuntime) IsAlive(_ context.Context, handle ports.RuntimeHandle) (bool, error) {
@@ -569,6 +606,50 @@ func TestSpawn_ResolvesProjectConfig(t *testing.T) {
 	}
 }
 
+func TestSpawn_DisabledAgentRejectedBeforeSideEffects(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{}
+	ws := &fakeWorkspace{}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+		Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+	})
+
+	requests := []ports.SpawnConfig{
+		{ProjectID: "mer", Kind: domain.KindWorker},
+		{ProjectID: "mer", Kind: domain.KindWorker, Route: &domain.AgentRoute{Harness: domain.HarnessClaudeCode, Model: "claude-test", ReasoningEffort: domain.ReasoningEffortMedium}},
+	}
+	for _, request := range requests {
+		_, err := m.Spawn(ctx, request)
+		if !errors.Is(err, ErrAgentDisabled) {
+			t.Fatalf("Spawn(%+v) error = %v, want ErrAgentDisabled", request, err)
+		}
+	}
+	if st.num != 0 || len(st.sessions) != 0 || rt.created != 0 || ws.lastCfg.SessionID != "" {
+		t.Fatalf("disabled spawn created side effects: rows=%d sessions=%d runtime=%d workspace=%q", st.num, len(st.sessions), rt.created, ws.lastCfg.SessionID)
+	}
+}
+
+func TestResolveSpawnAgentPolicyResolvesConfiguredOrchestratorHarness(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{}
+	ws := &fakeWorkspace{}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+		Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+	})
+
+	_, err := m.ResolveSpawnAgentPolicy(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindOrchestrator})
+	if !errors.Is(err, ErrAgentDisabled) {
+		t.Fatalf("ResolveSpawnAgentPolicy error = %v, want ErrAgentDisabled", err)
+	}
+	if st.num != 0 || len(st.sessions) != 0 || rt.created != 0 || ws.lastCfg.SessionID != "" {
+		t.Fatalf("policy preflight created side effects: rows=%d sessions=%d runtime=%d workspace=%q", st.num, len(st.sessions), rt.created, ws.lastCfg.SessionID)
+	}
+}
+
 func TestSpawn_RouteOverridesProjectAndRoleConfig(t *testing.T) {
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{
@@ -727,8 +808,157 @@ func TestSpawn_AssignsIDAndGoesIdle(t *testing.T) {
 	if rt.created != 1 {
 		t.Fatal("runtime not created")
 	}
-	if st.sessions["mer-1"].Metadata.RuntimeHandleID != "h1" {
+	if st.sessions["mer-1"].Metadata.RuntimeHandleID != "mer-1" {
 		t.Fatal("handle not folded")
+	}
+}
+
+func TestSpawn_MarkSpawnedAndDestroyFailureRemainsDiscoverableToDisabledReconcile(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{destroyErr: errors.New("tmux refused destroy")}
+	ws := &fakeWorkspace{}
+	lcm := &fakeLCM{store: st, spawnErr: errors.New("database write failed")}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Workspace: ws, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: lcm,
+		LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode})
+	if err == nil || !strings.Contains(err.Error(), "runtime teardown incomplete") {
+		t.Fatalf("Spawn error = %v, want incomplete runtime teardown", err)
+	}
+	rec := st.sessions["mer-1"]
+	if !rec.IsTerminated || rec.Metadata.RuntimeHandleID != "mer-1" || rec.Metadata.WorkspacePath != "/ws/mer-1" {
+		t.Fatalf("partial spawn row = %+v, want terminal recovery debt with runtime and workspace identity", rec)
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("workspace destroyed=%d before runtime absence was proven", ws.destroyed)
+	}
+	if rows := st.worktrees["mer-1"]; len(rows) != 1 || rows[0].State != "removed" || rows[0].WorktreePath != "/ws/mer-1" {
+		t.Fatalf("workspace recovery markers = %#v, want one removed root marker", rows)
+	}
+	if !rt.aliveByHandle["mer-1"] {
+		t.Fatal("fixture must leave deterministic runtime mer-1 alive")
+	}
+
+	// A later boot that disables Claude reaps the exact persisted runtime handle
+	// while leaving the recovery workspace available for history inspection.
+	m.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+	rt.destroyErr = nil
+	if err := m.Reconcile(ctx); err != nil {
+		t.Fatalf("disabled Reconcile: %v", err)
+	}
+	if rt.aliveByHandle["mer-1"] {
+		t.Fatal("disabled reconciliation missed the pre-bind runtime")
+	}
+}
+
+func TestSpawn_CreateErrorAndDestroyFailurePreservesCanonicalRecoveryDebt(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{
+		createErr:         errors.New("runtime setup failed after launch"),
+		createLeavesAlive: true,
+		destroyErr:        errors.New("tmux refused destroy"),
+	}
+	ws := &fakeWorkspace{}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Workspace: ws, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+		LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode})
+	if err == nil || !strings.Contains(err.Error(), "runtime teardown incomplete") {
+		t.Fatalf("Spawn error = %v, want incomplete runtime teardown", err)
+	}
+	if rec := st.sessions["mer-1"]; !rec.IsTerminated || rec.Metadata.RuntimeHandleID != "mer-1" || rec.Metadata.WorkspacePath != "/ws/mer-1" {
+		t.Fatalf("create-error debt row = %+v, want terminal row with canonical runtime and workspace identity", rec)
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("workspace destroyed=%d before runtime absence was proven", ws.destroyed)
+	}
+	if rows := st.worktrees["mer-1"]; len(rows) != 1 || rows[0].State != "removed" || rows[0].WorktreePath != "/ws/mer-1" {
+		t.Fatalf("workspace recovery markers = %#v, want one removed root marker", rows)
+	}
+	if !rt.aliveByHandle["mer-1"] {
+		t.Fatal("fixture must leave canonical runtime mer-1 alive")
+	}
+
+	// Disabled reconciliation uses the persisted canonical handle and leaves
+	// the preserved workspace terminal instead of relaunching Claude.
+	rt.createErr = nil
+	rt.destroyErr = nil
+	m.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+	if err := m.Reconcile(ctx); err != nil {
+		t.Fatalf("disabled Reconcile: %v", err)
+	}
+	if rt.aliveByHandle["mer-1"] {
+		t.Fatal("disabled reconciliation missed the canonical create-error runtime")
+	}
+}
+
+func TestSpawn_NonCanonicalHandleDestroyFailurePreservesExactRecoveryDebt(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{returnedHandle: "actual.runtime.handle", destroyErr: errors.New("tmux refused destroy")}
+	ws := &fakeWorkspace{}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Workspace: ws, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+		LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode})
+	if err == nil || !strings.Contains(err.Error(), "non-canonical handle") || !strings.Contains(err.Error(), "runtime teardown incomplete") {
+		t.Fatalf("Spawn error = %v, want non-canonical handle and incomplete teardown", err)
+	}
+	rec := st.sessions["mer-1"]
+	if !rec.IsTerminated || rec.Metadata.RuntimeHandleID != "actual.runtime.handle" || rec.Metadata.WorkspacePath != "/ws/mer-1" {
+		t.Fatalf("non-canonical recovery debt = %+v, want exact returned handle and workspace identity", rec)
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("workspace destroyed=%d before returned runtime absence was proven", ws.destroyed)
+	}
+	if rows := st.worktrees["mer-1"]; len(rows) != 1 || rows[0].State != "removed" {
+		t.Fatalf("workspace recovery markers = %#v, want one removed root marker", rows)
+	}
+
+	m.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+	rt.destroyErr = nil
+	if err := m.Reconcile(ctx); err != nil {
+		t.Fatalf("disabled Reconcile: %v", err)
+	}
+	if rt.aliveByHandle["actual.runtime.handle"] {
+		t.Fatal("disabled reconciliation missed exact returned runtime handle")
+	}
+}
+
+func TestSpawn_NonCanonicalHandleConfirmedAbsentCleansWorkspace(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{returnedHandle: "actual.runtime.handle"}
+	ws := &fakeWorkspace{}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Workspace: ws, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+		LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
+	if err == nil || !strings.Contains(err.Error(), "non-canonical handle") {
+		t.Fatalf("Spawn error = %v, want non-canonical handle", err)
+	}
+	if ws.destroyed != 1 {
+		t.Fatalf("workspace destroyed=%d after runtime absence was proven, want 1", ws.destroyed)
+	}
+	if rows := st.worktrees["mer-1"]; len(rows) != 0 {
+		t.Fatalf("workspace recovery markers = %#v, want none after successful cleanup", rows)
+	}
+	if rec := st.sessions["mer-1"]; !rec.IsTerminated || rec.Metadata.WorkspacePath != "" || rec.Metadata.RuntimeHandleID != "" {
+		t.Fatalf("cleaned non-canonical spawn = %+v, want terminal row without resource identity", rec)
 	}
 }
 
@@ -884,6 +1114,40 @@ func TestSpawn_AfterStartPromptFailureCleansUpSpawn(t *testing.T) {
 	}
 	if rec := st.sessions["mer-1"]; rec.Metadata.WorkspacePath != "" || rec.Metadata.Branch != "" || rec.Metadata.RuntimeHandleID != "" {
 		t.Fatalf("failed prompt delivery kept stale launch metadata: %#v", rec.Metadata)
+	}
+	if rows := st.worktrees["mer-1"]; len(rows) != 0 {
+		t.Fatalf("failed prompt delivery kept recovery markers after successful cleanup: %#v", rows)
+	}
+}
+
+func TestSpawn_AfterStartPromptFailurePreservesWorkspaceWhenRuntimeStopUnproven(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{destroyErr: errors.New("tmux refused destroy")}
+	ws := &fakeWorkspace{}
+	msg := &fakeMessenger{err: errors.New("pane unavailable")}
+	agent := &recordingAgent{}
+	m := New(Deps{
+		Runtime:   rt,
+		Agents:    singleAgent{agent: afterStartAgent{recordingAgent: agent}},
+		Workspace: ws, Store: st, Messenger: msg,
+		Lifecycle: &fakeLCM{store: st},
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Prompt: "fix the button"})
+	if err == nil || !strings.Contains(err.Error(), "deliver prompt") || !strings.Contains(err.Error(), "runtime teardown incomplete") {
+		t.Fatalf("Spawn error = %v, want prompt delivery and incomplete teardown", err)
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("workspace destroyed=%d before runtime absence was proven", ws.destroyed)
+	}
+	rec := st.sessions["mer-1"]
+	if !rec.IsTerminated || rec.Metadata.RuntimeHandleID != "mer-1" || rec.Metadata.WorkspacePath != "/ws/mer-1" || rec.Metadata.Prompt != "fix the button" {
+		t.Fatalf("prompt delivery recovery debt = %+v, want terminal row with complete launch identity", rec)
+	}
+	if rows := st.worktrees["mer-1"]; len(rows) != 1 || rows[0].State != "removed" || rows[0].WorktreePath != "/ws/mer-1" {
+		t.Fatalf("workspace recovery markers = %#v, want one removed root marker", rows)
 	}
 }
 
@@ -1520,6 +1784,28 @@ func TestRestore_RefusesLiveSession(t *testing.T) {
 	st.sessions["mer-1"] = mkLive("mer-1")
 	if _, err := m.Restore(ctx, "mer-1"); !errors.Is(err, ErrNotRestorable) {
 		t.Fatalf("want ErrNotRestorable, got %v", err)
+	}
+}
+
+func TestRestore_DisabledAgentRejectedBeforeWorkspaceRestore(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Harness: domain.HarnessClaudeCode, IsTerminated: true,
+		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1/root"},
+	}
+	rt := &fakeRuntime{}
+	ws := &fakeWorkspace{}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+		Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+	})
+
+	_, err := m.Restore(ctx, "mer-1")
+	if !errors.Is(err, ErrAgentDisabled) {
+		t.Fatalf("Restore error = %v, want ErrAgentDisabled", err)
+	}
+	if ws.lastCfg.SessionID != "" || rt.created != 0 {
+		t.Fatalf("disabled restore materialized resources: workspace=%q runtime=%d", ws.lastCfg.SessionID, rt.created)
 	}
 }
 func TestCleanup_ReclaimsTerminalWorkspaces(t *testing.T) {
@@ -3253,6 +3539,31 @@ func TestRestoreAll_SkipsSessionsKilledBeforeShutdown(t *testing.T) {
 	}
 }
 
+func TestRestoreAll_DisabledAgentStaysTerminatedWithoutMaterializingWorkspace(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Harness: domain.HarnessClaudeCode, IsTerminated: true,
+		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1/root"},
+	}
+	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, State: "removed"}}
+	rt := &fakeRuntime{}
+	ws := &fakeWorkspace{}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+		Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+	})
+
+	if err := m.RestoreAll(ctx); err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if ws.lastCfg.SessionID != "" || rt.created != 0 {
+		t.Fatalf("disabled restore-all materialized resources: workspace=%q runtime=%d", ws.lastCfg.SessionID, rt.created)
+	}
+	if len(st.worktrees["mer-1"]) != 1 {
+		t.Fatal("disabled restore-all consumed the reversible restore marker")
+	}
+}
+
 // TestRestoreAll_DeletesMarkerAfterRelaunch covers issue #2319 (b): the
 // shutdown-saved marker is one-shot. After RestoreAll relaunches a session, its
 // session_worktrees marker is deleted, so a second RestoreAll (with no fresh
@@ -3604,6 +3915,114 @@ func TestReconcileLive_AliveSessionAdoptedNoop(t *testing.T) {
 	}
 	if ws.stashCalls != 0 || lcm.terminated["s2"] != 0 || rt.destroyed != 0 {
 		t.Fatalf("adopt should be a no-op: stash=%d term=%d destroy=%d", ws.stashCalls, lcm.terminated["s2"], rt.destroyed)
+	}
+}
+
+func TestReconcile_DisabledLiveSessionIsPreservedAndRetired(t *testing.T) {
+	st := newFakeStore()
+	rec := domain.SessionRecord{
+		ID: "s-disabled", ProjectID: "p1", Harness: domain.HarnessClaudeCode,
+		Metadata: domain.SessionMetadata{Branch: "ao/s-disabled/root", WorkspacePath: "/wt/s-disabled", RuntimeHandleID: "s-disabled"},
+	}
+	st.sessions[rec.ID] = rec
+	rt := &fakeRuntime{aliveByHandle: map[string]bool{"s-disabled": true}}
+	ws := &fakeWorkspace{stashRef: "refs/ao/preserved/s-disabled"}
+	lcm := &fakeLCM{store: st}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+		Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: lcm,
+	})
+
+	if err := m.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !st.sessions[rec.ID].IsTerminated || lcm.terminated[rec.ID] != 1 {
+		t.Fatalf("disabled session was not terminated: record=%+v marks=%d", st.sessions[rec.ID], lcm.terminated[rec.ID])
+	}
+	if ws.stashCalls != 1 || rt.destroyed != 2 {
+		t.Fatalf("disabled retirement did not preserve then stop: stash=%d destroy=%d", ws.stashCalls, rt.destroyed)
+	}
+	rows := st.worktrees[rec.ID]
+	if len(rows) != 1 || rows[0].PreservedRef != "refs/ao/preserved/s-disabled" {
+		t.Fatalf("disabled retirement marker = %+v", rows)
+	}
+	if rt.created != 0 {
+		t.Fatalf("disabled session was relaunched: runtime.Create calls=%d", rt.created)
+	}
+}
+
+func TestReconcile_DisabledRuntimeDestroyFailureBlocksReadiness(t *testing.T) {
+	st := newFakeStore()
+	rec := domain.SessionRecord{
+		ID: "s-disabled", ProjectID: "p1", Harness: domain.HarnessClaudeCode,
+		Metadata: domain.SessionMetadata{Branch: "ao/s-disabled/root", WorkspacePath: "/wt/s-disabled", RuntimeHandleID: "s-disabled"},
+	}
+	st.sessions[rec.ID] = rec
+	rt := &fakeRuntime{
+		aliveByHandle: map[string]bool{"s-disabled": true},
+		destroyErr:    errors.New("tmux refused destroy"),
+	}
+	ws := &fakeWorkspace{stashRef: "refs/ao/preserved/s-disabled"}
+	lcm := &fakeLCM{store: st}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+		Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: lcm,
+	})
+
+	err := m.Reconcile(ctx)
+	if !errors.Is(err, ErrDisabledAgentRetirement) {
+		t.Fatalf("Reconcile error = %v, want ErrDisabledAgentRetirement", err)
+	}
+	if !st.sessions[rec.ID].IsTerminated {
+		t.Fatal("disabled session must remain terminal even when runtime teardown fails")
+	}
+	rows := st.worktrees[rec.ID]
+	if len(rows) != 1 || rows[0].PreservedRef != "refs/ao/preserved/s-disabled" {
+		t.Fatalf("disabled retirement marker = %+v", rows)
+	}
+	if !rt.aliveByHandle["s-disabled"] {
+		t.Fatal("fixture must prove the failed runtime is still alive")
+	}
+}
+
+func TestReconcile_DisabledPolicyInventoryFailuresBlockReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		errs []error
+	}{
+		{name: "initial inventory", errs: []error{errors.New("sqlite unavailable")}},
+		{name: "pre-reap refresh", errs: []error{nil, errors.New("sqlite unavailable")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.listAllErrs = tc.errs
+			m := New(Deps{
+				Runtime: &fakeRuntime{}, Agents: fakeAgents{},
+				Policy:    domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+				Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+			})
+
+			err := m.Reconcile(ctx)
+			if !errors.Is(err, ErrDisabledAgentRetirement) {
+				t.Fatalf("Reconcile error = %v, want ErrDisabledAgentRetirement", err)
+			}
+		})
+	}
+}
+
+func TestVerifyDisabledSessionsStoppedSkipsInventoryWhenPolicyInactive(t *testing.T) {
+	st := newFakeStore()
+	st.listAllErrs = []error{errors.New("sqlite unavailable")}
+	m := New(Deps{
+		Runtime: &fakeRuntime{}, Agents: fakeAgents{}, Workspace: &fakeWorkspace{}, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+	})
+
+	if err := m.verifyDisabledSessionsStopped(ctx); err != nil {
+		t.Fatalf("inactive policy verification = %v, want nil without inventory", err)
+	}
+	if st.listAllCalls != 0 {
+		t.Fatalf("inactive policy inventory calls = %d, want 0", st.listAllCalls)
 	}
 }
 

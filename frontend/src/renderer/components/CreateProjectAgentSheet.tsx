@@ -4,7 +4,6 @@ import { TriangleAlert, X } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import type { components } from "../../api/schema";
 import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
-import { AGENT_OPTIONS } from "../lib/agent-options";
 import { buildIntake, type IntakeForm, IntakeFields, intakeNeedsRule } from "./IntakeFields";
 import type { ProjectKind } from "../types/workspace";
 import { Button } from "./ui/button";
@@ -296,10 +295,10 @@ export const RequiredAgentField = memo(function RequiredAgentField({
 	supported?: AgentInfo[];
 	value: string;
 }) {
-	const fallbackAgents: AgentInfo[] = AGENT_OPTIONS.map((agent) => ({ id: agent, label: agent }));
-	const supportedAgents = supported ?? fallbackAgents;
-	const installedAgents = installed ?? supportedAgents;
-	const authorizedAgents = authorized ?? supportedAgents;
+	const supportedAgents = supported ?? [];
+	const installedAgents = installed ?? [];
+	const authorizedAgents = authorized ?? [];
+	const supportedIds = new Set(supportedAgents.map((agent) => agent.id));
 	const authorizedIds = new Set(authorizedAgents.map((agent) => agent.id));
 	const installedById = new Map(installedAgents.map((agent) => [agent.id, agent]));
 	const options = supportedAgents
@@ -325,7 +324,7 @@ export const RequiredAgentField = memo(function RequiredAgentField({
 			<Label htmlFor={id} className="text-xs font-medium text-muted-foreground">
 				{label}
 			</Label>
-			<Select value={value} onValueChange={onChange} disabled={disabled}>
+			<Select value={supportedIds.has(value) ? value : ""} onValueChange={onChange} disabled={disabled}>
 				<SelectTrigger id={id} size="sm" className="w-full text-control" aria-invalid={invalid || undefined}>
 					<SelectValue placeholder={placeholder} />
 				</SelectTrigger>
