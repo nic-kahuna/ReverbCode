@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -28,6 +29,7 @@ import (
 	importsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/importer"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
@@ -139,9 +141,21 @@ func Run() error {
 		}
 		return fmt.Errorf("wire session service: %w", err)
 	}
+	// Enforce disabled-agent policy before starting intake, preview polling, or
+	// the HTTP server. Reviewer runtimes live outside the session table and need
+	// their own reconciliation pass. Ordinary enabled-session recovery remains
+	// best-effort, but an unretired disabled runtime is a readiness failure.
+	if err := reconcileAgentsOnBoot(ctx, reviewSvc, sessMgr, log); err != nil {
+		stop()
+		lcStack.Stop()
+		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
+			log.Error("cdc pipeline shutdown", "err", cdcErr)
+		}
+		return err
+	}
 	lcStack.trackerDone = startTrackerIntake(ctx, store, sessionSvc, log)
 	previewDone := preview.NewPoller(store, sessionSvc, "http://"+cfg.Addr(), preview.PollerConfig{Logger: log}).Start(ctx)
-	agentSvc := agentsvc.New()
+	agentSvc := agentsvc.NewWithPolicy(cfg.AgentPolicy())
 	go func() {
 		if _, err := agentSvc.Refresh(ctx); err != nil {
 			log.Warn("initial agent catalog refresh failed", "err", err)
@@ -197,14 +211,6 @@ func Run() error {
 		log.Warn("restore mobile bridge on boot failed", "err", err)
 	}
 
-	// Reconcile sessions on boot: adopt crash-surviving runtimes, capture and
-	// terminate dead ones, reap leaked tmux, then restore shutdown-saved
-	// sessions. Best-effort: a failure is logged but never blocks boot. Placed
-	// before srv.Run so sessions are consistent before the server serves.
-	if reconcileErr := sessMgr.Reconcile(ctx); reconcileErr != nil {
-		log.Error("reconcile sessions on boot failed", "err", reconcileErr)
-	}
-
 	// ponytail: 5s tolerates a brief frontend restart; tune if dev hot-reload trips it.
 	const supervisorGrace = 5 * time.Second
 
@@ -246,6 +252,23 @@ func Run() error {
 		log.Error("cdc pipeline shutdown", "err", err)
 	}
 	return runErr
+}
+
+type reviewerLifecycle interface {
+	ReconcileDisabled(ctx context.Context) error
+}
+
+func reconcileAgentsOnBoot(ctx context.Context, reviews reviewerLifecycle, sessions sessionLifecycle, log *slog.Logger) error {
+	if err := reviews.ReconcileDisabled(ctx); err != nil {
+		return fmt.Errorf("reconcile disabled reviewers on boot: %w", err)
+	}
+	if err := sessions.Reconcile(ctx); err != nil {
+		if errors.Is(err, sessionmanager.ErrDisabledAgentRetirement) {
+			return fmt.Errorf("reconcile disabled sessions on boot: %w", err)
+		}
+		log.Error("reconcile sessions on boot failed", "err", err)
+	}
+	return nil
 }
 
 type runtimeControlServerEnsurer interface {

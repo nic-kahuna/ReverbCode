@@ -20,6 +20,7 @@ import (
 var (
 	ErrInvalid             = reviewcore.ErrInvalid
 	ErrNotFound            = reviewcore.ErrNotFound
+	ErrAgentDisabled       = reviewcore.ErrAgentDisabled
 	ErrAgentBinaryNotFound = ports.ErrAgentBinaryNotFound
 )
 
@@ -91,6 +92,12 @@ func (s *Service) Trigger(ctx context.Context, workerID domain.SessionID) (revie
 // Cancel stops the live reviewer pane and marks running review passes as failed.
 func (s *Service) Cancel(ctx context.Context, workerID domain.SessionID) (reviewcore.CancelResult, error) {
 	return s.engine.Cancel(ctx, workerID)
+}
+
+// ReconcileDisabled enforces agent policy for reviewer runtimes during daemon
+// boot. Reviewer history remains persisted by the core engine.
+func (s *Service) ReconcileDisabled(ctx context.Context) error {
+	return s.engine.ReconcileDisabled(ctx)
 }
 
 // SubmittedReview is one review result supplied by the reviewer CLI.

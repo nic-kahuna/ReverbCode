@@ -77,9 +77,30 @@ const agentCatalogResponse = {
 	error: undefined,
 };
 
-function mockProject(project: Record<string, unknown>) {
+const agentCatalogWithoutClaudeResponse = {
+	data: {
+		supported: [
+			{ id: "codex", label: "Codex" },
+			{ id: "goose", label: "Goose" },
+			{ id: "opencode", label: "OpenCode" },
+		],
+		installed: [
+			{ id: "codex", label: "Codex", authStatus: "authorized" },
+			{ id: "goose", label: "Goose", authStatus: "authorized" },
+			{ id: "opencode", label: "OpenCode", authStatus: "authorized" },
+		],
+		authorized: [
+			{ id: "codex", label: "Codex", authStatus: "authorized" },
+			{ id: "goose", label: "Goose", authStatus: "authorized" },
+			{ id: "opencode", label: "OpenCode", authStatus: "authorized" },
+		],
+	},
+	error: undefined,
+};
+
+function mockProject(project: Record<string, unknown>, catalogResponse = agentCatalogResponse) {
 	getMock.mockImplementation(async (path: string) => {
-		if (path === "/api/v1/agents") return agentCatalogResponse;
+		if (path === "/api/v1/agents") return catalogResponse;
 		return {
 			data: {
 				status: "ok",
@@ -142,10 +163,10 @@ describe("ProjectSettingsForm", () => {
 		const orchestratorAgent = screen.getByRole("combobox", { name: "Default orchestrator agent" });
 		const permissionMode = screen.getByRole("combobox", { name: "Permission mode" });
 		const reviewerAgent = screen.getByRole("combobox", { name: "Default reviewer agent" });
-		expect(workerAgent).toHaveTextContent("codex");
-		expect(orchestratorAgent).toHaveTextContent("claude-code");
+		await waitFor(() => expect(workerAgent).toHaveTextContent("Codex"));
+		expect(orchestratorAgent).toHaveTextContent("Claude Code");
 		expect(permissionMode).toHaveTextContent("Auto");
-		expect(reviewerAgent).toHaveTextContent("claude-code");
+		expect(reviewerAgent).toHaveTextContent("Claude Code");
 
 		await userEvent.clear(screen.getByLabelText("Default branch"));
 		await userEvent.type(screen.getByLabelText("Default branch"), "release");
@@ -189,6 +210,77 @@ describe("ProjectSettingsForm", () => {
 		});
 		expect(await screen.findByText("Saved.")).toBeInTheDocument();
 	}, 20_000);
+
+	it("requires explicit replacements for saved agents omitted from the active catalog", async () => {
+		mockProject(
+			{
+				id: "proj-1",
+				name: "Project One",
+				kind: "single_repo",
+				path: "/repo/project-one",
+				repo: "",
+				defaultBranch: "main",
+				config: {
+					worker: { agent: "claude-code" },
+					orchestrator: { agent: "claude-code" },
+					reviewers: [{ harness: "claude-code" }],
+				},
+			},
+			agentCatalogWithoutClaudeResponse,
+		);
+
+		renderSettings();
+
+		const workerAgent = await screen.findByRole("combobox", { name: "Default worker agent" });
+		const orchestratorAgent = screen.getByRole("combobox", { name: "Default orchestrator agent" });
+		const reviewerAgent = screen.getByRole("combobox", { name: "Default reviewer agent" });
+		await waitFor(() => expect(workerAgent).toHaveTextContent("Select worker agent"));
+		expect(orchestratorAgent).toHaveTextContent("Select orchestrator agent");
+		expect(reviewerAgent).toHaveTextContent("Project default");
+
+		await chooseOption(workerAgent, "Codex");
+		await chooseOption(orchestratorAgent, "Codex");
+		await userEvent.click(reviewerAgent);
+		expect(screen.queryByRole("option", { name: /claude/i })).not.toBeInTheDocument();
+		await userEvent.click(await screen.findByRole("option", { name: "Codex" }));
+		await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+		await waitFor(() => expect(putMock).toHaveBeenCalledTimes(1));
+		const body = putMock.mock.calls[0]?.[1]?.body;
+		expect(body.config.worker.agent).toBe("codex");
+		expect(body.config.orchestrator.agent).toBe("codex");
+		expect(body.config.reviewers).toEqual([{ harness: "codex" }]);
+	});
+
+	it("does not silently clear an unavailable configured reviewer", async () => {
+		mockProject(
+			{
+				id: "proj-1",
+				name: "Project One",
+				kind: "single_repo",
+				path: "/repo/project-one",
+				repo: "",
+				defaultBranch: "main",
+				config: {
+					worker: { agent: "codex" },
+					orchestrator: { agent: "codex" },
+					reviewers: [{ harness: "claude-code" }],
+				},
+			},
+			agentCatalogWithoutClaudeResponse,
+		);
+
+		renderSettings();
+
+		await userEvent.click(await screen.findByRole("button", { name: "Save changes" }));
+
+		expect(
+			await screen.findByText(
+				"The configured reviewer is unavailable. Select an available reviewer or project default.",
+			),
+		).toBeInTheDocument();
+		expect(putMock).not.toHaveBeenCalled();
+	});
 
 	it("shows the daemon validation message when save fails", async () => {
 		mockProject({
@@ -258,8 +350,7 @@ describe("ProjectSettingsForm", () => {
 
 		renderSettings();
 
-		await waitFor(() => expect(screen.getAllByText("/repo/project-one").length).toBeGreaterThan(0));
-		const workerAgent = screen.getByRole("combobox", { name: "Default worker agent" });
+		const workerAgent = await screen.findByRole("combobox", { name: "Default worker agent" });
 		await userEvent.click(workerAgent);
 		const options = await screen.findAllByRole("option");
 		expect(options.map((option) => option.textContent)).toEqual([
@@ -273,23 +364,17 @@ describe("ProjectSettingsForm", () => {
 	});
 
 	it("saves GitHub tracker intake settings, deriving the repo from the project's git origin", async () => {
-		getMock.mockResolvedValue({
-			data: {
-				status: "ok",
-				project: {
-					id: "proj-1",
-					name: "Project One",
-					kind: "single_repo",
-					path: "/repo/project-one",
-					repo: "git@github.com:acme/project-one.git",
-					defaultBranch: "main",
-					config: {
-						worker: { agent: "codex" },
-						orchestrator: { agent: "claude-code" },
-					},
-				},
+		mockProject({
+			id: "proj-1",
+			name: "Project One",
+			kind: "single_repo",
+			path: "/repo/project-one",
+			repo: "git@github.com:acme/project-one.git",
+			defaultBranch: "main",
+			config: {
+				worker: { agent: "codex" },
+				orchestrator: { agent: "claude-code" },
 			},
-			error: undefined,
 		});
 
 		renderSettings();
@@ -316,23 +401,17 @@ describe("ProjectSettingsForm", () => {
 	});
 
 	it("blocks save when intake is enabled with no assignee", async () => {
-		getMock.mockResolvedValue({
-			data: {
-				status: "ok",
-				project: {
-					id: "proj-1",
-					name: "Project One",
-					kind: "single_repo",
-					path: "/repo/project-one",
-					repo: "git@github.com:acme/project-one.git",
-					defaultBranch: "main",
-					config: {
-						worker: { agent: "codex" },
-						orchestrator: { agent: "claude-code" },
-					},
-				},
+		mockProject({
+			id: "proj-1",
+			name: "Project One",
+			kind: "single_repo",
+			path: "/repo/project-one",
+			repo: "git@github.com:acme/project-one.git",
+			defaultBranch: "main",
+			config: {
+				worker: { agent: "codex" },
+				orchestrator: { agent: "claude-code" },
 			},
-			error: undefined,
 		});
 
 		renderSettings();
@@ -345,23 +424,17 @@ describe("ProjectSettingsForm", () => {
 	});
 
 	it("restarts when the saved orchestrator agent already differs from the running orchestrator", async () => {
-		getMock.mockResolvedValue({
-			data: {
-				status: "ok",
-				project: {
-					id: "proj-1",
-					name: "Project One",
-					kind: "single_repo",
-					path: "/repo/project-one",
-					repo: "",
-					defaultBranch: "main",
-					config: {
-						worker: { agent: "codex" },
-						orchestrator: { agent: "goose" },
-					},
-				},
+		mockProject({
+			id: "proj-1",
+			name: "Project One",
+			kind: "single_repo",
+			path: "/repo/project-one",
+			repo: "",
+			defaultBranch: "main",
+			config: {
+				worker: { agent: "codex" },
+				orchestrator: { agent: "goose" },
 			},
-			error: undefined,
 		});
 
 		renderSettings("proj-1", [
@@ -389,7 +462,7 @@ describe("ProjectSettingsForm", () => {
 		]);
 
 		const orchestratorAgent = await screen.findByRole("combobox", { name: "Default orchestrator agent" });
-		expect(orchestratorAgent).toHaveTextContent("goose");
+		expect(orchestratorAgent).toHaveTextContent("Goose");
 
 		await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
@@ -401,23 +474,17 @@ describe("ProjectSettingsForm", () => {
 	});
 
 	it("keeps the config save successful when orchestrator replacement fails", async () => {
-		getMock.mockResolvedValue({
-			data: {
-				status: "ok",
-				project: {
-					id: "proj-1",
-					name: "Project One",
-					kind: "single_repo",
-					path: "/repo/project-one",
-					repo: "",
-					defaultBranch: "main",
-					config: {
-						worker: { agent: "codex" },
-						orchestrator: { agent: "claude-code" },
-					},
-				},
+		mockProject({
+			id: "proj-1",
+			name: "Project One",
+			kind: "single_repo",
+			path: "/repo/project-one",
+			repo: "",
+			defaultBranch: "main",
+			config: {
+				worker: { agent: "codex" },
+				orchestrator: { agent: "claude-code" },
 			},
-			error: undefined,
 		});
 		postMock.mockResolvedValue({
 			data: undefined,
@@ -429,7 +496,7 @@ describe("ProjectSettingsForm", () => {
 		const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
 		const orchestratorAgent = await screen.findByRole("combobox", { name: "Default orchestrator agent" });
-		await chooseOption(orchestratorAgent, "goose");
+		await chooseOption(orchestratorAgent, "Goose");
 		await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
 		await waitFor(() => expect(putMock).toHaveBeenCalledTimes(1));

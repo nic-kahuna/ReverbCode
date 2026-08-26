@@ -80,12 +80,13 @@ type sessionLifecycle interface {
 // store + LCM, the per-session agent resolver, and the agent messenger. The
 // returned service is mounted at httpd APIDeps.Sessions. It also returns the
 // manager so the caller can wire Reconcile into the boot sequence.
-func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, messenger ports.AgentMessenger, telemetry ports.EventSink, log *slog.Logger) (*sessionsvc.Service, reviewsvc.Manager, sessionLifecycle, error) {
+func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, messenger ports.AgentMessenger, telemetry ports.EventSink, log *slog.Logger) (*sessionsvc.Service, *reviewsvc.Service, sessionLifecycle, error) {
 	defaultAgent := cfg.Agent
 	if defaultAgent == "" {
 		defaultAgent = config.DefaultAgent
 	}
-	agents, err := buildAgentResolver(defaultAgent, log)
+	policy := cfg.AgentPolicy()
+	agents, err := buildAgentResolver(defaultAgent, policy, log)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -104,6 +105,7 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 	mgr := sessionmanager.New(sessionmanager.Deps{
 		Runtime:   runtime,
 		Agents:    agents,
+		Policy:    policy,
 		Workspace: ws,
 		Store:     store,
 		Messenger: messenger,
@@ -139,6 +141,7 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 		PRs:      store,
 		Projects: store,
 		Launcher: reviewcore.NewLauncher(reviewers, runtime),
+		Policy:   policy,
 	})
 	reviewSvc := reviewsvc.New(reviewEngine, store, reviewsvc.WithLifecycleReducer(lcm))
 	return sessionSvc, reviewSvc, mgr, nil
@@ -215,7 +218,7 @@ func (a agentRegistry) Agent(harness domain.AgentHarness) (ports.Agent, bool) {
 // adapters. It still validates AO_AGENT at startup for compatibility with the
 // config surface, but worker/orchestrator spawns must provide a resolved
 // harness before calling Agent.
-func buildAgentResolver(defaultAgent string, log *slog.Logger) (ports.AgentResolver, error) {
+func buildAgentResolver(defaultAgent string, policy domain.AgentPolicy, log *slog.Logger) (ports.AgentResolver, error) {
 	if defaultAgent == "" {
 		defaultAgent = config.DefaultAgent
 	}
@@ -226,6 +229,9 @@ func buildAgentResolver(defaultAgent string, log *slog.Logger) (ports.AgentResol
 	resolver := agentRegistry{reg: reg}
 	if _, ok := resolver.Agent(domain.AgentHarness(defaultAgent)); !ok {
 		return nil, fmt.Errorf("configured default agent %q is not a registered adapter", defaultAgent)
+	}
+	if policy.IsDisabled(defaultAgent) {
+		return nil, fmt.Errorf("configured default agent %q is disabled by AO_DISABLED_AGENTS", defaultAgent)
 	}
 	ids := make([]string, 0)
 	for _, mf := range reg.Manifests() {

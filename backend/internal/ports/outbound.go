@@ -80,6 +80,7 @@ type AgentMessenger interface {
 // Runtime is the full runtime adapter contract: session creation/teardown plus
 // liveness probing for reapers and terminal attachment.
 type Runtime interface {
+	HandleFor(cfg RuntimeConfig) (RuntimeHandle, error)
 	Create(ctx context.Context, cfg RuntimeConfig) (RuntimeHandle, error)
 	Destroy(ctx context.Context, handle RuntimeHandle) error
 	GetOutput(ctx context.Context, handle RuntimeHandle, lines int) (string, error)
@@ -97,8 +98,10 @@ type RuntimeConfig struct {
 	Env           map[string]string
 }
 
-// RuntimeHandle identifies a live runtime instance. Its ID is opaque outside
-// the concrete runtime adapter.
+// RuntimeHandle identifies a live runtime instance. HandleFor owns the
+// runtime-specific canonicalization from RuntimeConfig.SessionID, and Create
+// must return that same handle. This stable identity lets recovery find and
+// stop a process even if the post-launch metadata write fails.
 type RuntimeHandle struct {
 	ID string
 }

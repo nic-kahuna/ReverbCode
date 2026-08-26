@@ -168,7 +168,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 		return pflag.NormalizedName(name)
 	})
 	f.StringVar(&opts.project, "project", "", "Project id to spawn the session in (default: AO_PROJECT_ID or current registered repo)")
-	f.StringVar(&opts.harness, "harness", "", "Agent harness / --agent: claude-code, codex, aider, opencode, grok, droid, amp, agy, crush, cursor, qwen, copilot, goose, auggie, continue, devin, cline, kimi, kiro, kilocode, vibe, pi, autohand (default: project worker.agent; required if the project has none)")
+	f.StringVar(&opts.harness, "harness", "", "Agent harness / --agent (see `ao agent ls`; default: project worker.agent; required if the project has none)")
 	f.StringVar(&opts.model, "model", "", "Per-session model override (requires --reasoning-effort)")
 	f.StringVar(&opts.reasoningEffort, "reasoning-effort", "", "Per-session reasoning effort (requires --model)")
 	f.StringVar(&opts.branch, "branch", "", "Branch for the session worktree (default: ao/<session-id>/root)")

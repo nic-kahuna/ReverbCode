@@ -116,9 +116,9 @@ func TestResolveReviewerHarness(t *testing.T) {
 	}
 
 	// A worker harness that is not itself a reviewer (e.g. crush, aider) falls
-	// back to claude-code.
-	if got := (ProjectConfig{}).ResolveReviewerHarness(HarnessCrush); got != FallbackReviewerHarness {
-		t.Fatalf("crush worker = %q, want %q", got, FallbackReviewerHarness)
+	// back to codex.
+	if got := (ProjectConfig{}).ResolveReviewerHarness(HarnessCrush); got != ReviewerCodex {
+		t.Fatalf("crush worker = %q, want codex", got)
 	}
 	if got := (ProjectConfig{}).ResolveReviewerHarness(HarnessAider); got != FallbackReviewerHarness {
 		t.Fatalf("fallback = %q, want %q", got, FallbackReviewerHarness)
