@@ -54,14 +54,24 @@ func New(opts Options) *Runtime {
 	}
 }
 
-// Create spawns a detached pty-host for the session, waits for READY, stores
-// the addr+pid in-memory and in the B2 registry, and returns the handle.
-// Returns an error if sessionID is invalid, already exists, or spawn fails.
-func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+// HandleFor returns the exact session-id handle Create will use.
+func (r *Runtime) HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	id := string(cfg.SessionID)
 	if !validSessionID.MatchString(id) {
 		return ports.RuntimeHandle{}, fmt.Errorf("conpty: invalid session id %q: must match ^[a-zA-Z0-9_-]+$", id)
 	}
+	return ports.RuntimeHandle{ID: id}, nil
+}
+
+// Create spawns a detached pty-host for the session, waits for READY, stores
+// the addr+pid in-memory and in the B2 registry, and returns the handle.
+// Returns an error if sessionID is invalid, already exists, or spawn fails.
+func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+	handle, err := r.HandleFor(cfg)
+	if err != nil {
+		return ports.RuntimeHandle{}, err
+	}
+	id := handle.ID
 	if cfg.WorkspacePath == "" {
 		return ports.RuntimeHandle{}, fmt.Errorf("conpty: workspace path required")
 	}
@@ -101,7 +111,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 		RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 	})
 
-	return ports.RuntimeHandle{ID: id}, nil
+	return handle, nil
 }
 
 // Destroy gracefully kills the pty-host, waits up to ~500ms for the pid to

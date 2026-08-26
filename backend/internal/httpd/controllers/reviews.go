@@ -181,6 +181,8 @@ func writeReviewError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, reviewsvc.ErrInvalid):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "REVIEW_INVALID", err.Error(), nil)
+	case errors.Is(err, reviewsvc.ErrAgentDisabled):
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "REVIEWER_DISABLED", err.Error(), nil)
 	case errors.Is(err, reviewsvc.ErrNotFound):
 		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "REVIEW_NOT_FOUND", err.Error(), nil)
 	case errors.Is(err, reviewsvc.ErrAgentBinaryNotFound):

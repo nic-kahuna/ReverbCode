@@ -19,6 +19,9 @@ type fakeStore struct {
 	review               *domain.Review
 	runs                 []domain.ReviewRun
 	listAllReviewRunHits int
+	upsertCalls          int
+	upsertErrAt          int
+	upsertErr            error
 	// insertErr, when set, makes the next InsertReviewRun model a concurrent
 	// writer that already recorded a run for this commit: it records that
 	// winner (so a follow-up GetReviewRunBySessionAndSHA finds it) and returns
@@ -27,6 +30,10 @@ type fakeStore struct {
 }
 
 func (f *fakeStore) UpsertReview(_ context.Context, r domain.Review) error {
+	f.upsertCalls++
+	if f.upsertErrAt == f.upsertCalls {
+		return f.upsertErr
+	}
 	cp := r
 	f.review = &cp
 	return nil
@@ -127,12 +134,22 @@ func (f *fakeStore) ListRunningReviewRunsBySession(_ context.Context, sessionID 
 }
 
 type fakeSessions struct {
-	rec domain.SessionRecord
-	ok  bool
+	rec     domain.SessionRecord
+	ok      bool
+	listErr error
 }
 
 func (f fakeSessions) GetSession(_ context.Context, _ domain.SessionID) (domain.SessionRecord, bool, error) {
 	return f.rec, f.ok, nil
+}
+func (f fakeSessions) ListAllSessions(_ context.Context) ([]domain.SessionRecord, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if !f.ok {
+		return nil, nil
+	}
+	return []domain.SessionRecord{f.rec}, nil
 }
 
 type fakePRs struct{ prs []domain.PullRequest }
@@ -149,6 +166,8 @@ func (f fakeProjects) GetProject(_ context.Context, id string) (domain.ProjectRe
 
 type fakeLauncher struct {
 	handle           string
+	canonicalHandle  string
+	handleErr        error
 	alive            bool
 	spawnErr         error
 	notifyErr        error
@@ -157,15 +176,27 @@ type fakeLauncher struct {
 	notified         bool
 	cancelled        bool
 	cancelErr        error
+	stopErr          error
 	aliveErr         error
 	gotSpec          LaunchSpec
 	gotHandle        string
+	aliveHandle      string
 	cancelledHandle  string
 	cancelledHarness domain.ReviewerHarness
+	stoppedHandle    string
 	specs            []LaunchSpec
 	handles          []string
 }
 
+func (f *fakeLauncher) HandleFor(workerID domain.SessionID) (string, error) {
+	if f.handleErr != nil {
+		return "", f.handleErr
+	}
+	if f.canonicalHandle != "" {
+		return f.canonicalHandle, nil
+	}
+	return reviewerSessionID(workerID), nil
+}
 func (f *fakeLauncher) Spawn(_ context.Context, spec LaunchSpec) (string, error) {
 	f.spawned = true
 	f.spawnCount++
@@ -184,7 +215,8 @@ func (f *fakeLauncher) Notify(_ context.Context, handleID string, spec LaunchSpe
 	f.specs = append(f.specs, spec)
 	return f.notifyErr
 }
-func (f *fakeLauncher) Alive(_ context.Context, _ string) (bool, error) {
+func (f *fakeLauncher) Alive(_ context.Context, handleID string) (bool, error) {
+	f.aliveHandle = handleID
 	return f.alive || f.spawned, f.aliveErr
 }
 func (f *fakeLauncher) Cancel(_ context.Context, handleID string, harness domain.ReviewerHarness) error {
@@ -192,6 +224,14 @@ func (f *fakeLauncher) Cancel(_ context.Context, handleID string, harness domain
 	f.cancelledHandle = handleID
 	f.cancelledHarness = harness
 	return f.cancelErr
+}
+func (f *fakeLauncher) Stop(_ context.Context, handleID string) error {
+	f.stoppedHandle = handleID
+	if f.stopErr == nil {
+		f.alive = false
+		f.spawned = false
+	}
+	return f.stopErr
 }
 
 func liveWorker() domain.SessionRecord {
@@ -214,6 +254,69 @@ func newEngineForTest(store Store, sessions Sessions, prs PRs, projects Projects
 
 func prAt(sha string) fakePRs {
 	return fakePRs{prs: []domain.PullRequest{{URL: "https://github.com/o/r/pull/1", Number: 1, HeadSHA: sha}}}
+}
+
+func TestReconcileDisabledStopsReviewerAndPreservesHistory(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
+		runs: []domain.ReviewRun{
+			{ID: "run-running", SessionID: "mer-1", Status: domain.ReviewRunRunning, Harness: domain.ReviewerClaudeCode},
+			{ID: "run-complete", SessionID: "mer-1", Status: domain.ReviewRunComplete, Verdict: domain.VerdictApproved, Harness: domain.ReviewerClaudeCode},
+		},
+	}
+	launcher := &fakeLauncher{alive: true}
+	eng := New(Deps{
+		Store: store, Sessions: fakeSessions{rec: domain.SessionRecord{ID: "mer-1"}, ok: true}, Launcher: launcher,
+		Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+	})
+
+	if err := eng.ReconcileDisabled(context.Background()); err != nil {
+		t.Fatalf("ReconcileDisabled: %v", err)
+	}
+	if launcher.stoppedHandle != "review-mer-1" {
+		t.Fatalf("stopped handle = %q, want review-mer-1", launcher.stoppedHandle)
+	}
+	if store.review == nil || store.review.ID != "rev-1" || store.review.ReviewerHandleID != "review-mer-1" {
+		t.Fatalf("review history changed: %+v", store.review)
+	}
+	if store.runs[0].Status != domain.ReviewRunCancelled || !strings.Contains(store.runs[0].Body, "disabled by policy") {
+		t.Fatalf("running review was not cancelled with policy reason: %+v", store.runs[0])
+	}
+	if store.runs[1].Status != domain.ReviewRunComplete || store.runs[1].Verdict != domain.VerdictApproved {
+		t.Fatalf("completed review history changed: %+v", store.runs[1])
+	}
+}
+
+func TestReconcileDisabledStopFailureLeavesRunRunningAndFailsClosed(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
+		runs:   []domain.ReviewRun{{ID: "run-1", SessionID: "mer-1", Status: domain.ReviewRunRunning}},
+	}
+	launcher := &fakeLauncher{alive: true, stopErr: errors.New("destroy failed")}
+	eng := New(Deps{
+		Store: store, Sessions: fakeSessions{rec: domain.SessionRecord{ID: "mer-1"}, ok: true}, Launcher: launcher,
+		Policy: domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}),
+	})
+
+	err := eng.ReconcileDisabled(context.Background())
+	if !errors.Is(err, ErrDisabledAgentRetirement) {
+		t.Fatalf("ReconcileDisabled error = %v, want ErrDisabledAgentRetirement", err)
+	}
+	if store.runs[0].Status != domain.ReviewRunRunning {
+		t.Fatalf("run status = %q, want running while runtime may still be alive", store.runs[0].Status)
+	}
+}
+
+func TestReconcileDisabledSkipsInventoryWhenPolicyInactive(t *testing.T) {
+	eng := New(Deps{
+		Store:    &fakeStore{},
+		Sessions: fakeSessions{listErr: errors.New("inventory unavailable")},
+		Launcher: &fakeLauncher{},
+	})
+
+	if err := eng.ReconcileDisabled(context.Background()); err != nil {
+		t.Fatalf("inactive policy reconciliation = %v, want nil without inventory", err)
+	}
 }
 
 // --- tests ---
@@ -393,7 +496,7 @@ func TestTriggerFallsBackToExistingRunOnUniqueConflict(t *testing.T) {
 
 func TestTriggerIsIdempotentForSameCommit(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs: []domain.ReviewRun{{
 			ID: "run-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1",
 			Status: domain.ReviewRunComplete, Verdict: domain.VerdictApproved,
@@ -419,7 +522,7 @@ func TestTriggerIsIdempotentForSameCommit(t *testing.T) {
 
 func TestTriggerReusesRunningRowWithNoVerdict(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs:   []domain.ReviewRun{{ID: "run-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunRunning}},
 	}
 	launcher := &fakeLauncher{alive: false, handle: "review-mer-2"}
@@ -442,7 +545,7 @@ func TestTriggerReusesRunningRowWithNoVerdict(t *testing.T) {
 
 func TestTriggerRetriesTerminalRowWithNoVerdict(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs: []domain.ReviewRun{{
 			ID: "run-empty-verdict", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1",
 			Status: domain.ReviewRunComplete, Verdict: domain.VerdictNone,
@@ -465,7 +568,7 @@ func TestTriggerRetriesTerminalRowWithNoVerdict(t *testing.T) {
 
 func TestTriggerNotifiesLiveReviewerOnNewCommit(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs:   []domain.ReviewRun{{ID: "run-0", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha0", Status: domain.ReviewRunComplete}},
 	}
 	launcher := &fakeLauncher{alive: true}
@@ -488,7 +591,7 @@ func TestTriggerNotifiesLiveReviewerOnNewCommit(t *testing.T) {
 
 func TestTriggerSupersedesOlderRunningRunOnNewCommit(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs:   []domain.ReviewRun{{ID: "run-old", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha0", Status: domain.ReviewRunRunning}},
 	}
 	launcher := &fakeLauncher{alive: true, handle: "review-mer-1"}
@@ -511,7 +614,7 @@ func TestTriggerSupersedesOlderRunningRunOnNewCommit(t *testing.T) {
 
 func TestTriggerSpawnsWhenReviewerDead(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs:   []domain.ReviewRun{{ID: "run-0", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha0", Status: domain.ReviewRunComplete}},
 	}
 	launcher := &fakeLauncher{alive: false, handle: "review-mer-1"}
@@ -545,9 +648,121 @@ func TestTriggerLaunchFailureRecordsFailedRun(t *testing.T) {
 	}
 }
 
+func TestTriggerBindingFailureStopsFreshReviewerAndFailsRun(t *testing.T) {
+	store := &fakeStore{upsertErrAt: 2, upsertErr: errors.New("database unavailable")}
+	launcher := &fakeLauncher{handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	_, err := eng.Trigger(context.Background(), "mer-1")
+	if err == nil || !strings.Contains(err.Error(), "bind launched reviewer handle") {
+		t.Fatalf("Trigger error = %v, want binding failure", err)
+	}
+	if launcher.spawnCount != 1 || launcher.stoppedHandle != "review-mer-1" {
+		t.Fatalf("partial launch cleanup = %+v, want spawned handle strictly stopped", launcher)
+	}
+	if store.review == nil || store.review.Harness != domain.ReviewerClaudeCode || store.review.ReviewerHandleID != "" {
+		t.Fatalf("pre-launch identity changed unexpectedly: %+v", store.review)
+	}
+	if len(store.runs) != 1 || store.runs[0].Status != domain.ReviewRunFailed || !strings.Contains(store.runs[0].Body, "database unavailable") {
+		t.Fatalf("run after safely stopped partial launch = %+v, want failed with binding cause", store.runs)
+	}
+}
+
+func TestTriggerBindingAndStopFailureRemainsDiscoverableToDisabledReconcile(t *testing.T) {
+	store := &fakeStore{upsertErrAt: 2, upsertErr: errors.New("database unavailable")}
+	launcher := &fakeLauncher{handle: "runtime-review-mer-1", canonicalHandle: "runtime-review-mer-1", stopErr: errors.New("destroy failed")}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	_, err := eng.Trigger(context.Background(), "mer-1")
+	if !errors.Is(err, ErrReviewerBindingIncomplete) || !strings.Contains(err.Error(), "database unavailable") || !strings.Contains(err.Error(), "destroy failed") {
+		t.Fatalf("Trigger error = %v, want fail-closed binding and stop evidence", err)
+	}
+	if store.review == nil || store.review.Harness != domain.ReviewerClaudeCode || store.review.ReviewerHandleID != "" {
+		t.Fatalf("partial-launch identity = %+v, want desired harness with canonical handle recoverable from session", store.review)
+	}
+	if len(store.runs) != 1 || store.runs[0].Status != domain.ReviewRunRunning {
+		t.Fatalf("live undisposed reviewer run = %+v, want running until runtime is stopped", store.runs)
+	}
+
+	// The explicit handle binding is empty, but policy reconciliation resolves
+	// the runtime's canonical handle and still retires the live Claude
+	// reviewer before cancelling its running record.
+	launcher.stopErr = nil
+	launcher.stoppedHandle = ""
+	eng.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+	if err := eng.ReconcileDisabled(context.Background()); err != nil {
+		t.Fatalf("ReconcileDisabled: %v", err)
+	}
+	if launcher.stoppedHandle != "runtime-review-mer-1" {
+		t.Fatalf("canonical reviewer handle was not stopped: %q", launcher.stoppedHandle)
+	}
+	if store.runs[0].Status != domain.ReviewRunCancelled || !strings.Contains(store.runs[0].Body, "disabled by policy") {
+		t.Fatalf("reconciled partial-launch run = %+v, want cancelled history", store.runs[0])
+	}
+}
+
+func TestTriggerRecoversLiveReviewerWithIncompleteBindingWithoutDuplicateLaunch(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode},
+		runs:   []domain.ReviewRun{{ID: "run-1", ReviewID: "rev-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunRunning}},
+	}
+	launcher := &fakeLauncher{alive: true, canonicalHandle: "runtime-review-mer-1", handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	res, err := eng.Trigger(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	if res.Created || res.ReviewerHandleID != "runtime-review-mer-1" || launcher.spawned || launcher.notified {
+		t.Fatalf("recovered trigger = %+v launcher=%+v, want existing run and reviewer", res, launcher)
+	}
+	if store.review == nil || store.review.ReviewerHandleID != "runtime-review-mer-1" || launcher.aliveHandle != "runtime-review-mer-1" {
+		t.Fatalf("review binding = %+v, want recovered canonical handle", store.review)
+	}
+	if len(store.runs) != 1 || store.runs[0].Status != domain.ReviewRunRunning {
+		t.Fatalf("review run history changed during recovery: %+v", store.runs)
+	}
+}
+
+func TestTriggerRecoversLiveReviewerAndNotifiesNewRun(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode},
+		runs:   []domain.ReviewRun{{ID: "run-old", ReviewID: "rev-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha0", Status: domain.ReviewRunComplete, Verdict: domain.VerdictApproved}},
+	}
+	launcher := &fakeLauncher{alive: true, canonicalHandle: "runtime-review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	res, err := eng.Trigger(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	if !res.Created || !launcher.notified || launcher.gotHandle != "runtime-review-mer-1" || launcher.spawned {
+		t.Fatalf("recovered trigger = %+v launcher=%+v, want canonical-handle notify without spawn", res, launcher)
+	}
+	if store.review == nil || store.review.ReviewerHandleID != "runtime-review-mer-1" {
+		t.Fatalf("review binding = %+v, want recovered canonical handle", store.review)
+	}
+	if len(store.runs) != 2 || store.runs[0].ID != "run-old" || store.runs[0].Status != domain.ReviewRunComplete || store.runs[1].Status != domain.ReviewRunRunning {
+		t.Fatalf("review history after recovered notify = %+v", store.runs)
+	}
+}
+
+func TestTriggerIncompleteBindingProbeFailureDoesNotSpawn(t *testing.T) {
+	store := &fakeStore{review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode}}
+	launcher := &fakeLauncher{aliveErr: errors.New("runtime unavailable"), handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	if _, err := eng.Trigger(context.Background(), "mer-1"); err == nil || !strings.Contains(err.Error(), "probe canonical reviewer handle") {
+		t.Fatalf("Trigger error = %v, want derived-handle probe failure", err)
+	}
+	if launcher.spawned || launcher.notified || len(store.runs) != 0 {
+		t.Fatalf("failed recovery caused reviewer work: launcher=%+v runs=%+v", launcher, store.runs)
+	}
+}
+
 func TestTriggerRetriesAfterFailedRunForSameCommit(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs:   []domain.ReviewRun{{ID: "run-failed", ReviewID: "rev-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunFailed}},
 	}
 	launcher := &fakeLauncher{handle: "review-mer-1"}
@@ -567,7 +782,7 @@ func TestTriggerRetriesAfterFailedRunForSameCommit(t *testing.T) {
 
 func TestTriggerRetriesAfterCancelledRunForSameCommit(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs:   []domain.ReviewRun{{ID: "run-cancelled", ReviewID: "rev-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunCancelled}},
 	}
 	launcher := &fakeLauncher{handle: "review-mer-1"}
@@ -645,7 +860,7 @@ func TestTriggerAllowsTwoPRsWithSameHeadSHA(t *testing.T) {
 
 func TestTriggerSkipsApprovedAndRunningCurrentHead(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs: []domain.ReviewRun{
 			{ID: "approved", ReviewID: "rev-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunComplete, Verdict: domain.VerdictApproved, CreatedAt: time.Unix(1, 0)},
 			{ID: "running", ReviewID: "rev-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/2", TargetSHA: "sha2", Status: domain.ReviewRunRunning, CreatedAt: time.Unix(2, 0)},
@@ -672,7 +887,7 @@ func TestTriggerSkipsApprovedAndRunningCurrentHead(t *testing.T) {
 
 func TestTriggerCreatesRunForChangesRequestedCurrentHead(t *testing.T) {
 	store := &fakeStore{
-		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", ReviewerHandleID: "review-mer-1"},
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
 		runs: []domain.ReviewRun{{
 			ID: "changes", ReviewID: "rev-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1",
 			Status: domain.ReviewRunComplete, Verdict: domain.VerdictChangesRequested, CreatedAt: time.Unix(1, 0),
@@ -705,6 +920,85 @@ func TestTriggerUsesConfiguredReviewerHarness(t *testing.T) {
 	}
 }
 
+func TestTriggerStopsLiveClaudeBeforeSwitchingPersistedHandleToCodex(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"},
+		runs: []domain.ReviewRun{{
+			ID: "run-claude", ReviewID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode,
+			PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunRunning,
+		}},
+	}
+	projects := fakeProjects{cfg: domain.ProjectConfig{Reviewers: []domain.ReviewerConfig{{Harness: domain.ReviewerCodex}}}}
+	launcher := &fakeLauncher{alive: true, handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), projects, launcher)
+
+	res, err := eng.Trigger(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	if launcher.stoppedHandle != "review-mer-1" || !launcher.spawned || launcher.notified {
+		t.Fatalf("harness switch runtime actions = %+v, want stop then fresh spawn", launcher)
+	}
+	if launcher.gotSpec.Harness != domain.ReviewerCodex || res.Run.Harness != domain.ReviewerCodex {
+		t.Fatalf("new reviewer harness: spec=%q run=%q, want codex", launcher.gotSpec.Harness, res.Run.Harness)
+	}
+	if store.review == nil || store.review.Harness != domain.ReviewerCodex || store.review.ReviewerHandleID != "review-mer-1" {
+		t.Fatalf("persisted review = %+v, want codex bound to replacement handle", store.review)
+	}
+	if store.runs[0].Status != domain.ReviewRunCancelled || store.runs[0].Harness != domain.ReviewerClaudeCode {
+		t.Fatalf("Claude review history changed incorrectly: %+v", store.runs[0])
+	}
+	if len(store.runs) != 2 || store.runs[1].Harness != domain.ReviewerCodex || store.runs[1].Status != domain.ReviewRunRunning {
+		t.Fatalf("replacement run history = %+v, want retained Claude run plus running Codex run", store.runs)
+	}
+}
+
+func TestTriggerHarnessSwitchStopFailureKeepsClaudeIdentityForPolicyReconcile(t *testing.T) {
+	original := domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1"}
+	store := &fakeStore{review: &original}
+	projects := fakeProjects{cfg: domain.ProjectConfig{Reviewers: []domain.ReviewerConfig{{Harness: domain.ReviewerCodex}}}}
+	launcher := &fakeLauncher{alive: true, handle: "review-mer-1", stopErr: errors.New("destroy failed")}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), projects, launcher)
+
+	if _, err := eng.Trigger(context.Background(), "mer-1"); err == nil || !strings.Contains(err.Error(), "destroy failed") {
+		t.Fatalf("Trigger error = %v, want stop failure", err)
+	}
+	if store.review == nil || *store.review != original {
+		t.Fatalf("stop failure relabelled persisted reviewer: got %+v want %+v", store.review, original)
+	}
+	if len(store.runs) != 0 || launcher.spawned || launcher.notified {
+		t.Fatalf("stop failure created replacement side effects: runs=%+v launcher=%+v", store.runs, launcher)
+	}
+
+	// Because Trigger left the row bound to Claude, enabling the disabled policy
+	// still discovers and retires the old runtime on the boot reconciliation path.
+	launcher.stopErr = nil
+	launcher.stoppedHandle = ""
+	eng.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+	if err := eng.ReconcileDisabled(context.Background()); err != nil {
+		t.Fatalf("ReconcileDisabled after switch failure: %v", err)
+	}
+	if launcher.stoppedHandle != "review-mer-1" {
+		t.Fatalf("disabled policy missed persisted Claude runtime: stopped=%q", launcher.stoppedHandle)
+	}
+}
+
+func TestTriggerRejectsDisabledReviewerBeforePersistenceOrLaunch(t *testing.T) {
+	store := &fakeStore{}
+	launcher := &fakeLauncher{handle: "review-mer-1"}
+	projects := fakeProjects{cfg: domain.ProjectConfig{Reviewers: []domain.ReviewerConfig{{Harness: domain.ReviewerClaudeCode}}}}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), projects, launcher)
+	eng.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+
+	_, err := eng.Trigger(context.Background(), "mer-1")
+	if !errors.Is(err, ErrAgentDisabled) {
+		t.Fatalf("Trigger error = %v, want ErrAgentDisabled", err)
+	}
+	if store.review != nil || len(store.runs) != 0 || launcher.spawned || launcher.notified {
+		t.Fatalf("disabled reviewer caused side effects: review=%+v runs=%d launcher=%+v", store.review, len(store.runs), launcher)
+	}
+}
+
 func TestTriggerRejectsBadWorkerState(t *testing.T) {
 	t.Run("unknown worker", func(t *testing.T) {
 		eng := newEngineForTest(&fakeStore{}, fakeSessions{ok: false}, prAt("sha1"), fakeProjects{}, &fakeLauncher{})
@@ -732,5 +1026,65 @@ func TestListReturnsHandleAndRuns(t *testing.T) {
 	}
 	if got.ReviewerHandleID != "review-mer-1" || len(got.Runs) != 1 {
 		t.Fatalf("list = %+v", got)
+	}
+}
+
+func TestListRecoversLiveReviewerWithIncompleteBinding(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerCodex},
+		runs:   []domain.ReviewRun{{ID: "run-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunRunning}},
+	}
+	launcher := &fakeLauncher{alive: true, canonicalHandle: "runtime-review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	got, err := eng.List(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if got.ReviewerHandleID != "runtime-review-mer-1" || store.review == nil || store.review.ReviewerHandleID != "runtime-review-mer-1" {
+		t.Fatalf("recovered list = %+v review=%+v", got, store.review)
+	}
+	if len(got.Runs) != 1 || got.Runs[0].ID != "run-1" || store.runs[0].Status != domain.ReviewRunRunning {
+		t.Fatalf("review history changed during list recovery: got=%+v stored=%+v", got.Runs, store.runs)
+	}
+}
+
+func TestCancelRecoversLiveReviewerWithIncompleteBinding(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerCodex},
+		runs:   []domain.ReviewRun{{ID: "run-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunRunning}},
+	}
+	launcher := &fakeLauncher{alive: true, canonicalHandle: "runtime-review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	res, err := eng.Cancel(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if !launcher.cancelled || launcher.cancelledHandle != "runtime-review-mer-1" || launcher.cancelledHarness != domain.ReviewerCodex {
+		t.Fatalf("recovered cancel did not target canonical reviewer: %+v", launcher)
+	}
+	if store.review == nil || store.review.ReviewerHandleID != "runtime-review-mer-1" || len(res.CancelledRuns) != 1 || store.runs[0].Status != domain.ReviewRunCancelled {
+		t.Fatalf("cancel recovery result=%+v review=%+v runs=%+v", res, store.review, store.runs)
+	}
+}
+
+func TestCancelIncompleteBindingWithAbsentRuntimeCancelsStaleRuns(t *testing.T) {
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerCodex},
+		runs:   []domain.ReviewRun{{ID: "run-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunRunning}},
+	}
+	launcher := &fakeLauncher{alive: false}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+
+	res, err := eng.Cancel(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if launcher.cancelled || res.ReviewerHandleID != "" {
+		t.Fatalf("absent runtime should not be interrupted: launcher=%+v result=%+v", launcher, res)
+	}
+	if len(res.CancelledRuns) != 1 || store.runs[0].Status != domain.ReviewRunCancelled || store.review.ReviewerHandleID != "" {
+		t.Fatalf("stale running review not safely cancelled: result=%+v review=%+v runs=%+v", res, store.review, store.runs)
 	}
 }

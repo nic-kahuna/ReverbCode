@@ -4,6 +4,7 @@ import type { components } from "../../api/schema";
 import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
 import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
+import { REVIEWER_AGENT_OPTIONS } from "../lib/agent-options";
 import { captureRendererEvent } from "../lib/telemetry";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
 import { newestActiveOrchestrator } from "../types/workspace";
@@ -25,8 +26,6 @@ const PERMISSION_MODE_OPTIONS = [
 	{ value: "auto", label: "Auto" },
 	{ value: "bypass-permissions", label: "Bypass permissions" },
 ] as const;
-
-const REVIEWER_OPTIONS = ["claude-code", "codex", "opencode"] as const;
 
 const projectQueryKey = (id: string) => ["project", id] as const;
 
@@ -92,9 +91,18 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 	const [replacementError, setReplacementError] = useState<string | null>(null);
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const initialOrchestratorAgent = config.orchestrator?.agent ?? "";
-	const missingRequiredAgent = form.workerAgent === "" || form.orchestratorAgent === "";
 	const agentsQuery = useQuery(agentsQueryOptions);
 	const agentCatalog = agentsQuery.data;
+	const hasAgentCatalog = agentCatalog?.supported !== undefined;
+	const supportedAgentIds = new Set(agentCatalog?.supported?.map((agent) => agent.id) ?? []);
+	const reviewerOptions =
+		agentCatalog?.supported?.filter((agent) => (REVIEWER_AGENT_OPTIONS as readonly string[]).includes(agent.id)) ?? [];
+	const reviewerAgentIds = new Set(reviewerOptions.map((agent) => agent.id));
+	const configuredReviewerUnavailable = form.reviewerHarness !== "" && !reviewerAgentIds.has(form.reviewerHarness);
+	const missingRequiredAgent =
+		form.workerAgent === "" ||
+		form.orchestratorAgent === "" ||
+		(hasAgentCatalog && (!supportedAgentIds.has(form.workerAgent) || !supportedAgentIds.has(form.orchestratorAgent)));
 	const refreshAgentsMutation = useMutation({
 		mutationFn: refreshAgents,
 		onSuccess: (next) => queryClient.setQueryData(agentsQueryKey, next),
@@ -169,6 +177,17 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 			void captureRendererEvent("ao.renderer.settings_save_failed", { project_id: projectId });
 		},
 	});
+	if (!hasAgentCatalog) {
+		return (
+			<CenteredNote>
+				{agentsQuery.isError
+					? agentsQuery.error instanceof Error
+						? agentsQuery.error.message
+						: "Could not load agent catalog."
+					: "Loading agent catalog…"}
+			</CenteredNote>
+		);
+	}
 
 	return (
 		<form
@@ -177,8 +196,18 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 				event.preventDefault();
 				setSavedAt(null);
 				setReplacementError(null);
+				if (!hasAgentCatalog) {
+					setValidationError("Agent catalog is unavailable. Refresh agents before saving.");
+					return;
+				}
 				if (missingRequiredAgent) {
 					setValidationError("Worker and orchestrator agents are required.");
+					return;
+				}
+				if (configuredReviewerUnavailable) {
+					setValidationError(
+						"The configured reviewer is unavailable. Select an available reviewer or project default.",
+					);
 					return;
 				}
 				if (intakeIncomplete) {
@@ -330,7 +359,9 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 					<Field label="Default reviewer agent" htmlFor="reviewerHarness">
 						<ReviewerSelect
 							id="reviewerHarness"
-							value={form.reviewerHarness}
+							value={reviewerAgentIds.has(form.reviewerHarness) ? form.reviewerHarness : ""}
+							options={reviewerOptions}
+							disabled={!hasAgentCatalog}
 							onChange={(v) => setForm((f) => ({ ...f, reviewerHarness: v }))}
 						/>
 					</Field>
@@ -391,17 +422,33 @@ function PermissionModeSelect({
 	);
 }
 
-function ReviewerSelect({ id, value, onChange }: { id: string; value: string; onChange: (value: string) => void }) {
+function ReviewerSelect({
+	disabled,
+	id,
+	onChange,
+	options,
+	value,
+}: {
+	disabled: boolean;
+	id: string;
+	onChange: (value: string) => void;
+	options: Array<{ id: string; label: string }>;
+	value: string;
+}) {
 	return (
-		<Select value={value || "__default__"} onValueChange={(v) => onChange(v === "__default__" ? "" : v)}>
+		<Select
+			value={value || "__default__"}
+			onValueChange={(v) => onChange(v === "__default__" ? "" : v)}
+			disabled={disabled}
+		>
 			<SelectTrigger id={id} className="h-control-form w-full text-control">
 				<SelectValue />
 			</SelectTrigger>
 			<SelectContent>
 				<SelectItem value="__default__">Project default</SelectItem>
-				{REVIEWER_OPTIONS.map((reviewer) => (
-					<SelectItem key={reviewer} value={reviewer}>
-						{reviewer}
+				{options.map((reviewer) => (
+					<SelectItem key={reviewer.id} value={reviewer.id}>
+						{reviewer.label}
 					</SelectItem>
 				))}
 			</SelectContent>

@@ -25,9 +25,13 @@ type stubRuntime struct {
 	destroyedHandles []string
 }
 
-func (s *stubRuntime) Create(context.Context, ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+func (s *stubRuntime) HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+	return ports.RuntimeHandle{ID: string(cfg.SessionID)}, nil
+}
+
+func (s *stubRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	s.created++
-	return ports.RuntimeHandle{ID: "h1"}, nil
+	return ports.RuntimeHandle{ID: string(cfg.SessionID)}, nil
 }
 func (s *stubRuntime) Destroy(_ context.Context, h ports.RuntimeHandle) error {
 	s.destroyed++
@@ -161,7 +165,7 @@ func TestSpawnPRKillRoundTrip(t *testing.T) {
 		t.Fatalf("spawn got %+v", sess)
 	}
 	rec, ok, _ := st.store.GetSession(ctx, sess.ID)
-	if !ok || rec.Metadata.RuntimeHandleID != "h1" || rec.IsTerminated {
+	if !ok || rec.Metadata.RuntimeHandleID != "mer-1" || rec.IsTerminated {
 		t.Fatalf("post-spawn row wrong: %+v", rec)
 	}
 	if err := st.prm.ApplyObservation(ctx, sess.ID, ports.PRObservation{Fetched: true, URL: "pr1", Number: 1, CI: domain.CIFailing, Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "boom"}}}); err != nil {

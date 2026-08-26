@@ -298,6 +298,23 @@ func TestSessionNameMatchesCreateNaming(t *testing.T) {
 	}
 }
 
+func TestHandleForPreservesCreateCanonicalization(t *testing.T) {
+	r := New(Options{})
+	longID := strings.Repeat("long", 20) + "-1"
+	for _, id := range []string{"short-1", "repo.issue.42", longID} {
+		handle, err := r.HandleFor(ports.RuntimeConfig{SessionID: domain.SessionID(id)})
+		if err != nil {
+			t.Fatalf("HandleFor(%q): %v", id, err)
+		}
+		if want := SessionName(id); handle.ID != want {
+			t.Fatalf("HandleFor(%q) = %q, want canonical %q", id, handle.ID, want)
+		}
+	}
+	if _, err := r.HandleFor(ports.RuntimeConfig{}); err == nil {
+		t.Fatal("HandleFor(empty) succeeded, want session id error")
+	}
+}
+
 // -- env key validation --
 
 func TestCreateRejectsInvalidEnvKeys(t *testing.T) {
@@ -368,6 +385,30 @@ func TestCreateIssuesNewSessionAndStatusOff(t *testing.T) {
 	// Call 3: has-session (IsAlive, uses exact-match target =sess-1).
 	if got, want := fr.calls[3].args, hasSessionArgs("sess-1"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("call[3] = %#v, want %#v", got, want)
+	}
+}
+
+func TestCreateReturnsHandleForDottedSessionID(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{nil, nil, nil, nil}
+	cfg := ports.RuntimeConfig{
+		SessionID:     "repo.issue.42",
+		WorkspacePath: "/tmp/ws",
+		Argv:          []string{"echo", "hi"},
+	}
+	want, err := r.HandleFor(cfg)
+	if err != nil {
+		t.Fatalf("HandleFor: %v", err)
+	}
+	got, err := r.Create(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got != want {
+		t.Fatalf("Create handle = %+v, want HandleFor result %+v", got, want)
+	}
+	if got.ID == string(cfg.SessionID) {
+		t.Fatalf("dotted tmux id was not canonicalized: %q", got.ID)
 	}
 }
 

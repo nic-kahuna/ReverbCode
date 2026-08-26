@@ -129,6 +129,33 @@ func TestListReturnsInitialSupportedInventoryWithoutProbing(t *testing.T) {
 	}
 }
 
+func TestNewWithPolicyOmitsDisabledAgentsFromCatalogAndProbe(t *testing.T) {
+	svc := NewWithPolicy(domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode}))
+	inv, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	foundCodex := false
+	for _, info := range inv.Supported {
+		if info.ID == "claude-code" {
+			t.Fatal("disabled claude-code remained in supported catalog")
+		}
+		if info.ID == "codex" {
+			foundCodex = true
+		}
+	}
+	if !foundCodex {
+		t.Fatal("enabled codex missing from supported catalog")
+	}
+	probe, err := svc.Probe(context.Background(), "claude-code")
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if probe.Supported || probe.Installed {
+		t.Fatalf("disabled probe = %+v, want unsupported/uninstalled", probe)
+	}
+}
+
 func TestRefreshReportsInstalledAgentsAndIgnoresDetectorErrors(t *testing.T) {
 	svc := NewWithAgents([]agentregistry.HarnessAgent{
 		harnessAgent("codex", "Codex", nil),

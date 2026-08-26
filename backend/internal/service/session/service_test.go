@@ -201,25 +201,42 @@ func TestSessionRenameMissingSessionReturnsNotFound(t *testing.T) {
 // fakeCommander records Kill/Spawn calls so a test can assert the
 // clean-orchestrator ordering without wiring a real session engine.
 type fakeCommander struct {
-	killed          []domain.SessionID
-	retired         []domain.SessionID
-	sent            []domain.SessionID
-	cleanupProjects []domain.ProjectID
-	killErr         error
-	retireErr       error
-	sendErr         error
-	cleanupErr      error
-	spawnErr        error
-	spawnRecord     domain.SessionRecord
-	spawned         bool
-	killsAtSpawn    int
+	killed           []domain.SessionID
+	retired          []domain.SessionID
+	sent             []domain.SessionID
+	cleanupProjects  []domain.ProjectID
+	killErr          error
+	retireErr        error
+	sendErr          error
+	cleanupErr       error
+	spawnErr         error
+	preflightErr     error
+	preflightHarness domain.AgentHarness
+	spawnRecord      domain.SessionRecord
+	spawned          bool
+	preflighted      int
+	spawnCfg         ports.SpawnConfig
+	killsAtSpawn     int
 }
 
+func (f *fakeCommander) ResolveSpawnAgentPolicy(_ context.Context, cfg ports.SpawnConfig) (ports.SpawnConfig, error) {
+	f.preflighted++
+	if f.preflightErr != nil {
+		return ports.SpawnConfig{}, f.preflightErr
+	}
+	if f.preflightHarness != "" {
+		cfg.Harness = f.preflightHarness
+	} else if cfg.Harness == "" {
+		cfg.Harness = domain.HarnessCodex
+	}
+	return cfg, nil
+}
 func (f *fakeCommander) Spawn(_ context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error) {
 	if f.spawnErr != nil {
 		return domain.SessionRecord{}, f.spawnErr
 	}
 	f.spawned = true
+	f.spawnCfg = cfg
 	f.killsAtSpawn = len(f.retired)
 	if f.spawnRecord.ID != "" {
 		return f.spawnRecord, nil
@@ -341,8 +358,28 @@ func TestSpawnOrchestratorCleanRetiresActiveOrchestratorsBeforeSpawn(t *testing.
 	if !fc.spawned || fc.killsAtSpawn != 2 {
 		t.Fatalf("spawn must run after both retirements: spawned=%v retirementsAtSpawn=%d", fc.spawned, fc.killsAtSpawn)
 	}
+	if fc.spawnCfg.Harness != domain.HarnessCodex {
+		t.Fatalf("spawn harness = %q, want preflight-pinned codex", fc.spawnCfg.Harness)
+	}
 	if len(fc.killed) != 0 {
 		t.Fatalf("interactive Kill must not be used for replacement: killed=%v", fc.killed)
+	}
+}
+
+func TestSpawnOrchestratorCleanPinsPreflightHarnessAcrossConfigChange(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{
+		ID: "mer", Config: domain.ProjectConfig{Orchestrator: domain.RoleOverride{Harness: domain.HarnessCodex}},
+	}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator}
+	fc := &fakeCommander{preflightHarness: domain.HarnessCodex}
+	svc := &Service{manager: fc, store: st}
+
+	if _, err := svc.SpawnOrchestrator(context.Background(), "mer", true); err != nil {
+		t.Fatalf("SpawnOrchestrator: %v", err)
+	}
+	if fc.spawnCfg.Harness != domain.HarnessCodex {
+		t.Fatalf("spawn harness = %q, want exact preflight harness codex", fc.spawnCfg.Harness)
 	}
 }
 
@@ -361,6 +398,29 @@ func TestSpawnOrchestratorCleanContinuesWhenRetireNoticeFails(t *testing.T) {
 	}
 	if !fc.spawned {
 		t.Fatal("replacement should still spawn when retire notice delivery fails")
+	}
+}
+
+func TestSpawnOrchestratorCleanDisabledReplacementHasNoRetirementSideEffects(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{
+		ID:     "mer",
+		Config: domain.ProjectConfig{Orchestrator: domain.RoleOverride{Harness: domain.HarnessClaudeCode}},
+	}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator}
+	fc := &fakeCommander{preflightErr: fmt.Errorf("spawn: %w: %q", sessionmanager.ErrAgentDisabled, domain.HarnessClaudeCode)}
+	svc := &Service{manager: fc, store: st}
+
+	_, err := svc.SpawnOrchestrator(context.Background(), "mer", true)
+	var apiError *apierr.Error
+	if !errors.As(err, &apiError) || apiError.Code != "AGENT_DISABLED" {
+		t.Fatalf("SpawnOrchestrator error = %v, want AGENT_DISABLED", err)
+	}
+	if fc.preflighted != 1 {
+		t.Fatalf("policy preflights = %d, want 1", fc.preflighted)
+	}
+	if len(fc.sent) != 0 || len(fc.retired) != 0 || fc.spawned {
+		t.Fatalf("disabled replacement caused side effects: notices=%v retired=%v spawned=%v", fc.sent, fc.retired, fc.spawned)
 	}
 }
 
@@ -582,6 +642,7 @@ func TestToAPIErrorMapsWorkspaceBranchSentinels(t *testing.T) {
 		{"agent binary not found", fmt.Errorf("spawn mer-1: %w", ports.ErrAgentBinaryNotFound), apierr.KindInvalid, "AGENT_BINARY_NOT_FOUND"},
 		{"runtime prerequisite missing", fmt.Errorf("spawn: %w: tmux required on macOS/Linux but not in PATH", ports.ErrRuntimePrerequisite), apierr.KindInvalid, "RUNTIME_PREREQUISITE_MISSING"},
 		{"unknown harness", fmt.Errorf("spawn: %w: %q", sessionmanager.ErrUnknownHarness, "bogus"), apierr.KindInvalid, "UNKNOWN_HARNESS"},
+		{"disabled agent", fmt.Errorf("spawn: %w: %q", sessionmanager.ErrAgentDisabled, "claude-code"), apierr.KindConflict, "AGENT_DISABLED"},
 		{"missing harness", fmt.Errorf("spawn: %w: configure project worker.agent or pass --harness", sessionmanager.ErrMissingHarness), apierr.KindInvalid, "AGENT_REQUIRED"},
 		{"awaiting decision", fmt.Errorf("send mer-1: %w", sessionmanager.ErrAwaitingDecision), apierr.KindConflict, "SESSION_AWAITING_DECISION"},
 	}

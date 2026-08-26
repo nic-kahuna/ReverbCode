@@ -38,7 +38,7 @@ type ProjectConfig struct {
 
 	// Reviewers names the agent(s) that review a worker's PR when a review is
 	// triggered. It is configured independently of the Worker override; an empty
-	// list falls back to claude-code (see ResolveReviewerHarness).
+	// list falls back to codex (see ResolveReviewerHarness).
 	Reviewers []ReviewerConfig `json:"reviewers,omitempty"`
 
 	// TrackerIntake controls issue-driven worker spawning. It is opt-in and
@@ -56,12 +56,12 @@ type ReviewerConfig struct {
 
 // FallbackReviewerHarness is the reviewer used when a project configures none
 // and the worker's harness is not itself a supported reviewer.
-const FallbackReviewerHarness = ReviewerClaudeCode
+const FallbackReviewerHarness = ReviewerCodex
 
 // ResolveReviewerHarness picks the reviewer harness for a worker. A configured
 // reviewer wins. Otherwise the worker's own harness is reused when it is itself
 // a supported reviewer (e.g. a codex worker is reviewed by codex); a worker
-// whose harness is not a reviewer (e.g. crush) falls back to claude-code.
+// whose harness is not a reviewer (e.g. crush) falls back to codex.
 func (c ProjectConfig) ResolveReviewerHarness(worker AgentHarness) ReviewerHarness {
 	if len(c.Reviewers) > 0 {
 		return c.Reviewers[0].Harness
