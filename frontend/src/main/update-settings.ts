@@ -12,13 +12,22 @@ export interface UpdateSettings {
 // Live state of a manual update check/download, streamed to the renderer so the
 // Global Settings "Check for updates" / "Update" buttons can reflect progress.
 export type UpdateState =
-	"idle" | "checking" | "available" | "not-available" | "downloading" | "downloaded" | "error" | "unsupported";
+	| "idle"
+	| "checking"
+	| "available"
+	| "not-available"
+	| "downloading"
+	| "downloaded"
+	| "error"
+	| "unsupported";
 
 export interface UpdateStatus {
 	state: UpdateState;
 	version?: string;
 	percent?: number;
 	message?: string;
+	/** Stable packaged-policy identity for deterministic rollout probes. */
+	policy?: string;
 }
 
 /** File holding the user's auto-update preferences under the ~/.ao state dir. */
