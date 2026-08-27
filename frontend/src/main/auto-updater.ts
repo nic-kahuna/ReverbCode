@@ -9,6 +9,7 @@ import {
 	type UpdateChannel,
 	type UpdateStatus,
 } from "./update-settings";
+import { DESKTOP_UPDATES_DISABLED, desktopUpdatesDisabledStatus } from "./desktop-update-policy";
 
 // configureFeed sets the update channel on electron-updater. The repo/owner
 // are loaded automatically from app-update.yml (written by forge.config.ts's
@@ -25,7 +26,7 @@ function configureFeed(channel: UpdateChannel): void {
 	autoUpdater.allowDowngrade = true; // permits a nightly -> stable channel switch
 }
 
-let lastStatus: UpdateStatus = { state: "idle" };
+let lastStatus: UpdateStatus = DESKTOP_UPDATES_DISABLED ? desktopUpdatesDisabledStatus() : { state: "idle" };
 let eventsWired = false;
 
 // broadcast pushes the latest update status to every renderer window so the
@@ -35,6 +36,14 @@ function broadcast(status: UpdateStatus): void {
 	for (const win of BrowserWindow.getAllWindows()) {
 		if (!win.isDestroyed()) win.webContents.send("updates:status", status);
 	}
+}
+
+// This main-process guard is the authorization boundary for every updater
+// entry point. Renderer visibility is informational only.
+function rejectDisabledDesktopUpdates(): boolean {
+	if (!DESKTOP_UPDATES_DISABLED) return false;
+	broadcast(desktopUpdatesDisabledStatus());
+	return true;
 }
 
 // wireUpdaterEvents registers electron-updater listeners once and forwards each
@@ -64,6 +73,7 @@ export function getUpdateStatus(): UpdateStatus {
 // It is a thin shell: all policy (channel, opt-in) comes from update-settings.
 // Caller guards on app.isPackaged.
 export async function startAutoUpdates(stateDir: string): Promise<void> {
+	if (rejectDisabledDesktopUpdates()) return;
 	const settings = await readUpdateSettings(stateDir);
 	if (!settings.enabled) return;
 
@@ -85,6 +95,7 @@ export async function startAutoUpdates(stateDir: string): Promise<void> {
 // reports progress via the broadcast status. Updates only work in the packaged,
 // signed app; in dev electron-updater has no feed, so surface that plainly.
 export async function checkForUpdatesNow(stateDir: string): Promise<void> {
+	if (rejectDisabledDesktopUpdates()) return;
 	wireUpdaterEvents();
 	if (!app.isPackaged) {
 		broadcast({ state: "unsupported", message: "Updates are only available in the installed app." });
@@ -104,6 +115,7 @@ export async function checkForUpdatesNow(stateDir: string): Promise<void> {
 
 // downloadUpdateNow starts downloading the update found by checkForUpdatesNow.
 export async function downloadUpdateNow(): Promise<void> {
+	if (rejectDisabledDesktopUpdates()) return;
 	wireUpdaterEvents();
 	if (!app.isPackaged) {
 		broadcast({ state: "unsupported", message: "Updates are only available in the installed app." });
@@ -119,6 +131,7 @@ export async function downloadUpdateNow(): Promise<void> {
 // quitAndInstallUpdate installs a downloaded update and relaunches. isSilent
 // false keeps the installer UI on Windows; isForceRunAfter relaunches the app.
 export function quitAndInstallUpdate(): void {
+	if (rejectDisabledDesktopUpdates()) return;
 	if (!app.isPackaged) return;
 	autoUpdater.quitAndInstall(false, true);
 }
@@ -126,6 +139,7 @@ export function quitAndInstallUpdate(): void {
 // ensureUpdatePrefs prompts once (first run, before any settings file exists)
 // for auto-update opt-in + channel, with a nightly instability disclaimer.
 export async function ensureUpdatePrefs(stateDir: string): Promise<void> {
+	if (rejectDisabledDesktopUpdates()) return;
 	if (existsSync(path.join(stateDir, UPDATE_SETTINGS_FILE_NAME))) return;
 
 	const optIn = await dialog.showMessageBox({

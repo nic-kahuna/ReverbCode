@@ -19,6 +19,8 @@ export interface UpdateStatus {
 	version?: string;
 	percent?: number;
 	message?: string;
+	/** Stable packaged-policy identity for deterministic rollout probes. */
+	policy?: string;
 }
 
 /** File holding the user's auto-update preferences under the ~/.ao state dir. */

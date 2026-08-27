@@ -184,6 +184,34 @@ exactly one bundle with `dev.agent-orchestrator.desktop` in an Applications
 directory so macOS privacy grants do not resolve to an obsolete copy. This local
 path must never change the official Developer-ID/notarized release flow.
 
+For a deliberately pinned local build, set
+`AO_DISABLE_DESKTOP_UPDATES=true` on the `npm run package` process. The Vite
+main-process build normalizes that exact value and compiles it into the Electron
+main bundle; it is independent of `AO_LOCAL_SIGNING` and defaults to updates
+enabled when omitted. A disabled package blocks automatic checks, manual checks,
+downloads, restart/install, and the first-run update prompt. Rebuild without the
+setting to restore ordinary updater behavior.
+
+Before rollout, extract `.vite/build/main.js` from the packaged `app.asar` and
+require the disabled marker while rejecting the enabled marker. From the
+`frontend` directory (after dependencies are installed):
+
+```bash
+AO_APP_ASAR="/path/to/Agent Orchestrator.app/Contents/Resources/app.asar"
+node - "$AO_APP_ASAR" <<'NODE'
+const { extractFile } = require("@electron/asar");
+const main = extractFile(process.argv[2], ".vite/build/main.js").toString("utf8");
+if (!main.includes("ao-desktop-updates-disabled/v1")) process.exit(1);
+if (main.includes("ao-desktop-updates-enabled/v1")) process.exit(1);
+NODE
+```
+
+Run that probe against the final signed bundle used by the staged macOS rollout,
+then confirm the renderer-facing updater status has `state: "unsupported"` and
+`policy: "ao-desktop-updates-disabled/v1"`. The static marker proves the signed
+artifact was built with the policy; renderer status is visibility, not the
+authorization boundary.
+
 For managed local automation, provider profile files such as
 `$CODEX_HOME/ao-minimal.config.toml` are installed outside the application
 bundle and selected through typed project role configuration. They are runtime
