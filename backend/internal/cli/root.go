@@ -29,7 +29,7 @@ func executeWithDeps(deps Deps, args []string) error {
 	cmd := NewRootCommand(deps)
 	cmd.SetArgs(args)
 	err := cmd.Execute()
-	if err != nil && ExitCode(err) == 2 {
+	if err != nil && ExitCode(err) == 2 && !offlineCommand(args) {
 		(&commandContext{deps: deps}).emitCLIUsageError(context.Background(), args, err)
 	}
 	return err
@@ -179,6 +179,8 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		return usageError{err}
 	})
 
+	root.AddCommand(newCompatibilityCommand())
+	root.AddCommand(newPrepareStartPausedCommand())
 	root.AddCommand(newDaemonCommand())
 	root.AddCommand(newStartCommand(ctx))
 	root.AddCommand(newStopCommand(ctx))
@@ -208,7 +210,7 @@ type commandContext struct {
 
 func shouldEmitCLIInvocation(cmd *cobra.Command) bool {
 	switch strings.TrimSpace(cmd.CommandPath()) {
-	case "ao daemon", "ao start", "ao completion", "ao help":
+	case "ao daemon", "ao import", "ao compatibility", "ao prepare-start-paused", "ao start", "ao completion", "ao help":
 		return false
 	default:
 		return true
@@ -265,14 +267,24 @@ func atMostOneArg(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func offlineCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	return args[0] == "daemon" || args[0] == "import" || args[0] == "compatibility" || args[0] == "prepare-start-paused"
+}
+
 func newDaemonCommand() *cobra.Command {
-	return &cobra.Command{
+	var opts daemon.Options
+	cmd := &cobra.Command{
 		Use:    "daemon",
 		Short:  "Run the AO backend daemon",
 		Hidden: true,
 		Args:   noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return daemon.Run()
+			return daemon.RunWithOptions(opts)
 		},
 	}
+	cmd.Flags().BoolVar(&opts.StartPaused, "start-paused", false, "Persist project admission pauses before startup")
+	return cmd
 }

@@ -74,6 +74,9 @@ var DefaultAllowedOrigins = []string{
 // Config is the fully-resolved daemon configuration. It is immutable once
 // built by Load.
 type Config struct {
+	// StartPaused persists all project admission pauses before subsystem startup
+	// and defaults projects first registered during this boot to paused.
+	StartPaused bool
 	// Host is the bind address. Always loopback — see LoopbackHost.
 	Host string
 	// Port is the TCP port to bind. The daemon fails fast if it is taken.
@@ -119,6 +122,7 @@ func (c Config) AgentPolicy() domain.AgentPolicy {
 //
 // Recognised variables:
 //
+//	AO_START_PAUSED      maintenance boot; persist admission pause (true|false)
 //	AO_PORT              bind port           (default 3001)
 //	AO_REQUEST_TIMEOUT   per-request timeout (Go duration > 0, default 60s)
 //	AO_SHUTDOWN_TIMEOUT  shutdown deadline   (Go duration > 0, default 10s)
@@ -146,6 +150,13 @@ func Load() (Config, error) {
 			Remote:      TelemetryRemoteOff,
 			PostHogHost: DefaultTelemetryPostHogHost,
 		},
+	}
+
+	if raw, present := os.LookupEnv("AO_START_PAUSED"); present {
+		if raw != "true" && raw != "false" {
+			return Config{}, fmt.Errorf("invalid AO_START_PAUSED %q: want true or false", raw)
+		}
+		cfg.StartPaused = raw == "true"
 	}
 
 	if raw := os.Getenv("AO_PORT"); raw != "" {

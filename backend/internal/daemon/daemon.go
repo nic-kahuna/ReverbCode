@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
+	"github.com/aoagents/agent-orchestrator/backend/internal/bootguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/supervisor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -31,17 +32,30 @@ import (
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
-	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
 
 // Run starts the daemon and blocks until it exits. SIGINT/SIGTERM drive
 // graceful shutdown through the HTTP server and background workers.
-func Run() error {
+func Run() error { return RunWithOptions(Options{}) }
+
+// Options controls an explicit maintenance boot. It is not a global live pause.
+type Options struct{ StartPaused bool }
+
+// RunWithOptions applies explicit maintenance options before starting lanes.
+func RunWithOptions(opts Options) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
+
+	cfg.StartPaused = cfg.StartPaused || opts.StartPaused
+	guard, err := bootguard.Open(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("startup compatibility: %w", err)
+	}
+	defer func() { _ = guard.Close() }()
+	cfg.DataDir = guard.DataDir()
 
 	log := newLogger()
 
@@ -59,12 +73,9 @@ func Run() error {
 		return fmt.Errorf("daemon already running (pid %d, port %d); refusing to start", live.PID, live.Port)
 	}
 
-	// Open the durable store and bring up the CDC substrate: DB triggers capture
-	// changes into change_log, the poller tails it, and the broadcaster fans
-	// events out to live transports.
-	store, err := sqlite.Open(cfg.DataDir)
+	store, _, err := openGuardedStartupStore(context.Background(), guard, cfg.StartPaused)
 	if err != nil {
-		return fmt.Errorf("open store: %w", err)
+		return err
 	}
 	defer func() { _ = store.Close() }()
 

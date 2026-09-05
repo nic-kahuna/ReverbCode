@@ -213,6 +213,10 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 		projectConfig = *in.Config
 	}
 
+	if policy, ok := m.store.(interface{ NewProjectAdmissionPaused() bool }); ok && policy.NewProjectAdmissionPaused() {
+		projectConfig.AdmissionPaused = true
+	}
+
 	registeredAt := time.Now()
 	row := domain.ProjectRecord{
 		ID:           string(id),

@@ -23,3 +23,9 @@ FROM projects WHERE path = ? AND archived_at IS NULL;
 
 -- name: ArchiveProject :execrows
 UPDATE projects SET archived_at = ? WHERE id = ? AND archived_at IS NULL;
+
+-- name: ListProjectConfigsForStartup :many
+SELECT id, config FROM projects ORDER BY id;
+
+-- name: PauseAllProjectAdmission :exec
+UPDATE projects SET config = json_set(COALESCE(config, '{}'), '$.admissionPaused', json('true'));

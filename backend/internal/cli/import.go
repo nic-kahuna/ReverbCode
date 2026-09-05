@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/bootguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/legacyimport"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
@@ -99,11 +100,21 @@ func (c *commandContext) runImport(cmd *cobra.Command, opts importOptions) error
 // one-time bootstrap that must run with the daemon stopped (guarded by the
 // caller), so it cannot go through the daemon's loopback API.
 func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, opts legacyimport.Options) (legacyimport.Report, error) {
-	store, err := sqlite.Open(cfg.DataDir)
+	guard, err := bootguard.Open(cfg.DataDir)
+	if err != nil {
+		return legacyimport.Report{}, fmt.Errorf("import compatibility: %w", err)
+	}
+	defer func() { _ = guard.Close() }()
+	store, err := sqlite.Open(guard.DataDir())
 	if err != nil {
 		return legacyimport.Report{}, fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	if cfg.StartPaused {
+		if _, err := store.PauseAdmissionForStartup(ctx); err != nil {
+			return legacyimport.Report{}, err
+		}
+	}
 	return legacyimport.Run(ctx, store, opts)
 }
 

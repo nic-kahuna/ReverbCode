@@ -14,24 +14,30 @@ import (
 
 // UpsertProject inserts or replaces a registered project row.
 func (s *Store) UpsertProject(ctx context.Context, r domain.ProjectRecord) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.applyNewProjectAdmission(ctx, &r); err != nil {
+		return err
+	}
 	config, err := marshalProjectConfig(r.Config)
 	if err != nil {
 		return err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	return upsertProject(ctx, s.qw, r, config)
 }
 
 // UpsertWorkspaceProject inserts or replaces a workspace project and its child
 // repository registry in one transaction. The child set is authoritative.
 func (s *Store) UpsertWorkspaceProject(ctx context.Context, r domain.ProjectRecord, repos []domain.WorkspaceRepoRecord) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.applyNewProjectAdmission(ctx, &r); err != nil {
+		return err
+	}
 	config, err := marshalProjectConfig(r.Config)
 	if err != nil {
 		return err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	return s.inTx(ctx, "upsert workspace project", func(q *gen.Queries) error {
 		if err := upsertProject(ctx, q, r, config); err != nil {
 			return err
@@ -198,4 +204,65 @@ func nullTime(t time.Time) sql.NullTime {
 		return sql.NullTime{}
 	}
 	return sql.NullTime{Time: t, Valid: true}
+}
+
+// PauseAdmissionForStartup runs before any observer or runtime lane exists.
+// One transaction preserves unrelated config fields and includes archived rows.
+func (s *Store) PauseAdmissionForStartup(ctx context.Context) (ids []string, resultErr error) {
+	ids = []string{}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	// A published offline preparation must survive a crash. Ordinary AO writes
+	// use NORMAL; this transaction explicitly syncs its WAL before success.
+	if _, err := s.writeDB.ExecContext(ctx, "PRAGMA synchronous=FULL"); err != nil {
+		return nil, err
+	}
+	defer func() {
+		_, err := s.writeDB.ExecContext(context.Background(), "PRAGMA synchronous=NORMAL")
+		resultErr = errors.Join(resultErr, err)
+	}()
+	err := s.inTx(ctx, "startup admission pause", func(q *gen.Queries) error {
+		rows, err := q.ListProjectConfigsForStartup(ctx)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			ids = append(ids, string(row.ID))
+			if !row.Config.Valid {
+				continue
+			}
+			var existing domain.ProjectConfig
+			if err := json.Unmarshal([]byte(row.Config.String), &existing); err != nil {
+				return fmt.Errorf("project %s has unsupported configuration; startup refused: %w", row.ID, err)
+			}
+			if err := existing.Validate(); err != nil {
+				return fmt.Errorf("project %s has invalid configuration; startup refused: %w", row.ID, err)
+			}
+		}
+		return q.PauseAllProjectAdmission(ctx)
+	})
+	if err == nil {
+		s.newProjectsPaused = true
+	}
+	return ids, err
+}
+
+// NewProjectAdmissionPaused is fixed for this boot after startup preparation.
+func (s *Store) NewProjectAdmissionPaused() bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.newProjectsPaused
+}
+
+// applyNewProjectAdmission is called only with writeMu held.
+func (s *Store) applyNewProjectAdmission(ctx context.Context, r *domain.ProjectRecord) error {
+	if !s.newProjectsPaused {
+		return nil
+	}
+	previous, err := s.qw.GetProject(ctx, domain.ProjectID(r.ID))
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && previous.ArchivedAt.Valid) {
+		r.Config.AdmissionPaused = true
+		return nil
+	}
+	return err
 }

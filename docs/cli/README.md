@@ -170,3 +170,53 @@ actions.
 
 Do not port old in-process TypeScript CLI behavior that mixed command handling
 with storage and runtime implementation details.
+
+### Native startup compatibility and maintenance preparation
+
+`ao compatibility --json` reads only the native marker at
+`<AO_DATA_DIR>/compatibility.json` and reports the binary's supported protocol.
+It creates no data and contacts no daemon. Its `inspectionOnly: true` result is
+observational: an installer must hold the canonical data-directory `ao.lock`,
+recheck the marker and retain that lock across app/helper replacement. It must
+also independently verify the candidate artifact identity. An unsupported,
+malformed or unavailable marker emits inspection JSON and a nonzero exit.
+
+`ao prepare-start-paused --json` is the explicit offline preparation command.
+Stop the app and daemon first. The command holds `ao.lock`, checks compatibility
+before opening/migrating SQLite, persists admission pauses for every project
+(including archived projects), and exits without starting any runtime,
+lifecycle, observer, HTTP server or telemetry lane. Its versioned proof lists
+the paused project IDs; it does not prove existing worker processes stopped.
+
+`ao daemon --start-paused` (or `AO_START_PAUSED=true`) applies the same pause
+before subsystem construction and defaults newly registered projects to paused
+for that boot. An ordinary later start preserves the individual persisted
+values. Explicit per-project resume remains possible and does not automatically
+restore existing sessions. This installation/maintenance option is separate
+from selective foreground interference policy and is not a suspension receipt.
+Admission protects new launches and admission-guarded messages; ordinary sends
+and existing worker/lifecycle activity still require the later session fence.
+
+The strict canonical marker has one supported representation for protocol 1:
+
+```json
+{"schema":"ao-data-compatibility/v1","requiredProtocol":1}
+```
+
+The file ends in one newline. The native boot guard acquires the canonical
+lifetime lock before marker bootstrap, ordinary migrations or subsystem
+construction. A future capable build must durably ratchet this monotonic floor
+before writing newer custody state, under the same ownership. Failure, including
+uncertain persistence, forbids the later write. The ratchet never lowers the
+floor or reconstructs a marker deleted while ownership is held. Removing the
+marker or editing it by hand is unsupported; absence is only the legacy
+bootstrap case. New/unknown fields, noncanonical bytes and future protocols
+fail closed rather than being repaired.
+
+A supported guard-aware older binary refuses a future protocol before database
+or runtime mutation. A pre-guard archived executable does not know this marker
+exists: supported launcher/installer/rollback checks must reject it before
+replacement or launch. Native source integration alone does not establish an
+installed rollback floor. Existing app location and updater-off policy remain
+unchanged. No protection against malicious same-user executable replacement is
+claimed.

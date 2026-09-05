@@ -72,6 +72,38 @@ func (q *Queries) GetProject(ctx context.Context, id domain.ProjectID) (Project,
 	return i, err
 }
 
+const listProjectConfigsForStartup = `-- name: ListProjectConfigsForStartup :many
+SELECT id, config FROM projects ORDER BY id
+`
+
+type ListProjectConfigsForStartupRow struct {
+	ID     domain.ProjectID
+	Config sql.NullString
+}
+
+func (q *Queries) ListProjectConfigsForStartup(ctx context.Context) ([]ListProjectConfigsForStartupRow, error) {
+	rows, err := q.db.QueryContext(ctx, listProjectConfigsForStartup)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListProjectConfigsForStartupRow{}
+	for rows.Next() {
+		var i ListProjectConfigsForStartupRow
+		if err := rows.Scan(&i.ID, &i.Config); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listProjects = `-- name: ListProjects :many
 SELECT id, path, repo_origin_url, display_name, registered_at, archived_at, config, kind
 FROM projects WHERE archived_at IS NULL ORDER BY id
@@ -107,6 +139,15 @@ func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const pauseAllProjectAdmission = `-- name: PauseAllProjectAdmission :exec
+UPDATE projects SET config = json_set(COALESCE(config, '{}'), '$.admissionPaused', json('true'))
+`
+
+func (q *Queries) PauseAllProjectAdmission(ctx context.Context) error {
+	_, err := q.db.ExecContext(ctx, pauseAllProjectAdmission)
+	return err
 }
 
 const upsertProject = `-- name: UpsertProject :exec
