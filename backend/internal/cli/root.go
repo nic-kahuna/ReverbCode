@@ -28,8 +28,8 @@ func executeWithDeps(deps Deps, args []string) error {
 	deps = deps.withDefaults()
 	cmd := NewRootCommand(deps)
 	cmd.SetArgs(args)
-	err := cmd.Execute()
-	if err != nil && ExitCode(err) == 2 && !offlineCommand(args) {
+	executed, err := cmd.ExecuteC()
+	if err != nil && ExitCode(err) == 2 && !offlineCommand(executed) {
 		(&commandContext{deps: deps}).emitCLIUsageError(context.Background(), args, err)
 	}
 	return err
@@ -267,11 +267,18 @@ func atMostOneArg(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func offlineCommand(args []string) bool {
-	if len(args) == 0 {
+// Classify the command Cobra actually resolved, including leading global
+// flags, rather than inferring an offline operation from token position.
+func offlineCommand(cmd *cobra.Command) bool {
+	if cmd == nil {
 		return false
 	}
-	return args[0] == "daemon" || args[0] == "import" || args[0] == "compatibility" || args[0] == "prepare-start-paused"
+	switch cmd.CommandPath() {
+	case "ao daemon", "ao import", "ao compatibility", "ao prepare-start-paused":
+		return true
+	default:
+		return false
+	}
 }
 
 func newDaemonCommand() *cobra.Command {

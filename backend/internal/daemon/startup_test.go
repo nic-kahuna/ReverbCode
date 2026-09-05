@@ -239,3 +239,55 @@ func TestPrepareRefusesLiveLegacyRunfileBeforeDatabase(t *testing.T) {
 		t.Fatalf("opened database: %v", err)
 	}
 }
+
+func TestStartupPauseRejectsEffectiveFalseFromAmbiguousJSONAtomically(t *testing.T) {
+	for _, ambiguous := range []string{
+		`{"admissionPaused":false,"admissionPaused":false}`,
+		`{"admissionPaused":false,"AdmissionPaused":false}`,
+		`{"admissionPaused":false,"ADMISSIONPAUSED":false}`,
+	} {
+		t.Run(ambiguous, func(t *testing.T) {
+			cfg := startupConfig(t)
+			ctx := context.Background()
+			store, err := sqlite.Open(cfg.DataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"a-valid", "z-ambiguous"} {
+				if err := store.UpsertProject(ctx, domain.ProjectRecord{ID: id, Path: "/repos/" + id, RegisteredAt: time.Now()}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "ao.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			if _, err := raw.Exec(`UPDATE projects SET config=? WHERE id='z-ambiguous'`, ambiguous); err != nil {
+				t.Fatal(err)
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if _, err := PrepareStartPaused(ctx, cfg); err == nil {
+					t.Fatal("ambiguous policy reported successfully paused")
+				}
+				var configAfter string
+				if err := raw.QueryRow(`SELECT config FROM projects WHERE id='z-ambiguous'`).Scan(&configAfter); err != nil {
+					t.Fatal(err)
+				}
+				if configAfter != ambiguous {
+					t.Fatalf("ambiguous config rewritten: %s", configAfter)
+				}
+				var validConfig sql.NullString
+				if err := raw.QueryRow(`SELECT config FROM projects WHERE id='a-valid'`).Scan(&validConfig); err != nil {
+					t.Fatal(err)
+				}
+				if validConfig.Valid {
+					t.Fatalf("preceding valid row partially paused: %s", validConfig.String)
+				}
+			}
+		})
+	}
+}

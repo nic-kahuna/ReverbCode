@@ -239,7 +239,29 @@ func (s *Store) PauseAdmissionForStartup(ctx context.Context) (ids []string, res
 				return fmt.Errorf("project %s has invalid configuration; startup refused: %w", row.ID, err)
 			}
 		}
-		return q.PauseAllProjectAdmission(ctx)
+		if err := q.PauseAllProjectAdmission(ctx); err != nil {
+			return err
+		}
+		// SQLite json_set and Go JSON decoding differ on duplicate/case-variant
+		// keys. Verify the effective policy with the same decoder admission uses,
+		// in this transaction, before publishing a successful pause.
+		updated, err := q.ListProjectConfigsForStartup(ctx)
+		if err != nil {
+			return err
+		}
+		for _, row := range updated {
+			var effective domain.ProjectConfig
+			if !row.Config.Valid {
+				return fmt.Errorf("project %s pause was not persisted", row.ID)
+			}
+			if err := json.Unmarshal([]byte(row.Config.String), &effective); err != nil {
+				return fmt.Errorf("project %s effective admission is invalid: %w", row.ID, err)
+			}
+			if !effective.AdmissionPaused {
+				return fmt.Errorf("project %s has ambiguous admission keys; startup pause refused", row.ID)
+			}
+		}
+		return nil
 	})
 	if err == nil {
 		s.newProjectsPaused = true

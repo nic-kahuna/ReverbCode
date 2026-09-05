@@ -63,7 +63,11 @@ func TestOfflineCommandsNeverEmitInvocationOrUsageTelemetry(t *testing.T) {
 	}
 	calls := 0
 	deps := Deps{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, ProcessAlive: func(int) bool { return true }, HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { calls++; return jsonResponse(200, "{}"), nil })}}
-	for _, args := range [][]string{{"compatibility", "--json"}, {"compatibility", "--invalid"}, {"prepare-start-paused", "--json"}, {"prepare-start-paused", "--invalid"}, {"import", "--from", t.TempDir(), "--yes"}, {"import", "--invalid"}, {"daemon", "--invalid"}} {
+	for _, args := range [][]string{
+		{"compatibility", "--json"}, {"compatibility", "--invalid"}, {"prepare-start-paused", "--json"}, {"prepare-start-paused", "--invalid"}, {"import", "--from", t.TempDir(), "--yes"}, {"import", "--invalid"}, {"daemon", "--invalid"},
+		{"--help=false", "import", "--invalid"}, {"--help=false", "compatibility", "--invalid"}, {"--help=false", "prepare-start-paused", "--invalid"}, {"--help=false", "daemon", "--invalid"},
+		{"-h=false", "import", "extra"}, {"--help=false", "--version=false", "compatibility", "--invalid"},
+	} {
 		_ = executeWithDeps(deps, args)
 	}
 	if calls != 0 {

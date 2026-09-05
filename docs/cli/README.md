@@ -222,3 +222,12 @@ replacement or launch. Native source integration alone does not establish an
 installed rollback floor. Existing app location and updater-off policy remain
 unchanged. No protection against malicious same-user executable replacement is
 claimed.
+
+`ao import --dry-run` preserves project/configuration rows even when
+`AO_START_PAUSED=true`; it does not apply maintenance pauses. It retains the
+existing import store lifecycle, which can bootstrap/migrate SQLite, and the
+native compatibility marker may be initialized. It is a project-change preview,
+not the fully observational operation that `ao compatibility --json` provides.
+Offline pause preparation verifies the effective decoded admission policy inside
+its transaction; ambiguous JSON keys that leave effective admission open cause
+the entire pause transaction to roll back.

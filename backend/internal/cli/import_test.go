@@ -1,15 +1,19 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/legacyimport"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
 func writeLegacyProject(t *testing.T) string {
@@ -66,5 +70,50 @@ func TestImportCommand_RefusesWhenDaemonRunning(t *testing.T) {
 	_, _, err := executeCLI(t, Deps{}, "import", "--from", root, "--yes")
 	if err == nil || !strings.Contains(err.Error(), "daemon is running") {
 		t.Fatalf("err = %v, want refusal because daemon is running", err)
+	}
+}
+
+func TestImportDryRunDoesNotApplyStartupPauses(t *testing.T) {
+	cfg := setConfigEnv(t)
+	t.Setenv("AO_START_PAUSED", "true")
+	ctx := context.Background()
+	store, err := sqlite.Open(cfg.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := domain.ProjectRecord{ID: "existing", Path: "/repos/existing", DisplayName: "Existing", RegisteredAt: time.Now(), Config: domain.ProjectConfig{DefaultBranch: "develop", AdmissionPaused: false}}
+	if err := store.UpsertProject(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy := writeLegacyProject(t)
+	out, _, err := executeCLI(t, Deps{}, "import", "--from", legacy, "--dry-run", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report legacyimport.Report
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.DryRun || report.ProjectsImported != 1 {
+		t.Fatalf("wrong plan: %+v", report)
+	}
+	store, err = sqlite.Open(cfg.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	after, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("dry-run changed project/config rows: before=%+v after=%+v", before, after)
 	}
 }

@@ -110,7 +110,7 @@ func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, o
 		return legacyimport.Report{}, fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
-	if cfg.StartPaused {
+	if cfg.StartPaused && !opts.DryRun {
 		if _, err := store.PauseAdmissionForStartup(ctx); err != nil {
 			return legacyimport.Report{}, err
 		}
