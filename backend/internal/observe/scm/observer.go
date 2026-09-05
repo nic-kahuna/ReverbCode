@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -482,7 +483,7 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 			if p.RepoOriginURL == "" && p.Path != "" {
 				if url := resolveGitOriginURL(p.Path); url != "" {
 					p.RepoOriginURL = url
-					if err := o.store.UpsertProject(ctx, p); err != nil {
+					if err := o.persistOrigin(ctx, p.ID, url); err != nil {
 						o.logger.Warn("scm observer: backfill origin URL persist failed", "project", p.ID, "err", err)
 					}
 				}
@@ -1457,4 +1458,25 @@ func (o *Observer) cacheSetBool(m map[string]bool, order *[]string, key string, 
 
 func cacheDelete[V any](m map[string]V, order *[]string, key string) {
 	observe.CacheDelete(m, order, key)
+}
+
+// Backfilling a remote must not write a stale config over a concurrent pause.
+func (o *Observer) persistOrigin(ctx context.Context, id, url string) error {
+	unlock, err := admission.For(o.store).Lock(ctx, domain.ProjectID(id))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	row, ok, err := o.store.GetProject(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if row.ConfigDecodeError != "" {
+		return admission.ErrUncertain
+	}
+	row.RepoOriginURL = url
+	return o.store.UpsertProject(ctx, row)
 }

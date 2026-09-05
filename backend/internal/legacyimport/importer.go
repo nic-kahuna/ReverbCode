@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
@@ -128,6 +129,12 @@ func Run(ctx context.Context, store Store, opts Options) (Report, error) {
 }
 
 func importProject(ctx context.Context, store Store, record domain.ProjectRecord, dryRun bool, rep *Report) error {
+	unlock, err := admission.For(store).Lock(ctx, domain.ProjectID(record.ID))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	_, exists, err := store.GetProject(ctx, record.ID)
 	if err != nil {
 		return fmt.Errorf("lookup project %s: %w", record.ID, err)

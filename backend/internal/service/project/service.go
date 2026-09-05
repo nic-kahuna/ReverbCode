@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
@@ -21,6 +22,8 @@ import (
 
 // Manager is the controller-facing contract for the /api/v1/projects surface.
 type Manager interface {
+	GetAdmission(ctx context.Context, id domain.ProjectID) (AdmissionState, error)
+	SetAdmission(ctx context.Context, id domain.ProjectID, paused bool) (AdmissionState, error)
 	// List returns every registered project, including degraded entries
 	// (those whose config failed to load but whose registry entry survives).
 	List(ctx context.Context) ([]Summary, error)
@@ -51,6 +54,7 @@ type SessionTeardowner interface {
 
 // Service implements project registration and lookup use-cases for controllers.
 type Service struct {
+	admission      *admission.Gate
 	store          Store
 	sessions       SessionTeardowner
 	clock          func() time.Time
@@ -88,6 +92,7 @@ func NewWithDeps(d Deps) *Service {
 		defaultHarness = domain.AgentHarness(config.DefaultAgent)
 	}
 	s := &Service{
+		admission:      admission.For(d.Store),
 		store:          d.Store,
 		sessions:       d.Sessions,
 		clock:          d.Clock,
@@ -164,6 +169,11 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 
 	m.addMu.Lock()
 	defer m.addMu.Unlock()
+	releaseAdmission, err := m.admission.Lock(ctx, id)
+	if err != nil {
+		return Project{}, err
+	}
+	defer releaseAdmission()
 
 	projectCountBefore, err := m.activeProjectCount(ctx)
 	if err != nil {
@@ -513,6 +523,12 @@ func (m *Service) emitProjectAdded(row domain.ProjectRecord, firstProject bool) 
 // SetConfig replaces the project's stored config. The typed config is validated
 // here so a bad value is rejected when set rather than surfacing at spawn.
 func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConfigInput) (Project, error) {
+	unlock, err := m.admission.Lock(ctx, id)
+	if err != nil {
+		return Project{}, err
+	}
+	defer unlock()
+
 	if err := validateProjectID(id); err != nil {
 		return Project{}, err
 	}
@@ -526,6 +542,13 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 	if !ok || !row.ArchivedAt.IsZero() {
 		return Project{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
 	}
+	if !in.Config.AdmissionPausedSet && !in.Config.AdmissionPaused {
+		if row.ConfigDecodeError != "" {
+			return Project{}, apierr.Conflict("PROJECT_ADMISSION_UNKNOWN", "Config repair requires explicit admissionPaused", nil)
+		}
+		in.Config.AdmissionPaused = row.Config.AdmissionPaused
+	}
+	in.Config.AdmissionPausedSet = false
 	row.Config = in.Config
 	if err := m.store.UpsertProject(ctx, row); err != nil {
 		return Project{}, apierr.Internal("PROJECT_CONFIG_UPDATE_FAILED", "Failed to update project config")
@@ -773,4 +796,54 @@ func sessionPrefix(id string) string {
 		return id
 	}
 	return id[:12]
+}
+
+func admissionState(id domain.ProjectID, paused bool) AdmissionState {
+	return AdmissionState{ProjectID: id, AdmissionPaused: paused, Scope: "new_launches_only", ExistingSessionsMayBeRunning: true}
+}
+
+// GetAdmission reports persisted admission policy, never writer liveness.
+func (m *Service) GetAdmission(ctx context.Context, id domain.ProjectID) (AdmissionState, error) {
+	if err := validateProjectID(id); err != nil {
+		return AdmissionState{}, err
+	}
+	row, ok, err := m.store.GetProject(ctx, string(id))
+	if err != nil {
+		return AdmissionState{}, err
+	}
+	if !ok || !row.ArchivedAt.IsZero() {
+		return AdmissionState{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
+	}
+	if row.ConfigDecodeError != "" {
+		return AdmissionState{}, apierr.Conflict("PROJECT_ADMISSION_UNKNOWN", "Persisted project config is invalid", nil)
+	}
+	return admissionState(id, row.Config.AdmissionPaused), nil
+}
+
+// SetAdmission changes policy after every previously admitted launch completes.
+func (m *Service) SetAdmission(ctx context.Context, id domain.ProjectID, paused bool) (AdmissionState, error) {
+	if err := validateProjectID(id); err != nil {
+		return AdmissionState{}, err
+	}
+	unlock, err := m.admission.Lock(ctx, id)
+	if err != nil {
+		return AdmissionState{}, err
+	}
+	defer unlock()
+	row, ok, err := m.store.GetProject(ctx, string(id))
+	if err != nil {
+		return AdmissionState{}, err
+	}
+	if !ok || !row.ArchivedAt.IsZero() {
+		return AdmissionState{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
+	}
+	if row.ConfigDecodeError != "" {
+		return AdmissionState{}, apierr.Conflict("PROJECT_ADMISSION_UNKNOWN", "Repair persisted project config explicitly before changing admission", nil)
+	}
+	row.Config.AdmissionPaused = paused
+	row.Config.AdmissionPausedSet = false
+	if err := m.store.UpsertProject(ctx, row); err != nil {
+		return AdmissionState{}, err
+	}
+	return admissionState(id, paused), nil
 }

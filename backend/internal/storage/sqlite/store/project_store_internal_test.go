@@ -3,6 +3,8 @@ package store
 import (
 	"database/sql"
 	"testing"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
 func TestUnmarshalProjectConfigDegradesGracefully(t *testing.T) {
@@ -20,5 +22,18 @@ func TestUnmarshalProjectConfigDegradesGracefully(t *testing.T) {
 	// row (and ListProjects) stay accessible.
 	if got := unmarshalProjectConfig(sql.NullString{String: `{not json`, Valid: true}); !got.IsZero() {
 		t.Fatalf("corrupt config = %#v, want zero (degraded)", got)
+	}
+}
+
+func TestMalformedAdmissionRemainsReadableButUncertain(t *testing.T) {
+	for _, raw := range []string{`{"admissionPaused":null}`, `{"admissionPaused":"false"}`, `{bad json`, ``} {
+		rec := projectRowFromGen(gen.Project{Config: sql.NullString{String: raw, Valid: true}})
+		if rec.ConfigDecodeError == "" {
+			t.Fatalf("lost uncertainty: %q", raw)
+		}
+	}
+	rec := projectRowFromGen(gen.Project{})
+	if rec.ConfigDecodeError != "" {
+		t.Fatal("legacy SQL NULL no longer unpaused")
 	}
 }

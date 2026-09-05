@@ -104,16 +104,17 @@ type reviewerConfig struct {
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
 type projectConfig struct {
-	DefaultBranch string              `json:"defaultBranch,omitempty"`
-	SessionPrefix string              `json:"sessionPrefix,omitempty"`
-	Env           map[string]string   `json:"env,omitempty"`
-	Symlinks      []string            `json:"symlinks,omitempty"`
-	PostCreate    []string            `json:"postCreate,omitempty"`
-	AgentConfig   agentConfig         `json:"agentConfig,omitempty"`
-	Worker        roleOverride        `json:"worker,omitempty"`
-	Orchestrator  roleOverride        `json:"orchestrator,omitempty"`
-	Reviewers     []reviewerConfig    `json:"reviewers,omitempty"`
-	TrackerIntake trackerIntakeConfig `json:"trackerIntake,omitempty"`
+	AdmissionPaused *bool               `json:"admissionPaused,omitempty"`
+	DefaultBranch   string              `json:"defaultBranch,omitempty"`
+	SessionPrefix   string              `json:"sessionPrefix,omitempty"`
+	Env             map[string]string   `json:"env,omitempty"`
+	Symlinks        []string            `json:"symlinks,omitempty"`
+	PostCreate      []string            `json:"postCreate,omitempty"`
+	AgentConfig     agentConfig         `json:"agentConfig,omitempty"`
+	Worker          roleOverride        `json:"worker,omitempty"`
+	Orchestrator    roleOverride        `json:"orchestrator,omitempty"`
+	Reviewers       []reviewerConfig    `json:"reviewers,omitempty"`
+	TrackerIntake   trackerIntakeConfig `json:"trackerIntake,omitempty"`
 }
 
 // setConfigRequest mirrors the daemon's SetConfigInput body for
@@ -169,6 +170,7 @@ func newProjectCommand(ctx *commandContext) *cobra.Command {
 	cmd.AddCommand(newProjectGetCommand(ctx))
 	cmd.AddCommand(newProjectAddCommand(ctx))
 	cmd.AddCommand(newProjectSetConfigCommand(ctx))
+	cmd.AddCommand(newProjectAdmissionCommand(ctx))
 	cmd.AddCommand(newProjectRemoveCommand(ctx))
 	return cmd
 }
@@ -228,6 +230,69 @@ func newProjectGetCommand(ctx *commandContext) *cobra.Command {
 	return cmd
 }
 
+// projectAdmissionState mirrors the daemon's admission response. Pointer
+// booleans distinguish an explicit false from incomplete daemon evidence.
+type projectAdmissionState struct {
+	ProjectID                    string `json:"projectId"`
+	AdmissionPaused              *bool  `json:"admissionPaused"`
+	Scope                        string `json:"scope"`
+	ExistingSessionsMayBeRunning *bool  `json:"existingSessionsMayBeRunning"`
+}
+
+func newProjectAdmissionCommand(ctx *commandContext) *cobra.Command {
+	var paused, asJSON bool
+	cmd := &cobra.Command{
+		Use:   "admission <id>",
+		Short: "Read or change the pause on new project launches",
+		Long: "Read project admission, or set --paused=true|false to pause or allow new launches. " +
+			"Existing sessions may still be running; this does not stop writers or transfer ownership.",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+				return usageError{err}
+			}
+			if strings.TrimSpace(args[0]) == "" {
+				return usageError{errors.New("usage: project id is required")}
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := strings.TrimSpace(args[0])
+			path := "projects/" + url.PathEscape(id) + "/admission"
+			var res projectAdmissionState
+			var err error
+			if cmd.Flags().Changed("paused") {
+				err = ctx.putJSON(cmd.Context(), path, struct {
+					Paused bool `json:"paused"`
+				}{Paused: paused}, &res)
+			} else {
+				err = ctx.getJSON(cmd.Context(), path, &res)
+			}
+			if err != nil {
+				return err
+			}
+			if res.ProjectID != id || res.AdmissionPaused == nil || res.Scope != "new_launches_only" ||
+				res.ExistingSessionsMayBeRunning == nil || !*res.ExistingSessionsMayBeRunning {
+				return errors.New("daemon returned incomplete or mismatched project admission evidence")
+			}
+			if cmd.Flags().Changed("paused") && *res.AdmissionPaused != paused {
+				return errors.New("daemon did not confirm the requested admission pause")
+			}
+			if asJSON {
+				return writeJSON(cmd.OutOrStdout(), res)
+			}
+			state := "allowed"
+			if *res.AdmissionPaused {
+				state = "paused"
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "project %s: new launches %s; existing sessions may still be running\n", id, state)
+			return err
+		},
+	}
+	cmd.Flags().BoolVar(&paused, "paused", false, "Pause new launches (true) or allow them (false)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Output admission state as JSON")
+	return cmd
+}
+
 func newProjectAddCommand(ctx *commandContext) *cobra.Command {
 	var opts projectAddOptions
 	cmd := &cobra.Command{
@@ -282,7 +347,8 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 			"symlinks, post-create, agent model/permissions, role overrides, tracker intake). The config " +
 			"is resolved when a session spawns.\n\n" +
 			"Set fields via flags, pass the whole object with --config-json, or --clear " +
-			"to remove all config.",
+			"to clear defaults. The admission pause is preserved unless --config-json " +
+			"explicitly supplies admissionPaused as a boolean.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return usageError{err}
@@ -324,7 +390,7 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.trackerRepo, "tracker-repo", "", "GitHub repo for issue intake (owner/repo; default: derive from git origin)")
 	f.StringVar(&opts.trackerAssignee, "tracker-assignee", "", "GitHub issue assignee required for intake eligibility")
 	f.StringVar(&opts.configJSON, "config-json", "", "Full config as a JSON object (overrides field flags)")
-	f.BoolVar(&opts.clear, "clear", false, "Clear all config")
+	f.BoolVar(&opts.clear, "clear", false, "Clear config defaults while preserving the admission pause")
 	f.BoolVar(&opts.json, "json", false, "Output the updated project as JSON")
 	return cmd
 }
@@ -338,6 +404,13 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 		return projectConfig{}, nil
 	}
 	if opts.configJSON != "" {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(opts.configJSON), &fields); err != nil || fields == nil {
+			return projectConfig{}, usageError{errors.New("--config-json must be a JSON object")}
+		}
+		if value, ok := fields["admissionPaused"]; ok && string(value) == "null" {
+			return projectConfig{}, usageError{errors.New("--config-json admissionPaused must be a boolean")}
+		}
 		var cfg projectConfig
 		if err := json.Unmarshal([]byte(opts.configJSON), &cfg); err != nil {
 			return projectConfig{}, usageError{fmt.Errorf("--config-json is not a valid JSON object: %w", err)}

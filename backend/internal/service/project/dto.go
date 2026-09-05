@@ -34,6 +34,15 @@ type SetConfigInput struct {
 	Config domain.ProjectConfig `json:"config"`
 }
 
+// AdmissionState reports whether new launches are paused. It makes no claim
+// about writer shutdown or ownership transfer for existing sessions.
+type AdmissionState struct {
+	ProjectID                    domain.ProjectID `json:"projectId"`
+	AdmissionPaused              bool             `json:"admissionPaused"`
+	Scope                        string           `json:"scope" enum:"new_launches_only"`
+	ExistingSessionsMayBeRunning bool             `json:"existingSessionsMayBeRunning"`
+}
+
 // RemoveResult reports what DELETE /api/v1/projects/{id} actually did.
 type RemoveResult struct {
 	ProjectID         domain.ProjectID `json:"projectId"`

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -84,6 +85,7 @@ type scmProvider interface {
 // session operations to the internal sessionmanager.Manager and owns read-model
 // assembly, including user-facing display status derivation.
 type Service struct {
+	admission           *admission.Gate
 	manager             commander
 	store               Store
 	prClaimer           ports.PRClaimer
@@ -122,7 +124,7 @@ type Deps struct {
 
 // NewWithDeps wires a session service with optional PR-claim dependencies.
 func NewWithDeps(d Deps) *Service {
-	s := &Service{manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, clock: d.Clock, signalCapable: d.SignalCapable, telemetry: d.Telemetry}
+	s := &Service{admission: admission.For(d.Store), manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, clock: d.Clock, signalCapable: d.SignalCapable, telemetry: d.Telemetry}
 	if s.prClaimer == nil {
 		if w, ok := d.Store.(ports.PRClaimer); ok {
 			s.prClaimer = w
@@ -268,6 +270,19 @@ func (s *Service) emitSpawnFailed(cfg ports.SpawnConfig, err error, durationMs i
 // active orchestrator already exists it is returned as-is. A business rule that
 // belongs here, not in the HTTP controller.
 func (s *Service) SpawnOrchestrator(ctx context.Context, projectID domain.ProjectID, clean bool) (domain.Session, error) {
+	ctx, releaseAdmission, err := s.admissionGate().Enter(ctx, projectID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	defer releaseAdmission()
+	admissionProject, err := s.requireProject(ctx, projectID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	if err := admission.Check(admissionProject); err != nil {
+		return domain.Session{}, toAPIError(err)
+	}
+
 	unlock := s.lockOrchestratorProject(projectID)
 	defer unlock()
 
@@ -562,6 +577,10 @@ func toAPIError(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, admission.ErrPaused):
+		return apierr.Conflict("PROJECT_ADMISSION_PAUSED", err.Error(), nil)
+	case errors.Is(err, admission.ErrUncertain):
+		return apierr.Conflict("PROJECT_ADMISSION_UNKNOWN", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrNotFound):
 		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
 	case errors.Is(err, sessionmanager.ErrNotRestorable):
@@ -624,4 +643,13 @@ func (s *Service) harnessSignals(h domain.AgentHarness) bool {
 		return false
 	}
 	return s.signalCapable(h)
+}
+
+func (s *Service) admissionGate() *admission.Gate {
+	s.orchestratorLocksMu.Lock()
+	defer s.orchestratorLocksMu.Unlock()
+	if s.admission == nil {
+		s.admission = admission.For(s.store)
+	}
+	return s.admission
 }

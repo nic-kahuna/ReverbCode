@@ -6,6 +6,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -29,6 +30,8 @@ func (c *ProjectsController) Register(r chi.Router) {
 	r.Post("/projects/initialize", c.initialize)
 	r.Get("/projects/{id}", c.get)
 	r.Put("/projects/{id}/config", c.setConfig)
+	r.Get("/projects/{id}/admission", c.getAdmission)
+	r.Put("/projects/{id}/admission", c.setAdmission)
 	r.Delete("/projects/{id}", c.remove)
 }
 
@@ -117,6 +120,43 @@ func (c *ProjectsController) setConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, ProjectResponse{Project: p})
+}
+
+func (c *ProjectsController) getAdmission(w http.ResponseWriter, r *http.Request) {
+	if c.Mgr == nil {
+		apispec.NotImplemented(w, r, "GET", "/api/v1/projects/{id}/admission")
+		return
+	}
+	state, err := c.Mgr.GetAdmission(r.Context(), projectID(r))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, state)
+}
+
+func (c *ProjectsController) setAdmission(w http.ResponseWriter, r *http.Request) {
+	if c.Mgr == nil {
+		apispec.NotImplemented(w, r, "PUT", "/api/v1/projects/{id}/admission")
+		return
+	}
+	var in SetProjectAdmissionRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil || in.Paused == nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Body must contain paused as a boolean", nil)
+		return
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Body must contain one JSON object", nil)
+		return
+	}
+	state, err := c.Mgr.SetAdmission(r.Context(), projectID(r), *in.Paused)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, state)
 }
 
 func (c *ProjectsController) remove(w http.ResponseWriter, r *http.Request) {

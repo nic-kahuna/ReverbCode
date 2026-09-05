@@ -139,6 +139,8 @@ var schemaNames = map[string]string{
 	// httpd/controllers (wire envelopes)
 	"ControllersListProjectsResponse":             "ListProjectsResponse",
 	"ControllersProjectResponse":                  "ProjectResponse",
+	"ControllersSetProjectAdmissionRequest":       "SetProjectAdmissionRequest",
+	"ProjectAdmissionState":                       "ProjectAdmissionState",
 	"ControllersAgentIDParam":                     "AgentIDParam",
 	"ControllersGetProjectResponse":               "ProjectGetResponse",
 	"ControllersProjectOrDegraded":                "ProjectOrDegraded",
@@ -531,7 +533,7 @@ func eventOperations() []operation {
 	}
 }
 
-// projectOperations declares the 4 canonical /projects operations. The set must
+// projectOperations declares the canonical /projects operations. The set must
 // stay 1:1 with the routes ProjectsController.Register mounts —
 // TestRouteSpecParity fails the build otherwise.
 func projectOperations() []operation {
@@ -572,6 +574,31 @@ func projectOperations() []operation {
 			resps: []respUnit{
 				{http.StatusOK, controllers.GetProjectResponse{}},
 				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodGet, path: "/api/v1/projects/{id}/admission", id: "getProjectAdmission", tag: "projects",
+			summary:    "Read the pause on new launches; existing sessions may still be running",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, projectsvc.AdmissionState{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPut, path: "/api/v1/projects/{id}/admission", id: "setProjectAdmission", tag: "projects",
+			summary:    "Pause or allow new launches without stopping existing sessions or transferring ownership",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			reqBody:    controllers.SetProjectAdmissionRequest{},
+			resps: []respUnit{
+				{http.StatusOK, projectsvc.AdmissionState{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},
 		},

@@ -42,6 +42,12 @@ type ProjectResponse struct {
 	Project projectsvc.Project `json:"project"`
 }
 
+// SetProjectAdmissionRequest changes only the admission pause. A pointer lets
+// the handler reject an omitted or null paused field instead of unpausing.
+type SetProjectAdmissionRequest struct {
+	Paused *bool `json:"paused" required:"true" nullable:"false" description:"Whether new launches for this project are paused. Existing sessions may still be running."`
+}
+
 // GetProjectResponse is the { status, project } body of GET /projects/{id},
 // where project is oneOf Project|Degraded discriminated by status.
 type GetProjectResponse struct {

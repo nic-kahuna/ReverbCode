@@ -148,6 +148,14 @@ func projectRowFromGen(p gen.Project) domain.ProjectRecord {
 		Kind:          domain.ProjectKind(p.Kind).WithDefault(),
 		Config:        unmarshalProjectConfig(p.Config),
 	}
+	if p.Config.Valid {
+		var cfg domain.ProjectConfig
+		if err := json.Unmarshal([]byte(p.Config.String), &cfg); err != nil {
+			r.ConfigDecodeError = err.Error()
+		} else if err := cfg.Validate(); err != nil {
+			r.ConfigDecodeError = err.Error()
+		}
+	}
 	if p.ArchivedAt.Valid {
 		r.ArchivedAt = p.ArchivedAt.Time
 	}
@@ -181,6 +189,7 @@ func unmarshalProjectConfig(s sql.NullString) domain.ProjectConfig {
 	if err := json.Unmarshal([]byte(s.String), &cfg); err != nil {
 		return domain.ProjectConfig{}
 	}
+	cfg.AdmissionPausedSet = false
 	return cfg
 }
 

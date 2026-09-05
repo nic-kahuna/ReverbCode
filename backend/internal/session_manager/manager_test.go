@@ -1789,6 +1789,7 @@ func TestRestore_RefusesLiveSession(t *testing.T) {
 
 func TestRestore_DisabledAgentRejectedBeforeWorkspaceRestore(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Harness: domain.HarnessClaudeCode, IsTerminated: true,
 		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1/root"},
@@ -2270,6 +2271,7 @@ func TestSystemPrompt_AppendsConfidentialityGuard(t *testing.T) {
 // recomputed and handed to the agent's native resume command.
 func TestRestore_OrchestratorRederivesSystemPrompt(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator, IsTerminated: true,
 		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", AgentSessionID: "agent-x"},
@@ -2291,6 +2293,7 @@ func TestRestore_OrchestratorRederivesSystemPrompt(t *testing.T) {
 // system prompt alongside the persisted task prompt.
 func TestRestore_FallbackLaunchCarriesSystemPrompt(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator, IsTerminated: true,
 		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", Prompt: "kick off"},
@@ -2351,6 +2354,7 @@ func TestRestore_FallbackLaunchDeliversPromptAfterStartWhenAgentRequestsIt(t *te
 // every boot abandoned the orchestrator and spawned a fresh one.
 func TestRestore_PromptlessOrchestratorResumesViaAdapter(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator, IsTerminated: true,
 		// No AgentSessionID, no Prompt: exactly how orchestrators are persisted.
@@ -2380,6 +2384,7 @@ func TestRestore_PromptlessOrchestratorResumesViaAdapter(t *testing.T) {
 // abandon it and mint a new one (which caused the id-increment bug).
 func TestRestore_PromptlessUnresumableRelaunchesFresh(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator, IsTerminated: true,
 		// No AgentSessionID, no Prompt: exactly how an orchestrator is persisted.
@@ -2411,6 +2416,7 @@ func TestRestore_PromptlessUnresumableRelaunchesFresh(t *testing.T) {
 // (runtime.Create must NOT be called).
 func TestRestore_PromptlessWorkerNotResumable(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, IsTerminated: true,
 		// No AgentSessionID, no Prompt: promptless worker with no resume handle.
@@ -2441,6 +2447,7 @@ func TestRestore_PromptlessWorkerNotResumable(t *testing.T) {
 // not the one from its original spawn.
 func TestRestore_WorkerPointsAtCurrentOrchestrator(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	st.sessions["mer-9"] = domain.SessionRecord{ID: "mer-9", ProjectID: "mer", Kind: domain.KindOrchestrator}
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, IsTerminated: true,
@@ -2588,6 +2595,7 @@ func TestSpawn_RejectsMissingTmuxBeforeSessionRow(t *testing.T) {
 
 func TestSpawn_RejectsUnknownHarness(t *testing.T) {
 	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	rt := &fakeRuntime{}
 	ws := &fakeWorkspace{}
 	m := New(Deps{Runtime: rt, Agents: missingAgents{}, Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: func(string) (string, error) { return "/bin/true", nil }})

@@ -138,7 +138,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	}
 	enabledProjects := make([]domain.ProjectRecord, 0, len(projects))
 	for _, project := range projects {
-		if project.Config.TrackerIntake.Enabled {
+		if project.Config.TrackerIntake.Enabled && !project.Config.AdmissionPaused && project.ConfigDecodeError == "" {
 			enabledProjects = append(enabledProjects, project)
 		}
 	}

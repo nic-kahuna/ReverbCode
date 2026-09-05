@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -17,6 +19,10 @@ import (
 // SessionPrefix feeds the display prefix. TrackerIntake feeds the background
 // issue-intake loop.
 type ProjectConfig struct {
+	// AdmissionPaused prevents new launches; existing writers are unaffected.
+	AdmissionPaused bool `json:"admissionPaused,omitempty"`
+	// AdmissionPausedSet records explicit JSON presence for config replacement.
+	AdmissionPausedSet bool `json:"-"`
 	// DefaultBranch is the base branch new session worktrees are created from.
 	DefaultBranch string `json:"defaultBranch,omitempty"`
 	// SessionPrefix overrides the displayed session-id prefix.
@@ -104,6 +110,7 @@ func (c ProjectConfig) WithDefaults() ProjectConfig {
 // IsZero reports whether the config carries no settings, so storage can persist
 // SQL NULL and resolution can skip an empty config.
 func (c ProjectConfig) IsZero() bool {
+	c.AdmissionPausedSet = false
 	return reflect.DeepEqual(c, ProjectConfig{})
 }
 
@@ -182,5 +189,32 @@ func validateRepoRelative(p string) error {
 			return fmt.Errorf("path must be repo-relative and must not escape the project root")
 		}
 	}
+	return nil
+}
+
+// UnmarshalJSON rejects ambiguous pause values and retains explicit presence so
+// unrelated whole-config edits cannot implicitly resume admission.
+func (c *ProjectConfig) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return fmt.Errorf("project config must be an object")
+	}
+	type plain ProjectConfig
+	var value plain
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if raw, ok := fields["admissionPaused"]; ok {
+		if string(bytes.TrimSpace(raw)) == "null" {
+			return fmt.Errorf("admissionPaused must be a boolean")
+		}
+		value.AdmissionPausedSet = true
+	}
+	*c = ProjectConfig(value)
 	return nil
 }

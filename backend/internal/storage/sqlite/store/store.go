@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -19,20 +20,22 @@ import (
 // CDC is captured by DB triggers (migration 0001), NOT by this layer: the store
 // never writes change_log, it only reads it for the CDC poller.
 type Store struct {
-	writeDB *sql.DB
-	readDB  *sql.DB
-	qw      *gen.Queries // bound to the single writer connection
-	qr      *gen.Queries // bound to the reader pool
-	writeMu sync.Mutex
+	writeDB   *sql.DB
+	readDB    *sql.DB
+	qw        *gen.Queries // bound to the single writer connection
+	qr        *gen.Queries // bound to the reader pool
+	writeMu   sync.Mutex
+	admission *admission.Gate
 }
 
 // NewStore wraps an opened writer + reader *sql.DB (see Open) as a Store.
 func NewStore(writeDB, readDB *sql.DB) *Store {
 	return &Store{
-		writeDB: writeDB,
-		readDB:  readDB,
-		qw:      gen.New(writeDB),
-		qr:      gen.New(readDB),
+		writeDB:   writeDB,
+		admission: admission.New(),
+		readDB:    readDB,
+		qw:        gen.New(writeDB),
+		qr:        gen.New(readDB),
 	}
 }
 
@@ -58,3 +61,6 @@ func (s *Store) inTx(ctx context.Context, what string, fn func(*gen.Queries) err
 	}
 	return tx.Commit()
 }
+
+// AdmissionGate is shared by every launch and project config transition using this store.
+func (s *Store) AdmissionGate() *admission.Gate { return s.admission }

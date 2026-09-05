@@ -42,6 +42,8 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao project ls`                     | `GET /api/v1/projects`                         |
 | `ao project get <id>`               | `GET /api/v1/projects/{id}`                    |
 | `ao project set-config <id>`        | `PUT /api/v1/projects/{id}/config`             |
+| `ao project admission <id>`         | `GET /api/v1/projects/{id}/admission`          |
+| `ao project admission <id> --paused=true\|false` | `PUT /api/v1/projects/{id}/admission` |
 | `ao project rm <id>`                | `DELETE /api/v1/projects/{id}`                 |
 | `ao agent ls`                       | `GET /api/v1/agents`                           |
 | `ao agent ls --refresh`             | `POST /api/v1/agents/refresh`                  |
@@ -57,6 +59,22 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao send`                           | `POST /api/v1/sessions/{id}/send`              |
 | `ao preview [url]`                  | `POST /api/v1/sessions/{id}/preview`           |
 | `ao hooks <agent> <event>`          | `POST /api/v1/sessions/{id}/activity` (hidden) |
+
+`ao project admission <id> --paused=true` durably pauses new launches for one
+project; `--paused=false` allows them again. Omit the flag to read the current
+state. `--json` returns `projectId`, `admissionPaused`, `scope` (always
+`new_launches_only`), and `existingSessionsMayBeRunning` (always `true`). Existing
+workers can still write after admission is paused. This command does not suspend
+them, release their leases, or transfer ownership to a foreground task.
+Ordinary `set-config` replacements, including `--clear`, preserve the admission
+pause unless `--config-json` explicitly supplies `admissionPaused` as a boolean.
+
+A pause waits for an already admitted launch to finish before it reports success.
+If the request times out while waiting, admission remains unchanged and that
+launch may still be finishing. Read admission again and retry; a keeper can retain
+its own pause intent between attempts. Admission pause never proves an existing
+worker, reviewer, child process, or file writer has stopped. Resuming admission
+permits future launches; it does not restore preserved sessions automatically.
 
 `ao agent ls` prints the daemon-supported agent catalog with local install/auth
 readiness. Use `--refresh` to rerun the bounded local probes and `--json` to

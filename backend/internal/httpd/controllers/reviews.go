@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
@@ -179,6 +180,10 @@ func (c *ReviewsController) submit(w http.ResponseWriter, r *http.Request) {
 
 func writeReviewError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, admission.ErrPaused):
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PROJECT_ADMISSION_PAUSED", err.Error(), nil)
+	case errors.Is(err, admission.ErrUncertain):
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PROJECT_ADMISSION_UNKNOWN", err.Error(), nil)
 	case errors.Is(err, reviewsvc.ErrInvalid):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "REVIEW_INVALID", err.Error(), nil)
 	case errors.Is(err, reviewsvc.ErrAgentDisabled):

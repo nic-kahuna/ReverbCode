@@ -672,6 +672,102 @@ paths:
       summary: Fetch one project; discriminates ok vs degraded
       tags:
       - projects
+  /api/v1/projects/{id}/admission:
+    get:
+      operationId: getProjectAdmission
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectAdmissionState'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Read the pause on new launches; existing sessions may still be running
+      tags:
+      - projects
+    put:
+      operationId: setProjectAdmission
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetProjectAdmissionRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectAdmissionState'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Pause or allow new launches without stopping existing sessions or transferring
+        ownership
+      tags:
+      - projects
   /api/v1/projects/{id}/config:
     put:
       operationId: setProjectConfig
@@ -2312,8 +2408,28 @@ components:
       - repo
       - defaultBranch
       type: object
+    ProjectAdmissionState:
+      properties:
+        admissionPaused:
+          type: boolean
+        existingSessionsMayBeRunning:
+          type: boolean
+        projectId:
+          type: string
+        scope:
+          enum:
+          - new_launches_only
+          type: string
+      required:
+      - projectId
+      - admissionPaused
+      - scope
+      - existingSessionsMayBeRunning
+      type: object
     ProjectConfig:
       properties:
+        admissionPaused:
+          type: boolean
         agentConfig:
           $ref: '#/components/schemas/AgentConfig'
         defaultBranch:
@@ -2843,6 +2959,15 @@ components:
       - ok
       - sessionId
       - state
+      type: object
+    SetProjectAdmissionRequest:
+      properties:
+        paused:
+          description: Whether new launches for this project are paused. Existing
+            sessions may still be running.
+          type: boolean
+      required:
+      - paused
       type: object
     SetProjectConfigInput:
       properties:

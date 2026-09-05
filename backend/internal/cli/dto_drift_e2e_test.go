@@ -137,7 +137,8 @@ func authorizedCodexInventory() agentsvc.Inventory {
 // the CLI's request body. Every other method is a no-op so it satisfies the
 // projectsvc.Manager interface.
 type fakeProjectManager struct {
-	added projectsvc.AddInput
+	added     projectsvc.AddInput
+	admission projectsvc.AdmissionState
 }
 
 var _ projectsvc.Manager = (*fakeProjectManager)(nil)
@@ -169,6 +170,16 @@ func (f *fakeProjectManager) SetConfig(_ context.Context, id domain.ProjectID, i
 	return projectsvc.Project{ID: id, Config: &cfg}, nil
 }
 
+func (f *fakeProjectManager) GetAdmission(_ context.Context, id domain.ProjectID) (projectsvc.AdmissionState, error) {
+	return projectsvc.AdmissionState{ProjectID: id, AdmissionPaused: f.admission.AdmissionPaused,
+		Scope: "new_launches_only", ExistingSessionsMayBeRunning: true}, nil
+}
+
+func (f *fakeProjectManager) SetAdmission(ctx context.Context, id domain.ProjectID, paused bool) (projectsvc.AdmissionState, error) {
+	f.admission.AdmissionPaused = paused
+	return f.GetAdmission(ctx, id)
+}
+
 func (f *fakeProjectManager) Remove(context.Context, domain.ProjectID) (projectsvc.RemoveResult, error) {
 	return projectsvc.RemoveResult{}, nil
 }
@@ -195,6 +206,26 @@ func startDriftTestDaemon(t *testing.T, sessions controllers.SessionService, pro
 	t.Setenv("AO_RUN_FILE", rfPath)
 	if err := runfile.Write(rfPath, runfile.Info{PID: os.Getpid(), Port: port, StartedAt: time.Now()}); err != nil {
 		t.Fatalf("write run-file: %v", err)
+	}
+}
+
+func TestE2E_ProjectAdmissionDTORoundTrip(t *testing.T) {
+	projects := &fakeProjectManager{}
+	startDriftTestDaemon(t, &fakeSessionService{}, projects)
+	for _, flag := range []string{"--paused=true", "--paused=false", ""} {
+		var out bytes.Buffer
+		root := NewRootCommand(Deps{Out: &out, Err: &out, HTTPClient: &http.Client{}, ProcessAlive: func(int) bool { return true }})
+		args := []string{"project", "admission", "demo", "--json"}
+		if flag != "" {
+			args = append(args, flag)
+		}
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("admission %q: %v; output=%s", flag, err, out.String())
+		}
+		if projects.admission.AdmissionPaused != (flag == "--paused=true") {
+			t.Fatalf("admission %q: captured %#v", flag, projects.admission)
+		}
 	}
 }
 

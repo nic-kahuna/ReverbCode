@@ -34,6 +34,8 @@ type ProjectRecord struct {
 	// Config holds the typed per-project configuration AO resolves at spawn. An
 	// IsZero value means unset.
 	Config ProjectConfig
+	// ConfigDecodeError preserves uncertain persisted evidence while keeping reads available.
+	ConfigDecodeError string
 }
 
 // WorkspaceRepoRecord is a child repo registered under a workspace project.

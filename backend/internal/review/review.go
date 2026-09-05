@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -83,14 +84,15 @@ type Deps struct {
 
 // Engine is the core code-review engine.
 type Engine struct {
-	store    Store
-	sessions Sessions
-	prs      PRs
-	projects Projects
-	launcher Launcher
-	policy   domain.AgentPolicy
-	clock    func() time.Time
-	newID    func() string
+	admission *admission.Gate
+	store     Store
+	sessions  Sessions
+	prs       PRs
+	projects  Projects
+	launcher  Launcher
+	policy    domain.AgentPolicy
+	clock     func() time.Time
+	newID     func() string
 
 	// triggerMu guards triggerLocks; triggerLocks holds one mutex per worker
 	// session so reviewer operations for the same worker serialise (see
@@ -110,6 +112,7 @@ func New(d Deps) *Engine {
 		newID = uuid.NewString
 	}
 	return &Engine{
+		admission:    admission.For(d.Projects),
 		store:        d.Store,
 		sessions:     d.Sessions,
 		prs:          d.PRs,
@@ -251,6 +254,23 @@ func (e *Engine) Trigger(ctx stdctx.Context, workerID domain.SessionID) (Trigger
 	}
 	if !ok {
 		return TriggerResult{}, fmt.Errorf("%w: worker session %q", ErrNotFound, workerID)
+	}
+	releaseAdmission, err := e.admission.Lock(ctx, worker.ProjectID)
+	if err != nil {
+		return TriggerResult{}, err
+	}
+	defer releaseAdmission()
+	if e.projects != nil {
+		project, found, getErr := e.projects.GetProject(ctx, string(worker.ProjectID))
+		if getErr != nil {
+			return TriggerResult{}, getErr
+		}
+		if !found {
+			return TriggerResult{}, admission.ErrUncertain
+		}
+		if err := admission.Check(project); err != nil {
+			return TriggerResult{}, err
+		}
 	}
 	if worker.IsTerminated {
 		return TriggerResult{}, fmt.Errorf("%w: worker session %q is terminated", ErrInvalid, workerID)
