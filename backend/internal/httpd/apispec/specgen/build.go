@@ -792,7 +792,7 @@ func sessionOperations() []operation {
 		},
 		{
 			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/send", id: "sendSessionMessage", tag: "sessions",
-			summary:    "Send a message to a running session's agent",
+			summary:    "Send a message to a running session's agent, optionally requiring open project admission through delivery",
 			pathParams: []any{controllers.SessionIDParam{}},
 			reqBody:    controllers.SendSessionMessageRequest{},
 			resps: []respUnit{
@@ -800,7 +800,8 @@ func sessionOperations() []operation {
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				// Conflict: the session is terminated, or paused on a permission
-				// decision (SESSION_AWAITING_DECISION) — the guarded send refuses
+				// decision (SESSION_AWAITING_DECISION), or required project
+				// admission is paused/unknown — the guarded send refuses
 				// to paste into a pending dialog.
 				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},

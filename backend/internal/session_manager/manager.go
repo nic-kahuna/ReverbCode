@@ -1204,6 +1204,23 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 // fails, the runtime is still stopped and the record is terminated, but the
 // on-disk workspace is deliberately left untouched for manual recovery.
 func (m *Manager) reconcileDisabled(ctx context.Context, rec domain.SessionRecord) error {
+	project, known, projectErr := m.store.GetProject(ctx, string(rec.ProjectID))
+	if projectErr != nil || !known || admission.Check(project) != nil {
+		// Disabled-agent policy still requires cessation, but paused or uncertain
+		// admission must not normalize or remove the candidate's workspace.
+		handle, err := m.recoveryRuntimeHandle(rec)
+		if err != nil {
+			return fmt.Errorf("reconcile disabled %s: runtime identity: %w", rec.ID, err)
+		}
+		if handle.ID == "" {
+			return fmt.Errorf("reconcile disabled %s: %w", rec.ID, ErrIncompleteHandle)
+		}
+		if err := m.stopRuntimeStrict(ctx, handle); err != nil {
+			return fmt.Errorf("reconcile disabled %s: stop preserved runtime: %w", rec.ID, err)
+		}
+		return m.lcm.MarkTerminated(ctx, rec.ID)
+	}
+
 	if rec.Metadata.WorkspacePath != "" && rec.Metadata.Branch != "" {
 		saveErr := m.saveAndTeardownOne(ctx, rec, true)
 		if saveErr == nil {
@@ -1296,7 +1313,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			continue
 		}
 		if m.policy.IsDisabled(string(rec.Harness)) {
-			if err := m.reconcileDisabled(ctx, rec); err != nil {
+			if err := m.reconcileCessation(ctx, rec, m.reconcileDisabled); err != nil {
 				m.logger.Error("reconcile: disabled session retirement failed", "sessionID", rec.ID, "error", err)
 			}
 			continue
@@ -1319,7 +1336,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		if !rec.IsTerminated {
 			continue
 		}
-		if err := m.reconcileWithAdmission(ctx, rec, m.reconcileReap); err != nil {
+		if err := m.reconcileCessation(ctx, rec, m.reconcileReap); err != nil {
 			m.logger.Error("reconcile: reap pass failed, skipping", "sessionID", rec.ID, "error", err)
 		}
 	}
@@ -2716,4 +2733,41 @@ func (m *Manager) reconcileWithAdmission(ctx context.Context, rec domain.Session
 		return nil
 	}
 	return fn(ctx, fresh)
+}
+
+// reconcileCessation serializes runtime retirement without admitting new work.
+// A pause must not prevent enforcement of existing terminal/disabled intent.
+func (m *Manager) reconcileCessation(ctx context.Context, rec domain.SessionRecord, fn func(context.Context, domain.SessionRecord) error) error {
+	unlock, err := m.admission.Lock(ctx, rec.ProjectID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	fresh, ok, err := m.store.GetSession(ctx, rec.ID)
+	if err != nil {
+		return err
+	}
+	if !ok || fresh.IsTerminated != rec.IsTerminated {
+		return nil
+	}
+	return fn(ctx, fresh)
+}
+
+// SendAdmitted delivers a new background turn only while project admission is
+// open. The same lane stays held through delivery and any confirmation nudges.
+// Existing user sends and already-running work are deliberately unaffected.
+func (m *Manager) SendAdmitted(ctx context.Context, id domain.SessionID, message string) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	unlock, err := m.lockAdmission(ctx, rec.ProjectID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return m.Send(ctx, id, message)
 }

@@ -46,7 +46,8 @@ import (
 // the CLI's request body. Every other method is a no-op so it satisfies the
 // controllers.SessionService interface.
 type fakeSessionService struct {
-	spawned ports.SpawnConfig
+	spawned      ports.SpawnConfig
+	sentAdmitted string
 }
 
 var _ controllers.SessionService = (*fakeSessionService)(nil)
@@ -96,6 +97,11 @@ func (f *fakeSessionService) SetPreview(context.Context, domain.SessionID, strin
 }
 
 func (f *fakeSessionService) Send(context.Context, domain.SessionID, string) error {
+	return nil
+}
+
+func (f *fakeSessionService) SendAdmitted(_ context.Context, _ domain.SessionID, message string) error {
+	f.sentAdmitted = message
 	return nil
 }
 
@@ -206,6 +212,21 @@ func startDriftTestDaemon(t *testing.T, sessions controllers.SessionService, pro
 	t.Setenv("AO_RUN_FILE", rfPath)
 	if err := runfile.Write(rfPath, runfile.Info{PID: os.Getpid(), Port: port, StartedAt: time.Now()}); err != nil {
 		t.Fatalf("write run-file: %v", err)
+	}
+}
+
+func TestE2E_SendAdmissionDTORoundTrip(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "")
+	sessions := &fakeSessionService{}
+	startDriftTestDaemon(t, sessions, &fakeProjectManager{})
+	var out bytes.Buffer
+	root := NewRootCommand(Deps{Out: &out, Err: &out, HTTPClient: &http.Client{}, ProcessAlive: func(int) bool { return true }})
+	root.SetArgs([]string{"send", "--session", "demo-1", "--message", "continue", "--require-admission"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("send: %v; output=%s", err, out.String())
+	}
+	if sessions.sentAdmitted != "continue" {
+		t.Fatalf("admitted message=%q", sessions.sentAdmitted)
 	}
 }
 

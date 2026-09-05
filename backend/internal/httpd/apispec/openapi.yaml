@@ -1764,7 +1764,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Internal Server Error
-      summary: Send a message to a running session's agent
+      summary: Send a message to a running session's agent, optionally requiring open
+        project admission through delivery
       tags:
       - sessions
   /api/v1/sessions/cleanup:
@@ -2649,6 +2650,11 @@ components:
           maxLength: 4096
           minLength: 1
           type: string
+        requireAdmission:
+          description: When true, reject delivery while project admission is paused
+            or unknown, and serialize the admission check through delivery. Existing
+            sessions are not stopped.
+          type: boolean
       required:
       - message
       type: object

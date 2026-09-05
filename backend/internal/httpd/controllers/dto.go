@@ -242,7 +242,8 @@ type CleanupSessionsResponse struct {
 
 // SendSessionMessageRequest is the body of POST /api/v1/sessions/{sessionId}/send.
 type SendSessionMessageRequest struct {
-	Message string `json:"message" minLength:"1" maxLength:"4096"`
+	Message          string `json:"message" minLength:"1" maxLength:"4096"`
+	RequireAdmission bool   `json:"requireAdmission,omitempty" description:"When true, reject delivery while project admission is paused or unknown, and serialize the admission check through delivery. Existing sessions are not stopped."`
 }
 
 // SendSessionMessageResponse is the body of POST /api/v1/sessions/{sessionId}/send.

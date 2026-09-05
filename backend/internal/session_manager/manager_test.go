@@ -3928,6 +3928,7 @@ func TestReconcileLive_AliveSessionAdoptedNoop(t *testing.T) {
 
 func TestReconcile_DisabledLiveSessionIsPreservedAndRetired(t *testing.T) {
 	st := newFakeStore()
+	st.projects["p1"] = domain.ProjectRecord{ID: "p1"}
 	rec := domain.SessionRecord{
 		ID: "s-disabled", ProjectID: "p1", Harness: domain.HarnessClaudeCode,
 		Metadata: domain.SessionMetadata{Branch: "ao/s-disabled/root", WorkspacePath: "/wt/s-disabled", RuntimeHandleID: "s-disabled"},
@@ -3961,6 +3962,7 @@ func TestReconcile_DisabledLiveSessionIsPreservedAndRetired(t *testing.T) {
 
 func TestReconcile_DisabledRuntimeDestroyFailureBlocksReadiness(t *testing.T) {
 	st := newFakeStore()
+	st.projects["p1"] = domain.ProjectRecord{ID: "p1"}
 	rec := domain.SessionRecord{
 		ID: "s-disabled", ProjectID: "p1", Harness: domain.HarnessClaudeCode,
 		Metadata: domain.SessionMetadata{Branch: "ao/s-disabled/root", WorkspacePath: "/wt/s-disabled", RuntimeHandleID: "s-disabled"},

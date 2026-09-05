@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 )
 
 func TestAdmissionPausePreservesEveryLaunchEntry(t *testing.T) {
@@ -119,5 +121,113 @@ func TestUnknownAdmissionDoesNotRestore(t *testing.T) {
 	}
 	if rt.created != 0 || len(ws.calls) != 0 {
 		t.Fatal("mutated on unknown admission")
+	}
+}
+
+func TestPausedDisabledRecoveryStopsRuntimeAndPreservesCandidate(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		for _, unknown := range []bool{false, true} {
+			m, st, rt, ws := newManager()
+			p := st.projects["mer"]
+			p.Config.AdmissionPaused = !unknown
+			if unknown {
+				p.ConfigDecodeError = "bad persisted config"
+			}
+			st.projects["mer"] = p
+			m.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+			rec := domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Harness: domain.HarnessClaudeCode, IsTerminated: terminal, Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "mer-1", AgentSessionID: "native-context"}}
+			st.sessions[rec.ID] = rec
+			rt.aliveByHandle = map[string]bool{"mer-1": true}
+			marker := domain.SessionWorktreeRecord{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, WorktreePath: "/ws/mer-1", Branch: "b", PreservedRef: "refs/ao/preserved/existing", State: "removed"}
+			st.worktrees[rec.ID] = []domain.SessionWorktreeRecord{marker}
+			if err := m.Reconcile(ctx); err != nil {
+				t.Fatalf("terminal=%v unknown=%v: %v", terminal, unknown, err)
+			}
+			if rt.aliveByHandle["mer-1"] || !st.sessions[rec.ID].IsTerminated {
+				t.Fatal("disabled runtime remained live")
+			}
+			if ws.stashCalls != 0 || len(ws.calls) != 0 || !reflect.DeepEqual(st.sessions[rec.ID].Metadata, rec.Metadata) || !reflect.DeepEqual(st.worktrees[rec.ID], []domain.SessionWorktreeRecord{marker}) {
+				t.Fatal("disabled retirement changed preserved candidate")
+			}
+		}
+	}
+}
+func TestPausedDisabledUnknownStopDoesNotPublishTermination(t *testing.T) {
+	m, st, rt, ws := newManager()
+	p := st.projects["mer"]
+	p.Config.AdmissionPaused = true
+	st.projects["mer"] = p
+	m.policy = domain.NewAgentPolicy([]domain.AgentHarness{domain.HarnessClaudeCode})
+	rec := domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Harness: domain.HarnessClaudeCode, Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "mer-1"}}
+	st.sessions[rec.ID] = rec
+	rt.aliveErr = errors.New("probe unavailable")
+	if err := m.Reconcile(ctx); !errors.Is(err, ErrDisabledAgentRetirement) {
+		t.Fatalf("unknown stop: %v", err)
+	}
+	if st.sessions[rec.ID].IsTerminated || ws.stashCalls != 0 || len(ws.calls) != 0 {
+		t.Fatal("uncertain stop changed evidence")
+	}
+}
+
+type blockedAdmissionMessenger struct {
+	entered, release chan struct{}
+	once             sync.Once
+	calls            int
+}
+
+func (m *blockedAdmissionMessenger) Send(ctx context.Context, _ domain.SessionID, _ string) error {
+	m.calls++
+	m.once.Do(func() { close(m.entered) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.release:
+		return nil
+	}
+}
+func TestRequiredAdmissionSendSerializesWithPause(t *testing.T) {
+	m, st, _, _ := newManager()
+	st.sessions["mer-1"] = mkLive("mer-1")
+	raw := &blockedAdmissionMessenger{entered: make(chan struct{}), release: make(chan struct{})}
+	m.messenger = sessionguard.New(st, raw, nil)
+	sent := make(chan error, 1)
+	go func() { sent <- m.SendAdmitted(ctx, "mer-1", "background turn") }()
+	<-raw.entered
+	paused := make(chan error, 1)
+	go func() {
+		unlock, err := m.admission.Lock(ctx, "mer")
+		if err != nil {
+			paused <- err
+			return
+		}
+		defer unlock()
+		p := st.projects["mer"]
+		p.Config.AdmissionPaused = true
+		st.projects["mer"] = p
+		paused <- nil
+	}()
+	select {
+	case <-paused:
+		t.Fatal("pause completed before admitted send")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(raw.release)
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-paused; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SendAdmitted(ctx, "mer-1", "late background turn"); !errors.Is(err, admission.ErrPaused) {
+		t.Fatal(err)
+	}
+	if raw.calls != 1 {
+		t.Fatal("late background message reached pane")
+	}
+	if err := m.Send(ctx, "mer-1", "explicit user message"); err != nil {
+		t.Fatal(err)
+	}
+	if raw.calls != 2 {
+		t.Fatal("ordinary user send unexpectedly gated")
 	}
 }

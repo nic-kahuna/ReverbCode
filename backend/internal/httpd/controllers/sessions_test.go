@@ -23,15 +23,17 @@ import (
 )
 
 type fakeSessionService struct {
-	sessions        map[domain.SessionID]domain.Session
-	sent            string
-	cleanupProjects []domain.ProjectID
-	cleanupResult   []domain.SessionID
-	cleanupSkipped  []sessionsvc.CleanupSkipped
-	spawnErr        error
-	lastSpawn       ports.SpawnConfig
-	claimErr        error
-	listPRErr       error
+	sessions         map[domain.SessionID]domain.Session
+	sent             string
+	sentAdmitted     bool
+	sendAdmissionErr error
+	cleanupProjects  []domain.ProjectID
+	cleanupResult    []domain.SessionID
+	cleanupSkipped   []sessionsvc.CleanupSkipped
+	spawnErr         error
+	lastSpawn        ports.SpawnConfig
+	claimErr         error
+	listPRErr        error
 }
 
 func newFakeSessionService() *fakeSessionService {
@@ -180,6 +182,59 @@ func (f *fakeSessionService) Rename(_ context.Context, id domain.SessionID, disp
 func (f *fakeSessionService) Send(_ context.Context, _ domain.SessionID, message string) error {
 	f.sent = message
 	return nil
+}
+
+func (f *fakeSessionService) SendAdmitted(ctx context.Context, id domain.SessionID, message string) error {
+	f.sentAdmitted = true
+	if f.sendAdmissionErr != nil {
+		return f.sendAdmissionErr
+	}
+	return f.Send(ctx, id, message)
+}
+
+func TestSessionsAPI_SendRequireAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		admitted   bool
+	}{
+		{"ordinary", `{"message":"continue"}`, false},
+		{"explicit ordinary", `{"message":"continue","requireAdmission":false}`, false},
+		{"admitted", `{"message":"continue","requireAdmission":true}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newFakeSessionService()
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send", tc.body)
+			if status != http.StatusOK || svc.sent != "continue" || svc.sentAdmitted != tc.admitted {
+				t.Fatalf("status=%d admitted=%v sent=%q body=%s", status, svc.sentAdmitted, svc.sent, body)
+			}
+		})
+	}
+}
+
+func TestSessionsAPI_SendRequireAdmissionBlocked(t *testing.T) {
+	for _, code := range []string{"PROJECT_ADMISSION_PAUSED", "PROJECT_ADMISSION_UNKNOWN"} {
+		t.Run(code, func(t *testing.T) {
+			svc := newFakeSessionService()
+			svc.sendAdmissionErr = apierr.Conflict(code, "Admission unavailable", nil)
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send", `{"message":"continue","requireAdmission":true}`)
+			assertErrorCode(t, body, status, http.StatusConflict, code)
+			if svc.sent != "" || !svc.sentAdmitted {
+				t.Fatalf("blocked delivery: admitted=%v sent=%q", svc.sentAdmitted, svc.sent)
+			}
+		})
+	}
+}
+
+func TestSessionsAPI_SendRequireAdmissionWrongType(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send", `{"message":"continue","requireAdmission":"true"}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
+	if svc.sent != "" || svc.sentAdmitted {
+		t.Fatalf("malformed delivery: admitted=%v sent=%q", svc.sentAdmitted, svc.sent)
+	}
 }
 
 func (f *fakeSessionService) ListPRs(_ context.Context, id domain.SessionID) ([]domain.PRFacts, error) {

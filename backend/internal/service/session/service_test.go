@@ -267,6 +267,9 @@ func (f *fakeCommander) Send(_ context.Context, id domain.SessionID, _ string) e
 	f.sent = append(f.sent, id)
 	return nil
 }
+func (f *fakeCommander) SendAdmitted(ctx context.Context, id domain.SessionID, message string) error {
+	return f.Send(ctx, id, message)
+}
 func (f *fakeCommander) Cleanup(_ context.Context, project domain.ProjectID) (sessionmanager.CleanupResult, error) {
 	f.cleanupProjects = append(f.cleanupProjects, project)
 	if f.cleanupErr != nil {

@@ -57,6 +57,49 @@ func sendServer(t *testing.T, status int, respBody string) (*httptest.Server, *s
 	return srv, capture
 }
 
+func TestSend_RequireAdmissionWireFlag(t *testing.T) {
+	for _, required := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "admitted"}[required], func(t *testing.T) {
+			t.Setenv("AO_SESSION_ID", "")
+			cfg := setConfigEnv(t)
+			srv, capture := sendServer(t, http.StatusOK, `{"ok":true,"sessionId":"demo-1","message":"continue"}`)
+			writeRunFileFor(t, cfg, srv)
+			args := []string{"send", "--session", "demo-1", "--message", "continue"}
+			if required {
+				args = append(args, "--require-admission")
+			}
+			_, stderr, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, args...)
+			if err != nil {
+				t.Fatalf("send: %v; stderr=%s", err, stderr)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(capture.body), &got); err != nil {
+				t.Fatal(err)
+			}
+			if required && string(got["requireAdmission"]) != "true" {
+				t.Fatalf("request=%s", capture.body)
+			}
+			if !required && got["requireAdmission"] != nil {
+				t.Fatalf("ordinary request changed: %s", capture.body)
+			}
+		})
+	}
+}
+
+func TestSend_RequireAdmissionErrorAndUsage(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, _ := sendServer(t, http.StatusConflict, `{"error":"conflict","code":"PROJECT_ADMISSION_PAUSED","message":"Admission paused","requestId":"req-send"}`)
+	writeRunFileFor(t, cfg, srv)
+	_, stderr, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "send", "--session", "demo-1", "--message", "continue", "--require-admission")
+	if ExitCode(err) != 1 || !strings.Contains(err.Error()+stderr, "PROJECT_ADMISSION_PAUSED") || !strings.Contains(err.Error()+stderr, "req-send") {
+		t.Fatalf("error=%v stderr=%s", err, stderr)
+	}
+	_, _, err = executeCLI(t, Deps{}, "send", "--session", "demo-1", "--message", "continue", "--require-admission=maybe")
+	if ExitCode(err) != 2 {
+		t.Fatalf("invalid bool: %v exit=%d", err, ExitCode(err))
+	}
+}
+
 func TestSend_Success(t *testing.T) {
 	t.Setenv("AO_SESSION_ID", "")
 	cfg := setConfigEnv(t)

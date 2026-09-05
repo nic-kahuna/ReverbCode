@@ -135,3 +135,58 @@ func TestPauseTransitionWaitsForLaunchAndCancellationDoesNotCommit(t *testing.T)
 		t.Fatal(err)
 	}
 }
+
+type pausedProjectReadKey struct{}
+type admissionReadStore struct {
+	*sqlite.Store
+	read, release chan struct{}
+}
+
+func (s *admissionReadStore) GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error) {
+	row, ok, err := s.Store.GetProject(ctx, id)
+	if ctx.Value(pausedProjectReadKey{}) != nil {
+		close(s.read)
+		<-s.release
+	}
+	return row, ok, err
+}
+func TestConcurrentPauseCannotResurrectRemovedProject(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.UpsertProject(ctx, domain.ProjectRecord{ID: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &admissionReadStore{Store: store, read: make(chan struct{}), release: make(chan struct{})}
+	svc := project.New(wrapped)
+	paused := make(chan error, 1)
+	go func() {
+		_, err := svc.SetAdmission(context.WithValue(ctx, pausedProjectReadKey{}, true), "p", true)
+		paused <- err
+	}()
+	<-wrapped.read
+	removed := make(chan error, 1)
+	go func() { _, err := svc.Remove(ctx, "p"); removed <- err }()
+	select {
+	case <-removed:
+		t.Fatal("remove bypassed in-flight config transition")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(wrapped.release)
+	if err := <-paused; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-removed; err != nil {
+		t.Fatal(err)
+	}
+	row, ok, err := store.GetProject(ctx, "p")
+	if err != nil || !ok || row.ArchivedAt.IsZero() {
+		t.Fatalf("removed project resurrected: %+v %v", row, err)
+	}
+	if _, err := svc.SetAdmission(ctx, "p", false); err == nil {
+		t.Fatal("resume resurrected archived project")
+	}
+}

@@ -601,6 +601,12 @@ func (m *Service) Remove(ctx context.Context, id domain.ProjectID) (RemoveResult
 	if err := validateProjectID(id); err != nil {
 		return RemoveResult{}, err
 	}
+	unlock, err := m.admission.Lock(ctx, id)
+	if err != nil {
+		return RemoveResult{}, err
+	}
+	defer unlock()
+
 	row, ok, err := m.store.GetProject(ctx, string(id))
 	if err != nil {
 		return RemoveResult{}, apierr.Internal("PROJECT_REMOVE_FAILED", "Failed to remove project")

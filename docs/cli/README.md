@@ -69,6 +69,13 @@ them, release their leases, or transfer ownership to a foreground task.
 Ordinary `set-config` replacements, including `--clear`, preserve the admission
 pause unless `--config-json` explicitly supplies `admissionPaused` as a boolean.
 
+Background controllers use `ao send --require-admission --session <id>
+--message <text>` to require open project admission through message delivery.
+The daemon checks and sends under the same admission gate, so a pause cannot
+commit between those steps. Paused or unknown admission rejects the message.
+Ordinary `ao send` remains available for direct communication. This delivery
+check does not stop existing writers or transfer ownership.
+
 A pause waits for an already admitted launch to finish before it reports success.
 If the request times out while waiting, admission remains unchanged and that
 launch may still be finishing. Read admission again and retry; a keeper can retain

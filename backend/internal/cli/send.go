@@ -11,15 +11,17 @@ import (
 )
 
 type sendOptions struct {
-	session string
-	message string
+	session          string
+	message          string
+	requireAdmission bool
 }
 
 // sendAPIRequest mirrors the daemon's SendSessionMessageRequest body for
 // POST /api/v1/sessions/{id}/send. The CLI keeps its own copy so it need not
 // import httpd.
 type sendAPIRequest struct {
-	Message string `json:"message"`
+	Message          string `json:"message"`
+	RequireAdmission bool   `json:"requireAdmission,omitempty"`
 }
 
 func newSendCommand(ctx *commandContext) *cobra.Command {
@@ -34,6 +36,7 @@ func newSendCommand(ctx *commandContext) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&opts.session, "session", "", "Session id (required)")
 	cmd.Flags().StringVar(&opts.message, "message", "", "Message body (required)")
+	cmd.Flags().BoolVar(&opts.requireAdmission, "require-admission", false, "Require project admission to remain open through message delivery")
 	return cmd
 }
 
@@ -53,5 +56,5 @@ func (c *commandContext) sendMessage(ctx context.Context, opts sendOptions) erro
 	// PathEscape: session ids are already "-"/digit safe, but may later come
 	// from sanitized issue refs; keep the URL well-formed regardless.
 	path := "sessions/" + url.PathEscape(session) + "/send"
-	return c.postJSON(ctx, path, sendAPIRequest{Message: message}, nil)
+	return c.postJSON(ctx, path, sendAPIRequest{Message: message, RequireAdmission: opts.requireAdmission}, nil)
 }

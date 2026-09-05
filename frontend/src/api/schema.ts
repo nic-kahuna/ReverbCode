@@ -634,7 +634,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Send a message to a running session's agent */
+        /** Send a message to a running session's agent, optionally requiring open project admission through delivery */
         post: operations["sendSessionMessage"];
         delete?: never;
         options?: never;
@@ -988,6 +988,8 @@ export interface components {
         };
         SendSessionMessageRequest: {
             message: string;
+            /** @description When true, reject delivery while project admission is paused or unknown, and serialize the admission check through delivery. Existing sessions are not stopped. */
+            requireAdmission?: boolean;
         };
         SendSessionMessageResponse: {
             message: string;
