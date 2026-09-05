@@ -17,11 +17,10 @@ type sendOptions struct {
 }
 
 // sendAPIRequest mirrors the daemon's SendSessionMessageRequest body for
-// POST /api/v1/sessions/{id}/send. The CLI keeps its own copy so it need not
-// import httpd.
+// POST /api/v1/sessions/{id}/send and /send-admitted. The CLI keeps its own
+// copy so it need not import httpd.
 type sendAPIRequest struct {
-	Message          string `json:"message"`
-	RequireAdmission bool   `json:"requireAdmission,omitempty"`
+	Message string `json:"message"`
 }
 
 func newSendCommand(ctx *commandContext) *cobra.Command {
@@ -56,5 +55,10 @@ func (c *commandContext) sendMessage(ctx context.Context, opts sendOptions) erro
 	// PathEscape: session ids are already "-"/digit safe, but may later come
 	// from sanitized issue refs; keep the URL well-formed regardless.
 	path := "sessions/" + url.PathEscape(session) + "/send"
-	return c.postJSON(ctx, path, sendAPIRequest{Message: message, RequireAdmission: opts.requireAdmission}, nil)
+	if opts.requireAdmission {
+		// A distinct route makes older daemons reject before delivery. Never
+		// fall back to ordinary send when this capability is unavailable.
+		path += "-admitted"
+	}
+	return c.postJSON(ctx, path, sendAPIRequest{Message: message}, nil)
 }

@@ -57,6 +57,7 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao session claim-pr <id> <pr-ref>` | `POST /api/v1/sessions/{id}/pr/claim`          |
 | `ao orchestrator ls`                | `GET /api/v1/orchestrators`                    |
 | `ao send`                           | `POST /api/v1/sessions/{id}/send`              |
+| `ao send --require-admission`       | `POST /api/v1/sessions/{id}/send-admitted`     |
 | `ao preview [url]`                  | `POST /api/v1/sessions/{id}/preview`           |
 | `ao hooks <agent> <event>`          | `POST /api/v1/sessions/{id}/activity` (hidden) |
 
@@ -73,6 +74,8 @@ Background controllers use `ao send --require-admission --session <id>
 --message <text>` to require open project admission through message delivery.
 The daemon checks and sends under the same admission gate, so a pause cannot
 commit between those steps. Paused or unknown admission rejects the message.
+The CLI uses the distinct `/send-admitted` endpoint, so an older daemon rejects
+the request before delivery. It never falls back to ordinary send.
 Ordinary `ao send` remains available for direct communication. This delivery
 check does not stop existing writers or transfer ownership.
 

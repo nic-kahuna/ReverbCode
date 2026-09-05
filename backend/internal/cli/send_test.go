@@ -7,14 +7,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
 
-// sendServer wires an httptest server expecting POST /api/v1/sessions/{id}/send
-// and captures the request body and path the CLI hit.
+// sendCapture records the request body and path the CLI hit.
 type sendCapture struct {
 	body string
 	path string
@@ -39,7 +39,7 @@ func sendServer(t *testing.T, status int, respBody string) (*httptest.Server, *s
 			http.NotFound(w, r)
 			return
 		}
-		if !strings.HasPrefix(r.URL.Path, "/api/v1/sessions/") || !strings.HasSuffix(r.URL.Path, "/send") {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/sessions/") || (!strings.HasSuffix(r.URL.Path, "/send") && !strings.HasSuffix(r.URL.Path, "/send-admitted")) {
 			http.NotFound(w, r)
 			return
 		}
@@ -57,7 +57,7 @@ func sendServer(t *testing.T, status int, respBody string) (*httptest.Server, *s
 	return srv, capture
 }
 
-func TestSend_RequireAdmissionWireFlag(t *testing.T) {
+func TestSend_RequireAdmissionUsesDistinctRoute(t *testing.T) {
 	for _, required := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ordinary", true: "admitted"}[required], func(t *testing.T) {
 			t.Setenv("AO_SESSION_ID", "")
@@ -76,13 +76,74 @@ func TestSend_RequireAdmissionWireFlag(t *testing.T) {
 			if err := json.Unmarshal([]byte(capture.body), &got); err != nil {
 				t.Fatal(err)
 			}
-			if required && string(got["requireAdmission"]) != "true" {
-				t.Fatalf("request=%s", capture.body)
+			wantPath := "/api/v1/sessions/demo-1/send"
+			if required {
+				wantPath += "-admitted"
 			}
-			if !required && got["requireAdmission"] != nil {
-				t.Fatalf("ordinary request changed: %s", capture.body)
+			if capture.path != wantPath {
+				t.Fatalf("path=%q want=%q", capture.path, wantPath)
+			}
+			if len(got) != 1 || string(got["message"]) != `"continue"` {
+				t.Fatalf("request=%s; want only message", capture.body)
 			}
 		})
+	}
+}
+
+// The pre-admission daemon only registers /send and decodes a message-only DTO.
+// json.Decoder ignores unknown fields, so an optional JSON flag cannot safely
+// introduce admission enforcement to that endpoint.
+func TestSend_RequireAdmissionRejectsOlderDaemonBeforeDelivery(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "")
+	cfg := setConfigEnv(t)
+	var deliveries, requests atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/sessions/demo-1/send", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		deliveries.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/sessions/") {
+			requests.Add(1)
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	// Establish the compatibility hazard: the old endpoint accepts and
+	// delivers a message even when an unknown guard field is present.
+	resp, err := http.Post(srv.URL+"/api/v1/sessions/demo-1/send", "application/json", strings.NewReader(`{"message":"old guard","requireAdmission":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || deliveries.Load() != 1 {
+		t.Fatalf("legacy baseline status=%d deliveries=%d", resp.StatusCode, deliveries.Load())
+	}
+	deliveries.Store(0)
+	requests.Store(0)
+
+	_, stderr, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "send", "--session", "demo-1", "--message", "background turn", "--require-admission")
+	if ExitCode(err) != 1 || !strings.Contains(err.Error()+stderr, "404") {
+		t.Fatalf("error=%v stderr=%s; want unsupported endpoint failure", err, stderr)
+	}
+	if deliveries.Load() != 0 || requests.Load() != 1 {
+		t.Fatalf("guarded request delivered or retried: deliveries=%d requests=%d", deliveries.Load(), requests.Load())
+	}
+
+	// Compatibility for the ordinary command remains intact.
+	_, stderr, err = executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "send", "--session", "demo-1", "--message", "foreground message")
+	if err != nil || deliveries.Load() != 1 {
+		t.Fatalf("ordinary send error=%v stderr=%s deliveries=%d", err, stderr, deliveries.Load())
 	}
 }
 

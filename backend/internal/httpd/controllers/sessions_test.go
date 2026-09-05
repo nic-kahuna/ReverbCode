@@ -192,33 +192,34 @@ func (f *fakeSessionService) SendAdmitted(ctx context.Context, id domain.Session
 	return f.Send(ctx, id, message)
 }
 
-func TestSessionsAPI_SendRequireAdmission(t *testing.T) {
+func TestSessionsAPI_SendAdmissionRoutes(t *testing.T) {
 	for _, tc := range []struct {
-		name, body string
-		admitted   bool
+		name, route, body, want string
+		admitted                bool
 	}{
-		{"ordinary", `{"message":"continue"}`, false},
-		{"explicit ordinary", `{"message":"continue","requireAdmission":false}`, false},
-		{"admitted", `{"message":"continue","requireAdmission":true}`, true},
+		{"ordinary", "send", `{"message":"continue"}`, "continue", false},
+		{"admitted", "send-admitted", `{"message":"continue"}`, "continue", true},
+		{"admitted cannot opt out", "send-admitted", `{"message":"continue","requireAdmission":false}`, "continue", true},
+		{"admitted sanitizes", "send-admitted", `{"message":"con\u0000tinue"}`, "continue", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := newFakeSessionService()
 			srv := newSessionTestServer(t, svc)
-			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send", tc.body)
-			if status != http.StatusOK || svc.sent != "continue" || svc.sentAdmitted != tc.admitted {
+			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/"+tc.route, tc.body)
+			if status != http.StatusOK || svc.sent != tc.want || svc.sentAdmitted != tc.admitted {
 				t.Fatalf("status=%d admitted=%v sent=%q body=%s", status, svc.sentAdmitted, svc.sent, body)
 			}
 		})
 	}
 }
 
-func TestSessionsAPI_SendRequireAdmissionBlocked(t *testing.T) {
+func TestSessionsAPI_SendAdmittedBlocked(t *testing.T) {
 	for _, code := range []string{"PROJECT_ADMISSION_PAUSED", "PROJECT_ADMISSION_UNKNOWN"} {
 		t.Run(code, func(t *testing.T) {
 			svc := newFakeSessionService()
 			svc.sendAdmissionErr = apierr.Conflict(code, "Admission unavailable", nil)
 			srv := newSessionTestServer(t, svc)
-			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send", `{"message":"continue","requireAdmission":true}`)
+			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send-admitted", `{"message":"continue"}`)
 			assertErrorCode(t, body, status, http.StatusConflict, code)
 			if svc.sent != "" || !svc.sentAdmitted {
 				t.Fatalf("blocked delivery: admitted=%v sent=%q", svc.sentAdmitted, svc.sent)
@@ -227,13 +228,21 @@ func TestSessionsAPI_SendRequireAdmissionBlocked(t *testing.T) {
 	}
 }
 
-func TestSessionsAPI_SendRequireAdmissionWrongType(t *testing.T) {
-	svc := newFakeSessionService()
-	srv := newSessionTestServer(t, svc)
-	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send", `{"message":"continue","requireAdmission":"true"}`)
-	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
-	if svc.sent != "" || svc.sentAdmitted {
-		t.Fatalf("malformed delivery: admitted=%v sent=%q", svc.sentAdmitted, svc.sent)
+func TestSessionsAPI_SendAdmittedValidation(t *testing.T) {
+	for _, tc := range []struct{ name, body, code string }{
+		{"wrong type", `{"message":true}`, "INVALID_JSON"},
+		{"empty message", `{"message":""}`, "MESSAGE_REQUIRED"},
+		{"too long", `{"message":"` + strings.Repeat("x", 4097) + `"}`, "MESSAGE_TOO_LONG"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newFakeSessionService()
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/send-admitted", tc.body)
+			assertErrorCode(t, body, status, http.StatusBadRequest, tc.code)
+			if svc.sent != "" || svc.sentAdmitted {
+				t.Fatalf("malformed delivery: admitted=%v sent=%q", svc.sentAdmitted, svc.sent)
+			}
+		})
 	}
 }
 

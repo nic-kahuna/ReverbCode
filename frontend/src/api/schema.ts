@@ -634,8 +634,25 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Send a message to a running session's agent, optionally requiring open project admission through delivery */
+        /** Send a message to a running session's agent */
         post: operations["sendSessionMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sessions/{sessionId}/send-admitted": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Send a background message while holding open project admission through delivery; existing writers are not stopped */
+        post: operations["sendAdmittedSessionMessage"];
         delete?: never;
         options?: never;
         head?: never;
@@ -988,8 +1005,6 @@ export interface components {
         };
         SendSessionMessageRequest: {
             message: string;
-            /** @description When true, reject delivery while project admission is paused or unknown, and serialize the admission check through delivery. Existing sessions are not stopped. */
-            requireAdmission?: boolean;
         };
         SendSessionMessageResponse: {
             message: string;
@@ -3403,6 +3418,69 @@ export interface operations {
         };
     };
     sendSessionMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SendSessionMessageRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SendSessionMessageResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    sendAdmittedSessionMessage: {
         parameters: {
             query?: never;
             header?: never;

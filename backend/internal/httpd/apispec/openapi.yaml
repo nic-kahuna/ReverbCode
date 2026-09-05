@@ -1764,8 +1764,59 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Internal Server Error
-      summary: Send a message to a running session's agent, optionally requiring open
-        project admission through delivery
+      summary: Send a message to a running session's agent
+      tags:
+      - sessions
+  /api/v1/sessions/{sessionId}/send-admitted:
+    post:
+      operationId: sendAdmittedSessionMessage
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendSessionMessageRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendSessionMessageResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Send a background message while holding open project admission through
+        delivery; existing writers are not stopped
       tags:
       - sessions
   /api/v1/sessions/cleanup:
@@ -2650,11 +2701,6 @@ components:
           maxLength: 4096
           minLength: 1
           type: string
-        requireAdmission:
-          description: When true, reject delivery while project admission is paused
-            or unknown, and serialize the admission check through delivery. Existing
-            sessions are not stopped.
-          type: boolean
       required:
       - message
       type: object

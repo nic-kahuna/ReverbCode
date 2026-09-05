@@ -240,13 +240,14 @@ type CleanupSessionsResponse struct {
 	Skipped []CleanupSkippedSession `json:"skipped"`
 }
 
-// SendSessionMessageRequest is the body of POST /api/v1/sessions/{sessionId}/send.
+// SendSessionMessageRequest is the body of POST /api/v1/sessions/{sessionId}/send
+// and /send-admitted. Admission enforcement belongs to the distinct route.
 type SendSessionMessageRequest struct {
-	Message          string `json:"message" minLength:"1" maxLength:"4096"`
-	RequireAdmission bool   `json:"requireAdmission,omitempty" description:"When true, reject delivery while project admission is paused or unknown, and serialize the admission check through delivery. Existing sessions are not stopped."`
+	Message string `json:"message" minLength:"1" maxLength:"4096"`
 }
 
-// SendSessionMessageResponse is the body of POST /api/v1/sessions/{sessionId}/send.
+// SendSessionMessageResponse is the body of POST /api/v1/sessions/{sessionId}/send
+// and /send-admitted.
 type SendSessionMessageResponse struct {
 	OK        bool             `json:"ok"`
 	SessionID domain.SessionID `json:"sessionId"`

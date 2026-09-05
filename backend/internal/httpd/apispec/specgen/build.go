@@ -792,7 +792,7 @@ func sessionOperations() []operation {
 		},
 		{
 			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/send", id: "sendSessionMessage", tag: "sessions",
-			summary:    "Send a message to a running session's agent, optionally requiring open project admission through delivery",
+			summary:    "Send a message to a running session's agent",
 			pathParams: []any{controllers.SessionIDParam{}},
 			reqBody:    controllers.SendSessionMessageRequest{},
 			resps: []respUnit{
@@ -800,9 +800,23 @@ func sessionOperations() []operation {
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				// Conflict: the session is terminated, or paused on a permission
-				// decision (SESSION_AWAITING_DECISION), or required project
-				// admission is paused/unknown — the guarded send refuses
+				// decision (SESSION_AWAITING_DECISION). The send refuses
 				// to paste into a pending dialog.
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/send-admitted", id: "sendAdmittedSessionMessage", tag: "sessions",
+			summary:    "Send a background message while holding open project admission through delivery; existing writers are not stopped",
+			pathParams: []any{controllers.SessionIDParam{}},
+			reqBody:    controllers.SendSessionMessageRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.SendSessionMessageResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				// In addition to ordinary send conflicts, admission must be
+				// known and open before the message can be delivered.
 				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},

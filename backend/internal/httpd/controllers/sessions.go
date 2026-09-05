@@ -81,6 +81,7 @@ func (c *SessionsController) Register(r chi.Router) {
 	r.Post("/sessions/{sessionId}/kill", c.kill)
 	r.Post("/sessions/{sessionId}/rollback", c.rollback)
 	r.Post("/sessions/{sessionId}/send", c.send)
+	r.Post("/sessions/{sessionId}/send-admitted", c.sendAdmitted)
 	r.Post("/sessions/{sessionId}/activity", c.activity)
 	r.Get("/orchestrators", c.listOrchestrators)
 	r.Post("/orchestrators", c.spawnOrchestrator)
@@ -429,8 +430,20 @@ func (c *SessionsController) cleanup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *SessionsController) send(w http.ResponseWriter, r *http.Request) {
+	c.sendMessage(w, r, false)
+}
+
+func (c *SessionsController) sendAdmitted(w http.ResponseWriter, r *http.Request) {
+	c.sendMessage(w, r, true)
+}
+
+func (c *SessionsController) sendMessage(w http.ResponseWriter, r *http.Request, admitted bool) {
 	if c.Svc == nil {
-		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/send")
+		route := "/api/v1/sessions/{sessionId}/send"
+		if admitted {
+			route += "-admitted"
+		}
+		apispec.NotImplemented(w, r, "POST", route)
 		return
 	}
 	var in SendSessionMessageRequest
@@ -448,7 +461,7 @@ func (c *SessionsController) send(w http.ResponseWriter, r *http.Request) {
 	}
 	message := domain.SanitizeControlChars(in.Message)
 	send := c.Svc.Send
-	if in.RequireAdmission {
+	if admitted {
 		send = c.Svc.SendAdmitted
 	}
 	if err := send(r.Context(), sessionID(r), message); err != nil {
