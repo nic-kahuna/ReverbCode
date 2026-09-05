@@ -812,7 +812,9 @@ func admissionState(id domain.ProjectID, paused bool) AdmissionState {
 	return AdmissionState{ProjectID: id, AdmissionPaused: paused, Scope: "new_launches_only", ExistingSessionsMayBeRunning: true}
 }
 
-// GetAdmission reports persisted admission policy, never writer liveness.
+// GetAdmission reports persisted admission policy, including archived rows,
+// for offline preparation verification. It never changes archival state or
+// asserts writer liveness.
 func (m *Service) GetAdmission(ctx context.Context, id domain.ProjectID) (AdmissionState, error) {
 	if err := validateProjectID(id); err != nil {
 		return AdmissionState{}, err
@@ -821,7 +823,7 @@ func (m *Service) GetAdmission(ctx context.Context, id domain.ProjectID) (Admiss
 	if err != nil {
 		return AdmissionState{}, err
 	}
-	if !ok || !row.ArchivedAt.IsZero() {
+	if !ok {
 		return AdmissionState{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
 	}
 	if row.ConfigDecodeError != "" {

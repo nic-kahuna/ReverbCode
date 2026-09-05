@@ -187,6 +187,8 @@ before opening/migrating SQLite, persists admission pauses for every project
 (including archived projects), and exits without starting any runtime,
 lifecycle, observer, HTTP server or telemetry lane. Its versioned proof lists
 the paused project IDs; it does not prove existing worker processes stopped.
+Read-only `ao project admission <id> --json` also reports archived project
+policy for verification; admission changes remain forbidden on archived rows.
 
 `ao daemon --start-paused` (or `AO_START_PAUSED=true`) applies the same pause
 before subsystem construction and defaults newly registered projects to paused

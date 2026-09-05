@@ -190,3 +190,38 @@ func TestConcurrentPauseCannotResurrectRemovedProject(t *testing.T) {
 		t.Fatal("resume resurrected archived project")
 	}
 }
+
+func TestArchivedAdmissionRemainsReadableButCannotBeChanged(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	row := domain.ProjectRecord{ID: "archived", Path: "/tmp/archived", ArchivedAt: time.Now(), Config: domain.ProjectConfig{AdmissionPaused: true, DefaultBranch: "develop"}}
+	if err := store.UpsertProject(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := store.GetProject(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := project.New(store)
+	state, err := svc.GetAdmission(ctx, "archived")
+	if err != nil || state.ProjectID != "archived" || !state.AdmissionPaused || state.Scope != "new_launches_only" || !state.ExistingSessionsMayBeRunning {
+		t.Fatalf("archived policy: %+v,%v", state, err)
+	}
+	if _, err := svc.SetAdmission(ctx, "archived", false); err == nil {
+		t.Fatal("archived admission mutation allowed")
+	}
+	after, _, err := store.GetProject(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("archived row changed: before=%+v after=%+v", before, after)
+	}
+	if _, err := svc.GetAdmission(ctx, "missing"); err == nil {
+		t.Fatal("missing project accepted")
+	}
+}
