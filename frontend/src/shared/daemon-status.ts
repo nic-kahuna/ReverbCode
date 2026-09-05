@@ -5,6 +5,7 @@
 // human-facing and may contain local paths; `code` is what gets reported.
 // Statuses without a code (normal ready, user-initiated stop) are not failures.
 export type DaemonFailureCode =
+	| "startup_compatibility"
 	| "not_configured"
 	| "daemon_unreachable"
 	| "binary_missing"

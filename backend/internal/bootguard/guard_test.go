@@ -175,3 +175,45 @@ func TestGuardRatchetSurvivesProcessDeathAndAliasCannotContend(t *testing.T) {
 		t.Fatalf("crashed ratchet lost: %v,%v", g, err)
 	}
 }
+
+func TestInspectionCanonicalMissingAliasChild(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(alias, "absent", "data")
+	before, err := Inspect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "absent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspection wrote: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	after, err := Inspect(dir)
+	if err != nil || before.MarkerPath != after.MarkerPath {
+		t.Fatalf("alias inspection drift: %+v %+v %v", before, after, err)
+	}
+}
+
+func TestInspectionUnavailableAliasRetainsTypedFailure(t *testing.T) {
+	root := t.TempDir()
+	alias := filepath.Join(root, "dangling")
+	if err := os.Symlink(filepath.Join(root, "absent"), alias); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Inspect(filepath.Join(alias, "data"))
+	if !errors.Is(err, ErrUnavailable) || got.State != "unavailable" || got.Schema != "ao-compatibility/v1" || !got.InspectionOnly || got.SupportedProtocol != SupportedProtocol {
+		t.Fatalf("unavailable wire: %+v %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "absent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspection repaired alias: %v", err)
+	}
+}

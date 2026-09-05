@@ -25,3 +25,8 @@ export function desktopUpdatesDisabledStatus(): UpdateStatus {
 		policy: DESKTOP_UPDATE_POLICY_CANARY,
 	};
 }
+
+// The signed managed installer owns the bundle location as well as updates.
+export function mayRelocateDesktop(platform: NodeJS.Platform, isPackaged: boolean, freshData: boolean): boolean {
+	return platform === "darwin" && isPackaged && !DESKTOP_UPDATES_DISABLED && freshData;
+}

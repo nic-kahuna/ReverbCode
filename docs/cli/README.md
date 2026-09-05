@@ -26,13 +26,13 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 
 | Command                       | Purpose                                                                                                                           |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `ao start`                    | Start the daemon in the background and wait for `/readyz`.                                                                        |
+| `ao start`                    | Open the compatible containing desktop app; standalone bootstrap requires no existing AO data.                                                                        |
 | `ao stop`                     | Gracefully stop the daemon via loopback `POST /shutdown` after verifying daemon identity.                                         |
 | `ao status` / `--json`        | Report daemon state from `running.json`, process liveness, `/healthz`, and `/readyz`.                                             |
 | `ao doctor` / `--json`        | Check config, data directory, DB-file presence, daemon state, `git`, and (on Darwin/Linux) `tmux`; on Windows conpty is built in. |
 | `ao completion <shell>`       | Generate completions for `bash`, `zsh`, `fish`, or `powershell`.                                                                  |
 | `ao version` / `ao --version` | Print build metadata.                                                                                                             |
-| `ao daemon`                   | Hidden internal daemon entrypoint used by `ao start`.                                                                             |
+| `ao daemon`                   | Hidden internal daemon entrypoint used by the desktop app.                                                                             |
 
 ### Product commands
 
@@ -231,3 +231,28 @@ not the fully observational operation that `ao compatibility --json` provides.
 Offline pause preparation verifies the effective decoded admission policy inside
 its transaction; ambiguous JSON keys that leave effective admission open cause
 the entire pause transaction to roll back.
+
+### Supported desktop launch
+
+The installed macOS `ao start` binds to its own canonical
+`Contents/Resources/daemon/ao` executable and opens only that containing app.
+Discovery markers and other installed copies cannot substitute for it. It reads
+compatibility before launch; the daemon rechecks under `ao.lock` before opening
+SQLite. A standalone CLI refuses discovery/download/install when its selected
+data directory contains any existing state, including legacy data without a
+compatibility marker. Use the installed app's launcher or repair the signed
+installation. An empty unmanaged setup retains the bootstrap download path.
+
+Packaged desktop startup rejects `AO_DAEMON_COMMAND` and inspects compatibility
+using its bundled native binary with the same resolved environment as daemon
+launch. Failure leaves launch discovery unchanged and appears as a startup
+error. Development command overrides remain supported. Managed builds use the
+existing immutable updater-disabled policy to prevent self-relocation; only a
+fresh unmanaged package may relocate itself. The signed installer owns managed
+bundle replacement and compatible rollback under the data-directory lock.
+
+These are cooperative supported-entrypoint protections, not a way to retrofit
+old binaries: directly running a pre-guard archived app or an unsupported old
+installer remains outside the boundary. Compatibility is a monotonic protocol
+floor, not a global suspension switch. Compatible startup preserves individual
+project pauses and can continue unrelated work.

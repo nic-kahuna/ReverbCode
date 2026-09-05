@@ -3,15 +3,18 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/bootguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 )
 
@@ -61,11 +64,11 @@ func newStartCommand(ctx *commandContext) *cobra.Command {
 	opts := startOptions{}
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Fetch (if needed) and open the Agent Orchestrator desktop app",
+		Short: "Open the installed Agent Orchestrator desktop app",
 		Long: "Fetch (if needed) and open the Agent Orchestrator desktop app.\n\n" +
-			"The desktop app now owns the daemon, state, and updates. `ao start` no\n" +
-			"longer runs a daemon: it resolves the installed app (or downloads the\n" +
-			"latest release), opens it, and exits.",
+			"A bundled launcher opens only its own app after compatibility inspection.\n" +
+			"Standalone bootstrap is available only without existing AO data.\n" +
+			"The desktop app owns daemon startup; this command opens it and exits.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return ctx.runStart(cmd.Context(), cmd, opts)
@@ -82,10 +85,15 @@ func (c *commandContext) runStart(ctx context.Context, cmd *cobra.Command, opts 
 	out := cmd.OutOrStdout()
 	res := startResult{}
 
-	appPath := c.resolveApp()
+	appPath, err := c.authorizedStartBundle()
+	if err != nil {
+		return err
+	}
+	if appPath == "" {
+		appPath = c.resolveApp()
+	}
 	res.Resolved = appPath != ""
 
-	var err error
 	if appPath == "" {
 		// Progress for the fetch path goes to stderr so stdout stays pure JSON
 		// under --json. The resolve-and-launch fast path above stays quiet.
@@ -112,6 +120,69 @@ func (c *commandContext) runStart(ctx context.Context, cmd *cobra.Command, opts 
 		c.printManualOpen(out, appPath)
 	}
 	return nil
+}
+
+// authorizedStartBundle is an observational gate, not an installation lease.
+// The native daemon checks the floor again under ao.lock before opening SQLite.
+func (c *commandContext) authorizedStartBundle() (string, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return "", err
+	}
+	inspection, err := bootguard.Inspect(cfg.DataDir)
+	if err != nil {
+		return "", err
+	}
+	executable, err := c.deps.Executable()
+	if err != nil {
+		return "", fmt.Errorf("AO_START_REPAIR_REQUIRED: resolve installed launcher: %w", err)
+	}
+	bundle, err := containingAppBundle(executable)
+	if err != nil {
+		return "", err
+	}
+	if bundle != "" {
+		return bundle, nil
+	}
+	// Missing marker is legacy compatibility, not proof of an unused data dir.
+	// Any existing entry (including a dangling symlink or unknown durable file)
+	// makes standalone download/discovery unsafe. Do not open SQLite to decide.
+	entries, err := os.ReadDir(filepath.Dir(inspection.MarkerPath))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("AO_START_REPAIR_REQUIRED: inspect product data: %w", err)
+	}
+	if inspection.State != "missing_legacy" || len(entries) != 0 {
+		return "", fmt.Errorf("AO_START_REPAIR_REQUIRED: existing AO data requires the installed app's launcher; repair the signed installation if it is missing")
+	}
+	return "", nil
+}
+
+// Bind a packaged macOS CLI to its actual executable, never a discovery hint.
+// Other distribution layouts remain standalone and cannot open protected data.
+func containingAppBundle(executable string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		return "", fmt.Errorf("AO_START_REPAIR_REQUIRED: resolve launcher: %w", err)
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	suffix := filepath.Join("Contents", "Resources", "daemon", "ao")
+	if !strings.HasSuffix(resolved, string(filepath.Separator)+suffix) {
+		return "", nil
+	}
+	bundle := strings.TrimSuffix(resolved, string(filepath.Separator)+suffix)
+	if !strings.HasSuffix(bundle, ".app") {
+		return "", nil
+	}
+	for _, p := range []string{resolved, filepath.Join(bundle, "Contents", "Info.plist"), filepath.Join(bundle, "Contents", "MacOS", "agent-orchestrator")} {
+		info, err := os.Lstat(p)
+		if err != nil || !info.Mode().IsRegular() {
+			return "", fmt.Errorf("AO_START_REPAIR_REQUIRED: installed app layout is incomplete at %s", p)
+		}
+	}
+	return bundle, nil
 }
 
 // resolveApp returns the path to a usable desktop bundle, or "" when none is

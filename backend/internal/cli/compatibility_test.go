@@ -66,7 +66,7 @@ func TestOfflineCommandsNeverEmitInvocationOrUsageTelemetry(t *testing.T) {
 	for _, args := range [][]string{
 		{"compatibility", "--json"}, {"compatibility", "--invalid"}, {"prepare-start-paused", "--json"}, {"prepare-start-paused", "--invalid"}, {"import", "--from", t.TempDir(), "--yes"}, {"import", "--invalid"}, {"daemon", "--invalid"},
 		{"--help=false", "import", "--invalid"}, {"--help=false", "compatibility", "--invalid"}, {"--help=false", "prepare-start-paused", "--invalid"}, {"--help=false", "daemon", "--invalid"},
-		{"-h=false", "import", "extra"}, {"--help=false", "--version=false", "compatibility", "--invalid"},
+		{"-h=false", "import", "extra"}, {"start", "--invalid"}, {"--help=false", "start", "--invalid"}, {"--help=false", "--version=false", "compatibility", "--invalid"},
 	} {
 		_ = executeWithDeps(deps, args)
 	}

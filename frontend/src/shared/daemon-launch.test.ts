@@ -54,3 +54,9 @@ describe("resolveDaemonLaunch", () => {
 		});
 	});
 });
+
+it("rejects configured commands in every packaged platform", () => {
+	for (const platform of ["darwin", "win32", "linux"] as const) {
+		expect(resolveDaemonLaunch({ AO_DAEMON_COMMAND: "old daemon" }, true, "/resources", "/app", platform)).toBeNull();
+	}
+});

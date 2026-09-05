@@ -40,6 +40,22 @@ describe("desktop update package policy", () => {
 		expect(enabled?.config.define?.__AO_DESKTOP_UPDATE_POLICY_CANARY__).toBe('"ao-desktop-updates-enabled/v1"');
 	});
 
+	it("managed packages cannot relocate even on a fresh install", async () => {
+		vi.stubEnv("AO_DISABLE_DESKTOP_UPDATES", "true");
+		const policy = await import("./desktop-update-policy");
+		expect(policy.mayRelocateDesktop("darwin", true, true)).toBe(false);
+		process.env.AO_DISABLE_DESKTOP_UPDATES = "false";
+		expect(policy.mayRelocateDesktop("darwin", true, true)).toBe(false);
+	});
+	it("general packages relocate only fresh packaged macOS installs", async () => {
+		vi.stubEnv("AO_DISABLE_DESKTOP_UPDATES", "false");
+		const policy = await import("./desktop-update-policy");
+		expect(policy.mayRelocateDesktop("darwin", true, true)).toBe(true);
+		expect(policy.mayRelocateDesktop("darwin", true, false)).toBe(false);
+		expect(policy.mayRelocateDesktop("darwin", false, true)).toBe(false);
+		expect(policy.mayRelocateDesktop("win32", true, true)).toBe(false);
+	});
+
 	it("exposes a stable unsupported status for disabled packages", async () => {
 		vi.stubEnv("AO_DISABLE_DESKTOP_UPDATES", "true");
 		const policy = await import("./desktop-update-policy");

@@ -274,7 +274,7 @@ func offlineCommand(cmd *cobra.Command) bool {
 		return false
 	}
 	switch cmd.CommandPath() {
-	case "ao daemon", "ao import", "ao compatibility", "ao prepare-start-paused":
+	case "ao daemon", "ao import", "ao compatibility", "ao prepare-start-paused", "ao start":
 		return true
 	default:
 		return false

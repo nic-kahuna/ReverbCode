@@ -23,6 +23,7 @@ export function resolveDaemonLaunch(
 ): DaemonLaunchSpec | null {
 	const configuredCommand = env.AO_DAEMON_COMMAND?.trim();
 	if (configuredCommand) {
+		if (isPackaged) return null;
 		return {
 			command: configuredCommand,
 			args: [],

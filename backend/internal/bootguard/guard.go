@@ -79,14 +79,17 @@ func read(dataDir string) (Marker, bool, error) {
 
 // Inspect reads no database, creates no files and does not acquire ownership.
 func Inspect(dataDir string) (Inspection, error) {
-	abs, err := filepath.Abs(dataDir)
+	out := Inspection{Schema: "ao-compatibility/v1", SupportedProtocol: SupportedProtocol, InspectionOnly: true, StartPausedSupported: true}
+	abs, err := canonicalInspectionPath(dataDir)
 	if err != nil {
-		return Inspection{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		out.State = "unavailable"
+		// The unresolved path is diagnostic only; callers must reject unavailable.
+		if attempted, pathErr := filepath.Abs(dataDir); pathErr == nil {
+			out.MarkerPath = filepath.Join(attempted, MarkerName)
+		}
+		return out, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
-	if canonical, e := filepath.EvalSymlinks(abs); e == nil {
-		abs = canonical
-	}
-	out := Inspection{Schema: "ao-compatibility/v1", SupportedProtocol: SupportedProtocol, MarkerPath: filepath.Join(abs, MarkerName), InspectionOnly: true, StartPausedSupported: true}
+	out.MarkerPath = filepath.Join(abs, MarkerName)
 	m, exists, err := read(abs)
 	if err != nil {
 		out.State = "unavailable"
@@ -106,6 +109,29 @@ func Inspect(dataDir string) (Inspection, error) {
 		return out, ErrUnsupported
 	}
 	return out, nil
+}
+
+// Resolve existing ancestors without creating a missing data directory. A
+// dangling symlink or inaccessible ancestor is uncertainty, never fresh state.
+func canonicalInspectionPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Lstat(abs); err == nil {
+		return filepath.EvalSymlinks(abs)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	parent := filepath.Dir(abs)
+	if parent == abs {
+		return "", fmt.Errorf("cannot resolve data-directory root")
+	}
+	resolved, err := canonicalInspectionPath(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolved, filepath.Base(abs)), nil
 }
 
 // Guard retains the data-directory lock until all daemon/offline work ends.

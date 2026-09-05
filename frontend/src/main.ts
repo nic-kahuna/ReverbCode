@@ -33,6 +33,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { inspectBundledCompatibility, prepareDesktopStartup } from "./main/launch-compatibility";
+import { mayRelocateDesktop } from "./main/desktop-update-policy";
 import { type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
@@ -526,13 +528,18 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 	if (daemonProcess) {
 		return daemonStatus;
 	}
-	const launch = resolveDaemonLaunch(
-		process.env,
-		app.isPackaged,
-		process.resourcesPath,
-		app.getAppPath(),
-		process.platform,
-	);
+	await ensureShellEnv();
+	const env = daemonEnv();
+	const launch = resolveDaemonLaunch(env, app.isPackaged, process.resourcesPath, app.getAppPath(), process.platform);
+	if (app.isPackaged) {
+		try {
+			await inspectBundledCompatibility(launch, env);
+		} catch (error) {
+			setDaemonStatus({ state: "error", code: "startup_compatibility", message: String(error) });
+			return daemonStatus;
+		}
+	}
+
 	if (!launch) return daemonStatus;
 	const existing = await inspectExistingDaemon(launch);
 	if (existing) {
@@ -555,11 +562,16 @@ async function startDaemon(): Promise<DaemonStatus> {
 		return daemonStartPromise;
 	}
 	const startEpoch = daemonStartEpoch;
-	const promise = startDaemonInner(startEpoch).finally(() => {
-		if (daemonStartPromise === promise) {
-			daemonStartPromise = null;
-		}
-	});
+	const promise = startDaemonInner(startEpoch)
+		.catch((error: unknown) => {
+			setDaemonStatus({ state: "error", code: "startup_compatibility", message: String(error) });
+			return daemonStatus;
+		})
+		.finally(() => {
+			if (daemonStartPromise === promise) {
+				daemonStartPromise = null;
+			}
+		});
 	daemonStartPromise = promise;
 	return daemonStartPromise;
 }
@@ -581,13 +593,15 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// shell-exported credentials rather than launchd's minimal env.
 	await ensureShellEnv();
 
+	const launchEnv = daemonEnv();
 	const launch = resolveDaemonLaunch(
-		process.env,
+		launchEnv,
 		app.isPackaged,
 		process.resourcesPath,
 		app.getAppPath(),
 		process.platform,
 	);
+	if (app.isPackaged) await inspectBundledCompatibility(launch, launchEnv);
 	if (!launch) {
 		setDaemonStatus({
 			state: "stopped",
@@ -732,7 +746,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// the whole group via killDaemon() reaches the daemon and any PTY children.
 	const child = spawn(launch.command, launch.args, {
 		cwd: launch.cwd,
-		env: daemonEnv(),
+		env: launchEnv,
 		shell: launch.shell,
 		detached: true,
 		// Hide the daemon's console on a Windows GUI launch (no flashing terminal).
@@ -1173,45 +1187,36 @@ async function writeAppStateOnLaunch(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
-	// Capture install provenance BEFORE relocation. moveToApplicationsFolder()
-	// relaunches from /Applications WITHOUT forwarding our --installed-via arg, and
-	// code past a successful move never runs in this instance, so a post-move-only
-	// write would record installSource="unknown" and the sticky logic in
-	// writeAppStateMarker would then lock it there forever. Writing now (only when
-	// the arg is present, i.e. the npm-bootstrap launch) persists the source so the
-	// post-move instance preserves it while refreshing appPath to /Applications.
-	if (parseInstalledVia(process.argv)) {
-		try {
-			await writeAppStateOnLaunch();
-		} catch (err) {
-			console.error("failed to write pre-relocation app-state marker:", err);
-		}
-	}
-
-	if (process.platform === "darwin" && app.isPackaged) {
-		try {
-			// On success this restarts the app from /Applications, so code past
-			// here only runs when no move happened (already there, or declined).
-			app.moveToApplicationsFolder();
-		} catch (err) {
-			console.error("relocation to Applications failed:", err);
-		}
-	}
-
-	// Refresh the marker post-relocation so appPath records the final bundle path;
-	// the sticky installSource preserves the value captured above. A marker-write
-	// failure is non-fatal: log and continue so the app still boots.
+	let startupAllowed = true;
 	try {
-		await writeAppStateOnLaunch();
-	} catch (err) {
-		console.error("failed to write app-state marker:", err);
+		await prepareDesktopStartup({
+			isPackaged: app.isPackaged,
+			inspect: async () => {
+				await ensureShellEnv();
+				const env = daemonEnv();
+				const launch = resolveDaemonLaunch(env, true, process.resourcesPath, app.getAppPath(), process.platform);
+				return inspectBundledCompatibility(launch, env);
+			},
+			mayRelocate: (freshData) => mayRelocateDesktop(process.platform, app.isPackaged, freshData),
+			installedVia: Boolean(parseInstalledVia(process.argv)),
+			writeDiscovery: writeAppStateOnLaunch,
+			relocate: () => {
+				app.moveToApplicationsFolder();
+			},
+			report: (error) => console.error("AO desktop startup discovery/relocation:", error),
+		});
+	} catch (error) {
+		startupAllowed = false;
+		setDaemonStatus({ state: "error", code: "startup_compatibility", message: String(error) });
 	}
 
 	registerRendererProtocol();
 	applyRuntimeAppIcon();
 	createWindow();
-	void startDaemon();
-	initAutoUpdates();
+	if (startupAllowed) {
+		void startDaemon();
+		initAutoUpdates();
+	}
 
 	app.on("activate", () => {
 		if (BrowserWindow.getAllWindows().length === 0) {
