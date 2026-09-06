@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/custody"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
@@ -119,6 +120,10 @@ func New(opts Options) (*Workspace, error) {
 // Create adds a git worktree for the session under the managed root, checking
 // out the requested branch, and returns where it landed.
 func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	if err := w.guardCustody(ctx, cfg.ProjectID, cfg.SessionID, false); err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+
 	if err := validateConfig(cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
@@ -132,6 +137,34 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 	path, err := w.managedPath(cfg)
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
+	}
+	if custody.ManagedPreparation(ctx) {
+		if _, e := os.Lstat(path); !os.IsNotExist(e) {
+			return ports.WorkspaceInfo{}, fmt.Errorf("%w: managed new candidate path already exists", custody.ErrUnknown)
+		}
+		exists, e := w.refExists(ctx, repo, "refs/heads/"+cfg.Branch)
+		if e != nil {
+			return ports.WorkspaceInfo{}, e
+		}
+		if exists {
+			return ports.WorkspaceInfo{}, fmt.Errorf("%w: existing branch requires explicit candidate adoption", custody.ErrUnknown)
+		}
+		ref, e := w.resolveBaseRef(ctx, repo, cfg.Branch, cfg.BaseBranch)
+		if e != nil {
+			return ports.WorkspaceInfo{}, e
+		}
+		data, e := w.run(ctx, w.binary, revParseVerifyArgs(repo, ref+"^{commit}")...)
+		if e != nil {
+			return ports.WorkspaceInfo{}, e
+		}
+		sha := strings.TrimSpace(string(data))
+		if e = custody.BindPrewriteCandidate(ctx, path, sha, cfg.Branch); e != nil {
+			return ports.WorkspaceInfo{}, e
+		}
+		if _, e = w.run(ctx, w.binary, worktreeAddNewBranchArgs(repo, cfg.Branch, path, sha)...); e != nil {
+			return ports.WorkspaceInfo{}, e
+		}
+		return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, nil
 	}
 	if info, ok, err := w.existingWorktree(ctx, repo, path, cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
@@ -150,6 +183,10 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 // one branch name; if the requested branch already exists in any repo, one
 // suffixed branch that is free in every repo is selected and used everywhere.
 func (w *Workspace) CreateWorkspaceProject(ctx context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
+	if err := w.guardCustody(ctx, cfg.ProjectID, cfg.SessionID, true); err != nil {
+		return ports.WorkspaceProjectInfo{}, err
+	}
+
 	if err := validateWorkspaceProjectConfig(cfg); err != nil {
 		return ports.WorkspaceProjectInfo{}, err
 	}
@@ -233,6 +270,10 @@ func (w *Workspace) CreateWorkspaceProject(ctx context.Context, cfg ports.Worksp
 // rollback because normal interactive cleanup still goes through Destroy and
 // the full dirty-preserve matrix is implemented separately.
 func (w *Workspace) DestroyWorkspaceProject(ctx context.Context, info ports.WorkspaceProjectInfo) error {
+	if err := w.guardCustody(ctx, info.Root.ProjectID, info.Root.SessionID, true); err != nil {
+		return err
+	}
+
 	var firstErr error
 	for i := len(info.Worktrees) - 1; i >= 0; i-- {
 		wt := info.Worktrees[i]
@@ -256,6 +297,10 @@ func (w *Workspace) DestroyWorkspaceProject(ctx context.Context, info ports.Work
 // Destroy removes the session's worktree and prunes it from the repo, refusing
 // (rather than force-deleting) if git still has the path registered afterwards.
 func (w *Workspace) Destroy(ctx context.Context, info ports.WorkspaceInfo) error {
+	if err := w.guardCustody(ctx, info.ProjectID, info.SessionID, true); err != nil {
+		return err
+	}
+
 	if info.Path == "" {
 		return fmt.Errorf("%w: empty path", ErrUnsafePath)
 	}
@@ -308,6 +353,10 @@ func (w *Workspace) Destroy(ctx context.Context, info ports.WorkspaceInfo) error
 // discards agent work. For interactive teardown (ao session kill, ao cleanup)
 // use Destroy, which refuses dirty worktrees via ErrWorkspaceDirty.
 func (w *Workspace) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) error {
+	if err := w.guardCustody(ctx, info.ProjectID, info.SessionID, true); err != nil {
+		return err
+	}
+
 	if info.Path == "" {
 		return fmt.Errorf("%w: empty path", ErrUnsafePath)
 	}
@@ -345,6 +394,10 @@ func (w *Workspace) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) 
 // Returns the full ref name (e.g. "refs/ao/preserved/sess-1"). Returns an
 // empty string (and no error) if the worktree is clean.
 func (w *Workspace) StashUncommitted(ctx context.Context, info ports.WorkspaceInfo) (string, error) {
+	if err := w.guardCustody(ctx, info.ProjectID, info.SessionID, true); err != nil {
+		return "", err
+	}
+
 	if info.Path == "" {
 		return "", fmt.Errorf("%w: empty path", ErrUnsafePath)
 	}
@@ -491,6 +544,10 @@ func (w *Workspace) countIgnoredPaths(ctx context.Context, worktree string) (int
 //
 // NEVER deletes the preserve ref on a failed or conflicted apply.
 func (w *Workspace) ApplyPreserved(ctx context.Context, info ports.WorkspaceInfo, ref string) error {
+	if err := w.guardCustody(ctx, info.ProjectID, info.SessionID, true); err != nil {
+		return err
+	}
+
 	if info.Path == "" {
 		return fmt.Errorf("%w: empty path", ErrUnsafePath)
 	}
@@ -546,6 +603,10 @@ func (w *Workspace) runCherryPickNoCommit(ctx context.Context, worktree, commitS
 // Restore re-attaches to an existing worktree for the session if one is still
 // present, recreating the handle without disturbing its contents.
 func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	if err := w.guardCustody(ctx, cfg.ProjectID, cfg.SessionID, true); err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+
 	if err := validateConfig(cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
@@ -1135,6 +1196,10 @@ func moveStrayPathAside(path string) (string, error) {
 }
 
 func runCommand(ctx context.Context, binary string, args ...string) ([]byte, error) {
+	if out, handled, err := custody.RunPreparedCommand(ctx, "", binary, args...); handled {
+		return out, err
+	}
+
 	cmd := aoprocess.CommandContext(ctx, binary, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1157,3 +1222,21 @@ func (e commandError) Error() string {
 }
 
 func (e commandError) Unwrap() error { return e.err }
+
+func (w *Workspace) guardCustody(ctx context.Context, project domain.ProjectID, session domain.SessionID, destructive bool) error {
+	if source, ok := w.repos.(interface {
+		ManagedProject(context.Context, string) (bool, error)
+	}); ok {
+		managed, err := source.ManagedProject(ctx, string(project))
+		if err != nil {
+			return err
+		}
+		if managed {
+			if destructive {
+				return custody.ErrFenced
+			}
+			return custody.ValidatePreparation(ctx, string(session))
+		}
+	}
+	return nil
+}

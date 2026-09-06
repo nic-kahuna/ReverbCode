@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -114,6 +115,30 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 		return nil
 	}
 
+	if attempt := os.Getenv("AO_NATIVE_ATTEMPT_ID"); attempt != "" {
+		generation, e := strconv.ParseInt(os.Getenv("AO_NATIVE_GENERATION"), 10, 64)
+		if e != nil {
+			return e
+		}
+		var native struct {
+			SessionID  string `json:"session_id"`
+			Transcript string `json:"transcript_path"`
+			CWD        string `json:"cwd"`
+			TurnID     string `json:"turn_id"`
+		}
+		if e = json.Unmarshal(payload, &native); e != nil {
+			return e
+		}
+		hookSessionID := sessionID
+		if child := os.Getenv("AO_NATIVE_CHILD_HANDLE"); child != "" {
+			hookSessionID = child
+		}
+		body := map[string]any{"project": os.Getenv("AO_PROJECT_ID"), "session_id": hookSessionID, "launch_attempt_id": attempt, "launch_generation": generation, "pid": os.Getpid(), "event": event, "state": string(state), "provider_id": native.SessionID, "transcript": native.Transcript, "worktree": native.CWD, "turn_id": native.TurnID}
+		if e = c.postJSON(ctx, "custody/hook", body, nil); e != nil {
+			c.reportHookFailure(agent, event, sessionID, e)
+		}
+		return nil
+	}
 	toolName, toolUseID := activityMeta(payload)
 	path := "sessions/" + url.PathEscape(sessionID) + "/activity"
 	if err := c.postJSON(ctx, path, setActivityAPIRequest{State: string(state), Event: event, ToolName: toolName, ToolUseID: toolUseID}, nil); err != nil {

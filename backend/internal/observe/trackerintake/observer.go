@@ -5,7 +5,9 @@ package trackerintake
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/aoagents/agent-orchestrator/backend/internal/custody"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -150,6 +152,20 @@ func (o *Observer) Poll(ctx context.Context) error {
 		return err
 	}
 	seen := seenIssueIDs(sessions)
+	if native, ok := o.store.(interface {
+		CurrentAttempt(context.Context, string) (custody.Attempt, bool, error)
+	}); ok {
+		for _, session := range sessions {
+			attempt, found, e := native.CurrentAttempt(ctx, string(session.ID))
+			if e != nil {
+				return e
+			}
+			if found && custody.RetryableAttempt(attempt) {
+				delete(seen, session.IssueID)
+			}
+		}
+	}
+
 	for _, project := range enabledProjects {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -224,6 +240,10 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 			Route:     route,
 			Prompt:    BuildIssuePrompt(issue),
 		}); err != nil {
+			if errors.Is(err, custody.ErrAdmission) || errors.Is(err, custody.ErrFenced) || errors.Is(err, custody.ErrConflict) {
+				o.logger.Debug("tracker intake: managed candidate deferred", "project", project.ID, "issue", issueID, "err", err)
+				continue
+			}
 			o.logger.Error("tracker intake: spawn issue session failed", "project", project.ID, "issue", issueID, "err", err)
 			spawnFailed = true
 			continue

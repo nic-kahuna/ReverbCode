@@ -18,7 +18,7 @@ import (
 const (
 	MarkerSchema      = "ao-data-compatibility/v1"
 	MarkerName        = "compatibility.json"
-	SupportedProtocol = 1
+	SupportedProtocol = 2
 )
 
 // Stable errors allow offline tooling to distinguish refusal from uncertainty.

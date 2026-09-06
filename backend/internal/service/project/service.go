@@ -602,6 +602,18 @@ func resolveDefaultBranch(path string) string {
 // archives the project registration. The original repository path and durable
 // session/history rows are preserved.
 func (m *Service) Remove(ctx context.Context, id domain.ProjectID) (RemoveResult, error) {
+	if store, ok := m.store.(interface {
+		ManagedProject(context.Context, string) (bool, error)
+	}); ok {
+		managed, err := store.ManagedProject(ctx, string(id))
+		if err != nil {
+			return RemoveResult{}, err
+		}
+		if managed {
+			return RemoveResult{}, apierr.Conflict("AO_CUSTODY_FENCED", "Managed project custody must be reconciled before removal", nil)
+		}
+	}
+
 	if err := validateProjectID(id); err != nil {
 		return RemoveResult{}, err
 	}

@@ -96,6 +96,9 @@ type RuntimeConfig struct {
 	WorkspacePath string
 	Argv          []string
 	Env           map[string]string
+	// Managed is set only by the native custody facade after final admission.
+	// It selects the inert retained-pane launch shape, never an interactive tail.
+	Managed bool
 }
 
 // RuntimeHandle identifies a live runtime instance. HandleFor owns the
@@ -104,6 +107,17 @@ type RuntimeConfig struct {
 // stop a process even if the post-launch metadata write fails.
 type RuntimeHandle struct {
 	ID string
+}
+
+// RuntimeProcessInfo identifies a tmux pane before kernel identity binding.
+// These reusable numbers are observations, never signal authority.
+type RuntimeProcessInfo struct {
+	Socket    string
+	ServerPID int
+	SessionID string
+	PaneID    string
+	PanePID   int
+	Dead      bool
 }
 
 // Stream is one live terminal attach: PTY-like bytes plus resize. Returned

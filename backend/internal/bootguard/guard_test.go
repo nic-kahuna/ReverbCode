@@ -26,7 +26,7 @@ func TestGuardRejectsInvalidEvidenceWithoutChangingBytes(t *testing.T) {
 		name, data string
 		want       error
 	}{
-		{"future", string(encode(Marker{MarkerSchema, 2})), ErrUnsupported},
+		{"future", string(encode(Marker{MarkerSchema, 3})), ErrUnsupported},
 		{"zero", `{"schema":"ao-data-compatibility/v1","requiredProtocol":0}` + "\n", ErrMalformed},
 		{"bool", `{"schema":"ao-data-compatibility/v1","requiredProtocol":true}` + "\n", ErrMalformed},
 		{"duplicate", `{"schema":"ao-data-compatibility/v1","requiredProtocol":2,"requiredProtocol":1}` + "\n", ErrMalformed},
@@ -84,7 +84,7 @@ func TestGuardRatchetIsMonotonicAndRequiresLiveOwnership(t *testing.T) {
 	if err := g.Ratchet(2); !errors.Is(err, ErrOwnership) {
 		t.Fatalf("closed ratchet: %v", err)
 	}
-	if g, err := Open(dir); g != nil || !errors.Is(err, ErrUnsupported) {
+	if g, err := open(dir, 1); g != nil || !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("older supported build accepted newer state: %v,%v", g, err)
 	}
 }
@@ -171,7 +171,7 @@ func TestGuardRatchetSurvivesProcessDeathAndAliasCannotContend(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = cmd.Wait()
-	if g, err := Open(dir); g != nil || !errors.Is(err, ErrUnsupported) {
+	if g, err := open(dir, 1); g != nil || !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("crashed ratchet lost: %v,%v", g, err)
 	}
 }

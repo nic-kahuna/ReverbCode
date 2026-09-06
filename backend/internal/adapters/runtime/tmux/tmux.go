@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -214,7 +215,17 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	}
 
 	launchCmd := buildLaunchCommand(cfg)
-	args := newSessionArgs(id, cfg.WorkspacePath, r.shell, launchCmd)
+	shell := r.shell
+	if cfg.Managed {
+		if !filepath.IsAbs(r.binary) {
+			return ports.RuntimeHandle{}, errors.New("managed tmux requires an absolute trusted binary")
+		}
+		// Configure this exact pane's window before the provider can execute.
+		// TMUX/TMUX_PANE here are inherited from tmux, before provider exports.
+		launchCmd = shellQuote(r.binary) + ` set-option -w -t "$TMUX_PANE" remain-on-exit on || exit $?; ` + launchCmd
+		shell = "/bin/sh"
+	}
+	args := newSessionArgs(id, cfg.WorkspacePath, shell, launchCmd)
 	if _, err := r.run(ctx, args...); err != nil {
 		return ports.RuntimeHandle{}, fmt.Errorf("tmux runtime: create session %s: %w", id, err)
 	}
@@ -222,24 +233,32 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	// Hide the status bar in the embedded terminal: it clutters the view and
 	// was not designed for the in-browser display context.
 	if _, err := r.run(ctx, setStatusOffArgs(id)...); err != nil {
-		_ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: id})
+		if !cfg.Managed {
+			_ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: id})
+		}
 		return ports.RuntimeHandle{}, fmt.Errorf("tmux runtime: set status %s: %w", id, err)
 	}
 
 	// Enable mouse mode so the embedded terminal's SGR wheel reports scroll the
 	// pane (see setMouseOnArgs). Without it, wheel scrolling silently no-ops.
 	if _, err := r.run(ctx, setMouseOnArgs(id)...); err != nil {
-		_ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: id})
+		if !cfg.Managed {
+			_ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: id})
+		}
 		return ports.RuntimeHandle{}, fmt.Errorf("tmux runtime: set mouse %s: %w", id, err)
 	}
 
 	alive, err := r.IsAlive(ctx, handle)
 	if err != nil {
-		_ = r.Destroy(context.Background(), handle)
+		if !cfg.Managed {
+			_ = r.Destroy(context.Background(), handle)
+		}
 		return ports.RuntimeHandle{}, fmt.Errorf("tmux runtime: verify session %s: %w", id, err)
 	}
 	if !alive {
-		_ = r.Destroy(context.Background(), handle)
+		if !cfg.Managed {
+			_ = r.Destroy(context.Background(), handle)
+		}
 		return ports.RuntimeHandle{}, fmt.Errorf("tmux runtime: session %s exited before ready", id)
 	}
 	return handle, nil
@@ -633,8 +652,41 @@ func buildLaunchCommand(cfg ports.RuntimeConfig) string {
 	// Keep the tmux session alive after the agent exits so the operator can
 	// inspect the terminal. The shell variable expansion picks up $SHELL from
 	// the process env if set, otherwise falls back to /bin/sh.
-	b.WriteString(`; exec "${SHELL:-/bin/sh}" -i`)
+	if cfg.Managed {
+		b.WriteString(`; ao_status=$?; exit "$ao_status"`)
+	} else {
+		b.WriteString(`; exec "${SHELL:-/bin/sh}" -i`)
+	}
 	return b.String()
+}
+
+// RuntimeProcesses reads exact pane coordinates; custody separately binds every
+// relevant process to a real kernel audit token before it can be signalled.
+func (r *Runtime) RuntimeProcesses(ctx context.Context, handle ports.RuntimeHandle) (ports.RuntimeProcessInfo, error) {
+	id, err := handleID(handle)
+	if err != nil {
+		return ports.RuntimeProcessInfo{}, err
+	}
+	out, err := r.run(ctx, "display-message", "-p", "-t", id+":0.0", "#{socket_path}\t#{pid}\t#{session_id}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}")
+	if err != nil {
+		return ports.RuntimeProcessInfo{}, err
+	}
+	fields := strings.Split(strings.TrimSpace(string(out)), "\t")
+	if len(fields) != 6 {
+		return ports.RuntimeProcessInfo{}, errors.New("unknown tmux pane identity")
+	}
+	server, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return ports.RuntimeProcessInfo{}, err
+	}
+	pid, err := strconv.Atoi(fields[4])
+	if err != nil {
+		return ports.RuntimeProcessInfo{}, err
+	}
+	if server <= 1 || pid <= 1 || fields[0] == "" || fields[2] == "" || fields[3] == "" || (fields[5] != "0" && fields[5] != "1") {
+		return ports.RuntimeProcessInfo{}, errors.New("incomplete tmux pane identity")
+	}
+	return ports.RuntimeProcessInfo{Socket: fields[0], ServerPID: server, SessionID: fields[2], PaneID: fields[3], PanePID: pid, Dead: fields[5] == "1"}, nil
 }
 
 // -- error type --

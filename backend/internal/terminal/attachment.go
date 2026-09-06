@@ -44,6 +44,9 @@ const (
 // onExit fires at most once, when the attach loop gives up (runtime dead,
 // attach failure cap) — never on close().
 type attachment struct {
+	pinnedContext context.Context
+	pinError      error
+
 	id     string
 	handle ports.RuntimeHandle
 	src    Source
@@ -74,7 +77,15 @@ func newAttachment(id string, handle ports.RuntimeHandle, src Source, onOpen fun
 	if onData == nil {
 		onData = func([]byte) {}
 	}
+	pinned := context.Background()
+	var pinErr error
+	if source, ok := src.(interface {
+		PinAttachment(context.Context, ports.RuntimeHandle) (context.Context, error)
+	}); ok {
+		pinned, pinErr = source.PinAttachment(pinned, handle)
+	}
 	return &attachment{
+		pinnedContext: pinned, pinError: pinErr,
 		id:          id,
 		handle:      handle,
 		src:         src,
@@ -90,6 +101,11 @@ func newAttachment(id string, handle ports.RuntimeHandle, src Source, onOpen fun
 // run drives attach → read-loop → re-attach until the pane exits cleanly, the
 // attachment is closed, or ctx is cancelled. It is started once per attachment.
 func (a *attachment) run(ctx context.Context) {
+	if a.pinError != nil {
+		a.fail("generation pin: " + a.pinError.Error())
+		return
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	if !a.setRunCancel(cancel) {
 		cancel()
@@ -134,7 +150,7 @@ func (a *attachment) run(ctx context.Context) {
 		if a.shouldStop(ctx) {
 			return
 		}
-		p, err := a.src.Attach(ctx, a.handle, rows, cols)
+		p, err := a.src.Attach(pinnedAttachmentContext{Context: ctx, pin: a.pinnedContext}, a.handle, rows, cols)
 		if a.shouldStop(ctx) {
 			if p != nil {
 				_ = p.Close()
@@ -397,4 +413,20 @@ func (a *attachment) markExited() {
 func (a *attachment) fail(reason string) {
 	a.log.Warn("terminal attachment failed", "id", a.id, "reason", reason)
 	a.markExited()
+}
+
+// Cancellation follows the attachment, while the generation value is fixed at
+// construction and cannot silently follow a successor during reconnect.
+type pinnedAttachmentContext struct {
+	context.Context
+	pin context.Context
+}
+
+func (c pinnedAttachmentContext) Value(key any) any {
+	if c.pin != nil {
+		if v := c.pin.Value(key); v != nil {
+			return v
+		}
+	}
+	return c.Context.Value(key)
 }

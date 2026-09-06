@@ -19,6 +19,7 @@ import (
 
 // APIDeps bundles every service the API layer's controllers depend on.
 type APIDeps struct {
+	Custody            controllers.CustodyService
 	Agents             controllers.AgentCatalog
 	Projects           projectsvc.Manager
 	Sessions           controllers.SessionService
@@ -37,6 +38,7 @@ type APIDeps struct {
 // API owns one controller per resource and is the single Register call the
 // router invokes to mount the /api/v1 surface.
 type API struct {
+	custody       *controllers.CustodyController
 	cfg           config.Config
 	agents        *controllers.AgentsController
 	projects      *controllers.ProjectsController
@@ -53,7 +55,8 @@ type API struct {
 // environment.
 func NewAPI(cfg config.Config, deps APIDeps) *API {
 	return &API{
-		cfg: cfg,
+		custody: &controllers.CustodyController{Service: deps.Custody},
+		cfg:     cfg,
 		agents: &controllers.AgentsController{
 			Catalog: deps.Agents,
 		},
@@ -86,6 +89,18 @@ func (a *API) Register(root chi.Router) {
 
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Timeout(timeout))
+			r.Group(func(r chi.Router) {
+				r.Use(func(next http.Handler) http.Handler {
+					return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+						if !localControlRequest(request) {
+							envelope.WriteAPIError(w, request, http.StatusForbidden, "forbidden", "LOCAL_CUSTODY_ONLY", "Local custody control only", nil)
+							return
+						}
+						next.ServeHTTP(w, request)
+					})
+				})
+				a.custody.Register(r)
+			})
 			a.agents.Register(r)
 			a.projects.Register(r)
 			a.sessions.Register(r)

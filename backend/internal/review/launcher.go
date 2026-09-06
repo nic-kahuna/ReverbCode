@@ -109,6 +109,17 @@ func (l *agentLauncher) invocation(spec LaunchSpec) ports.ReviewInvocation {
 }
 
 func (l *agentLauncher) Spawn(ctx context.Context, spec LaunchSpec) (string, error) {
+	operation := "reviewer:" + spec.RunID
+	if native, ok := l.runtime.(interface {
+		ChildPermit(context.Context, string, string) (context.Context, error)
+	}); ok {
+		var err error
+		ctx, err = native.ChildPermit(ctx, string(spec.WorkerID), operation)
+		if err != nil {
+			return "", err
+		}
+	}
+
 	reviewer, ok := l.reviewers.Reviewer(spec.Harness)
 	if !ok {
 		return "", fmt.Errorf("no reviewer adapter for harness %q", spec.Harness)
@@ -133,6 +144,13 @@ func (l *agentLauncher) Spawn(ctx context.Context, spec LaunchSpec) (string, err
 	if err != nil {
 		return "", fmt.Errorf("reviewer runtime: %w", err)
 	}
+	if native, ok := l.runtime.(interface {
+		BindChild(context.Context, string, string, string) error
+	}); ok {
+		if err := native.BindChild(ctx, string(spec.WorkerID), operation, handle.ID); err != nil {
+			return "", err
+		}
+	}
 	return handle.ID, nil
 }
 
@@ -155,6 +173,16 @@ func pinnedEnv(base map[string]string) map[string]string {
 }
 
 func (l *agentLauncher) Notify(ctx context.Context, handleID string, spec LaunchSpec) error {
+	if native, ok := l.runtime.(interface {
+		ChildPermit(context.Context, string, string) (context.Context, error)
+	}); ok {
+		var err error
+		ctx, err = native.ChildPermit(ctx, string(spec.WorkerID), "reviewer:"+spec.RunID)
+		if err != nil {
+			return err
+		}
+	}
+
 	reviewer, ok := l.reviewers.Reviewer(spec.Harness)
 	if !ok {
 		return fmt.Errorf("no reviewer adapter for harness %q", spec.Harness)

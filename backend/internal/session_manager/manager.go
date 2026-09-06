@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
+	"github.com/aoagents/agent-orchestrator/backend/internal/custody"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
@@ -129,6 +130,7 @@ type Store interface {
 // Manager coordinates internal session spawn, restore, kill, and cleanup over
 // the outbound ports. User-facing read-model assembly lives in the service package.
 type Manager struct {
+	custody   *custody.Coordinator
 	admission *admission.Gate
 	runtime   runtimeController
 	agents    ports.AgentResolver
@@ -186,6 +188,7 @@ const (
 
 // Deps are the collaborators a Session Manager needs; New wires them together.
 type Deps struct {
+	Custody   *custody.Coordinator
 	Runtime   runtimeController
 	Agents    ports.AgentResolver
 	Policy    domain.AgentPolicy
@@ -214,6 +217,7 @@ type Deps struct {
 // time.Now when Deps.Clock is nil.
 func New(d Deps) *Manager {
 	m := &Manager{
+		custody:    d.Custody,
 		admission:  admission.For(d.Store),
 		runtime:    d.Runtime,
 		agents:     d.Agents,
@@ -250,6 +254,9 @@ func New(d Deps) *Manager {
 	// messenger is the raw d.Messenger wrapped in a Guard (needs m.logger, so it
 	// is built after the logger default).
 	m.messenger = sessionguard.New(d.Store, d.Messenger, m.logger)
+	if m.custody != nil {
+		m.custody.LaunchPrepared = m.launchPrepared
+	}
 	return m
 }
 
@@ -299,6 +306,19 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: prompt: %w", err)
 	}
 
+	if managed, e := m.managedProject(ctx, string(cfg.ProjectID)); e != nil {
+		return domain.SessionRecord{}, e
+	} else if managed && cfg.IssueID != "" {
+		records, e := m.store.ListSessions(ctx, cfg.ProjectID)
+		if e != nil {
+			return domain.SessionRecord{}, e
+		}
+		for _, existing := range records {
+			if existing.IssueID == cfg.IssueID && !existing.IsTerminated {
+				return m.spawnManaged(ctx, cfg, project, existing)
+			}
+		}
+	}
 	seed := seedRecord(cfg, m.clock())
 	if cfg.Route != nil {
 		requested := *cfg.Route
@@ -314,6 +334,11 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: create: %w", err)
 	}
 	id := rec.ID
+	if managed, managedErr := m.managedProject(ctx, string(cfg.ProjectID)); managedErr != nil {
+		return rec, managedErr
+	} else if managed {
+		return m.spawnManaged(ctx, cfg, project, rec)
+	}
 
 	branch := cfg.Branch
 	if branch == "" {
@@ -768,6 +793,9 @@ func (m *Manager) rollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 
 // RollbackSpawn is the public surface of rollbackSpawn for service-layer callers.
 func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (deleted, killed bool, err error) {
+	if err := m.protectManaged(ctx, id); err != nil {
+		return false, false, err
+	}
 	return m.rollbackSpawn(ctx, id)
 }
 
@@ -781,6 +809,9 @@ func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 // available destroy steps are skipped so it can be cleaned up from the
 // dashboard.
 func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
+	if err := m.protectManaged(ctx, id); err != nil {
+		return false, err
+	}
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return false, fmt.Errorf("kill %s: %w", id, err)
@@ -845,6 +876,9 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 // This deliberately does not write a session_worktrees row: those rows are
 // boot-restore markers, and a replaced orchestrator must stay terminated.
 func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID) error {
+	if err := m.protectManaged(ctx, id); err != nil {
+		return err
+	}
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return fmt.Errorf("retire replacement %s: %w", id, err)
@@ -941,6 +975,9 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 // before any durable session write, so a failure never resurrects the row or destroys
 // the worktree (it may hold the agent's prior work).
 func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
+	if err := m.protectManaged(ctx, id); err != nil {
+		return domain.SessionRecord{}, err
+	}
 	initial, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return domain.SessionRecord{}, err
@@ -1113,6 +1150,9 @@ func (m *Manager) SaveAndTeardownAll(ctx context.Context) error {
 // ForceDestroy; if either capture or the DB write fails, ForceDestroy is
 // not called.
 func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionRecord, destroyRuntime bool) error {
+	if err := m.protectManaged(ctx, rec.ID); err != nil {
+		return err
+	}
 	if rows, ok, err := m.workspaceProjectRows(ctx, rec); err != nil {
 		return fmt.Errorf("save %s: workspace rows: %w", rec.ID, err)
 	} else if ok {
@@ -1176,6 +1216,9 @@ func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionReco
 // worktree intact: better to skip the relaunch than to tear down un-preserved
 // work or relaunch onto an inconsistent worktree.
 func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) error {
+	if err := m.protectManaged(ctx, rec.ID); err != nil {
+		return err
+	}
 	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
 		return nil
 	}
@@ -1204,6 +1247,9 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 // fails, the runtime is still stopped and the record is terminated, but the
 // on-disk workspace is deliberately left untouched for manual recovery.
 func (m *Manager) reconcileDisabled(ctx context.Context, rec domain.SessionRecord) error {
+	if err := m.protectManaged(ctx, rec.ID); err != nil {
+		return err
+	}
 	project, known, projectErr := m.store.GetProject(ctx, string(rec.ProjectID))
 	if projectErr != nil || !known || admission.Check(project) != nil {
 		// Disabled-agent policy still requires cessation, but paused or uncertain
@@ -1261,6 +1307,9 @@ func (m *Manager) reconcileDisabled(ctx context.Context, rec domain.SessionRecor
 // to kill the runtime (e.g. ForceDestroy/Destroy errored after MarkTerminated).
 // Destroy is idempotent, so an already-gone session is a no-op.
 func (m *Manager) reconcileReap(ctx context.Context, rec domain.SessionRecord) error {
+	if err := m.protectManaged(ctx, rec.ID); err != nil {
+		return err
+	}
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID == "" {
 		var err error
@@ -1435,6 +1484,10 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 	}
 	for _, rec := range recs {
 		func() {
+			if err := m.protectManaged(ctx, rec.ID); err != nil {
+				m.logger.Info("restore-all: managed generation retained", "sessionID", rec.ID, "error", err)
+				return
+			}
 			unlock, gateErr := m.lockAdmission(ctx, rec.ProjectID)
 			if gateErr != nil {
 				m.logger.Info("restore-all: admission unavailable", "sessionID", rec.ID, "error", gateErr)
@@ -1862,6 +1915,22 @@ func (m *Manager) applyWorkspaceProjectPreserved(ctx context.Context, rows []por
 // the session is active or the budget is exhausted. Confirmation never fails
 // the send: it only decides whether to nudge again.
 func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string) error {
+	if managed, err := m.managedSession(ctx, id); err != nil {
+		return err
+	} else if managed {
+		if m.custody == nil {
+			return custody.ErrAdmission
+		}
+		rec, ok, err := m.store.GetSession(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrNotFound
+		}
+		return m.custody.StartTurn(ctx, rec, message)
+	}
+
 	outcome, err := m.messenger.Deliver(ctx, id, message)
 	if err != nil {
 		return fmt.Errorf("send %s: %w", id, err)
@@ -2035,6 +2104,10 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 	}
 	result := CleanupResult{Cleaned: make([]domain.SessionID, 0, len(recs)), Skipped: []CleanupSkip{}}
 	for _, rec := range recs {
+		if err := m.protectManaged(ctx, rec.ID); err != nil {
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "managed custody retained"})
+			continue
+		}
 		if !rec.IsTerminated {
 			continue
 		}

@@ -17,6 +17,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
 	"github.com/aoagents/agent-orchestrator/backend/internal/bootguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/custody"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/supervisor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
@@ -113,7 +114,14 @@ func RunWithOptions(opts Options) error {
 	// attach Stream and liveness; the CDC broadcaster feeds the session-state channel. The manager
 	// is handed to httpd, which mounts it at /mux. Raw PTY bytes never flow
 	// through the CDC change_log -- only session-state events do.
-	runtimeAdapter := runtimeselect.New(log, cfg.DataDir)
+	rawRuntime := runtimeselect.New(log, cfg.DataDir)
+	custodyGate := custody.NewGate(store)
+	runtimeAdapter := custody.NewRuntime(rawRuntime, custodyGate)
+	capacityAuthority, err := custody.NewCommandAuthority(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	custodyCoordinator := custody.New(store, runtimeAdapter, custodyGate, capacityAuthority, cfg.DataDir)
 	if err := ensureRuntimeControlServer(ctx, runtimeAdapter); err != nil {
 		stop()
 		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
@@ -143,7 +151,8 @@ func RunWithOptions(opts Options) error {
 	// selected runtime, a gitworktree workspace, the per-session agent resolver
 	// (AO_AGENT validated here for compatibility), and the agent messenger, then mount it
 	// on the API.
-	sessionSvc, reviewSvc, sessMgr, err := startSession(cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, log)
+	custodyCoordinator.Activity = lcStack.LCM.ApplyActivitySignal
+	sessionSvc, reviewSvc, sessMgr, err := startSession(cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, log, custodyCoordinator)
 	if err != nil {
 		stop()
 		lcStack.Stop()
@@ -186,6 +195,7 @@ func RunWithOptions(opts Options) error {
 	mc := &controllers.MobileController{Bridge: bs}
 
 	srv, err := httpd.NewWithDeps(cfg, log, termMgr, httpd.APIDeps{
+		Custody:            custodyCoordinator,
 		Projects:           projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, DefaultHarness: domain.AgentHarness(cfg.Agent), Telemetry: telemetrySink}),
 		Agents:             agentSvc,
 		Sessions:           sessionSvc,

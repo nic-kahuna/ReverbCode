@@ -180,6 +180,9 @@ func NewRootCommand(deps Deps) *cobra.Command {
 	})
 
 	root.AddCommand(newCompatibilityCommand())
+	root.AddCommand(newAdmissionCommand(ctx))
+	root.AddCommand(newCustodyCommand(ctx))
+	root.AddCommand(newPrepareCustodyCommand())
 	root.AddCommand(newPrepareStartPausedCommand())
 	root.AddCommand(newDaemonCommand())
 	root.AddCommand(newStartCommand(ctx))
@@ -274,7 +277,7 @@ func offlineCommand(cmd *cobra.Command) bool {
 		return false
 	}
 	switch cmd.CommandPath() {
-	case "ao daemon", "ao import", "ao compatibility", "ao prepare-start-paused", "ao start":
+	case "ao daemon", "ao import", "ao compatibility", "ao prepare-start-paused", "ao prepare-custody", "ao start", "ao admission evidence", "ao custody certificate":
 		return true
 	default:
 		return false

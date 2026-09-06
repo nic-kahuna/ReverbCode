@@ -621,6 +621,11 @@ func (t *Tracker) parseID(id domain.TrackerID) (owner, repo string, number int, 
 	return parseGitHubID(id.Native)
 }
 
+// ParseIssueID exposes the canonical tracker parser for native identity binding.
+func ParseIssueID(native string) (owner, repo string, number int, err error) {
+	return parseGitHubID(native)
+}
+
 // parseGitHubID accepts "owner/repo#NUM" and returns the three components.
 // Forms like "owner/repo/issues/NUM" or bare numbers are intentionally
 // rejected so the rest of the system has one canonical id shape.

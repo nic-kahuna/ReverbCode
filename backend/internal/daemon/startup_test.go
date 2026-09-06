@@ -154,7 +154,7 @@ func TestStartupPauseNewProjectsAndLaterOrdinaryRestart(t *testing.T) {
 }
 
 func TestStartupRejectsFutureMarkerBeforeDatabaseOrRuntime(t *testing.T) {
-	for _, marker := range []string{`{"schema":"ao-data-compatibility/v1","requiredProtocol":2}` + "\n", `malformed`} {
+	for _, marker := range []string{`{"schema":"ao-data-compatibility/v1","requiredProtocol":3}` + "\n", `malformed`} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := startupConfig(t)
 			if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {

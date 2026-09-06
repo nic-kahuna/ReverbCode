@@ -7,6 +7,7 @@ package lifecycle
 import (
 	"context"
 	"fmt"
+	"github.com/aoagents/agent-orchestrator/backend/internal/custody"
 	"log/slog"
 	"sync"
 	"time"
@@ -127,6 +128,25 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 
 // ApplyActivitySignal records an authoritative agent activity signal.
 func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, s ports.ActivitySignal) error {
+	if !custody.ActivityAuthorized(ctx, id) {
+		if store, ok := m.store.(interface {
+			ManagedProject(context.Context, string) (bool, error)
+		}); ok {
+			rec, exists, err := m.store.GetSession(ctx, id)
+			if err != nil {
+				return err
+			}
+			if exists {
+				managed, e := store.ManagedProject(ctx, string(rec.ProjectID))
+				if e != nil {
+					return e
+				}
+				if managed {
+					return custody.ErrFenced
+				}
+			}
+		}
+	}
 	if !s.Valid {
 		return nil
 	}

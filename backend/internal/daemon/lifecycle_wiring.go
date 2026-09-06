@@ -13,6 +13,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/gitworktree"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/custody"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe/reaper"
@@ -80,7 +81,7 @@ type sessionLifecycle interface {
 // store + LCM, the per-session agent resolver, and the agent messenger. The
 // returned service is mounted at httpd APIDeps.Sessions. It also returns the
 // manager so the caller can wire Reconcile into the boot sequence.
-func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, messenger ports.AgentMessenger, telemetry ports.EventSink, log *slog.Logger) (*sessionsvc.Service, *reviewsvc.Service, sessionLifecycle, error) {
+func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, messenger ports.AgentMessenger, telemetry ports.EventSink, log *slog.Logger, coordinators ...*custody.Coordinator) (*sessionsvc.Service, *reviewsvc.Service, sessionLifecycle, error) {
 	defaultAgent := cfg.Agent
 	if defaultAgent == "" {
 		defaultAgent = config.DefaultAgent
@@ -102,7 +103,12 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("session workspace: %w", err)
 	}
+	var coordinator *custody.Coordinator
+	if len(coordinators) > 0 {
+		coordinator = coordinators[0]
+	}
 	mgr := sessionmanager.New(sessionmanager.Deps{
+		Custody:   coordinator,
 		Runtime:   runtime,
 		Agents:    agents,
 		Policy:    policy,
@@ -264,4 +270,8 @@ func (r projectRepoResolver) RepoPath(projectID domain.ProjectID) (string, error
 		return "", fmt.Errorf("project %q has no repo path on record: %w", projectID, sessionmanager.ErrProjectNotResolvable)
 	}
 	return rec.Path, nil
+}
+
+func (r projectRepoResolver) ManagedProject(ctx context.Context, id string) (bool, error) {
+	return r.store.ManagedProject(ctx, id)
 }

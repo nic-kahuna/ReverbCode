@@ -15,6 +15,7 @@ import (
 	openapi "github.com/swaggest/openapi-go"
 	"github.com/swaggest/openapi-go/openapi31"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/custody"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
@@ -293,7 +294,7 @@ type operation struct {
 }
 
 func operations() []operation {
-	ops := append([]operation{}, eventOperations()...)
+	ops := append(custodyOperations(), eventOperations()...)
 	ops = append(ops, agentOperations()...)
 	ops = append(ops, projectOperations()...)
 	ops = append(ops, sessionOperations()...)
@@ -898,5 +899,18 @@ func prOperations() []operation {
 				{http.StatusNotImplemented, envelope.APIError{}},
 			},
 		},
+	}
+}
+
+func custodyOperations() []operation {
+	return []operation{
+		{method: http.MethodPost, path: "/api/v1/admission/evidence", id: "admission_evidence", tag: "custody", summary: "Exact local native admission/evidence", reqBody: custody.EvidenceRequest{}, resps: []respUnit{{http.StatusOK, custody.Evidence{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
+		{method: http.MethodPost, path: "/api/v1/custody/certificate", id: "custody_certificate", tag: "custody", summary: "Exact local native custody/certificate", reqBody: custody.CertificateExportRequest{}, resps: []respUnit{{http.StatusOK, custody.CertificateExport{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
+		{method: http.MethodPost, path: "/api/v1/custody/request", id: "custody_request", tag: "custody", summary: "Exact local native custody/request", reqBody: custody.CustodyRequest{}, resps: []respUnit{{http.StatusOK, custody.CustodyStatus{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
+		{method: http.MethodPost, path: "/api/v1/custody/status", id: "custody_status", tag: "custody", summary: "Exact local native custody/status", reqBody: custody.CustodyRequest{}, resps: []respUnit{{http.StatusOK, custody.CustodyStatus{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
+		{method: http.MethodPost, path: "/api/v1/custody/checkpoint", id: "custody_checkpoint", tag: "custody", summary: "Exact local native custody/checkpoint", reqBody: custody.CustodyRequest{}, resps: []respUnit{{http.StatusOK, custody.CustodyStatus{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
+		{method: http.MethodPost, path: "/api/v1/custody/verify", id: "custody_verify", tag: "custody", summary: "Exact local native custody/verify", reqBody: custody.CustodyRequest{}, resps: []respUnit{{http.StatusOK, custody.CustodyStatus{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
+		{method: http.MethodPost, path: "/api/v1/custody/handback", id: "custody_handback", tag: "custody", summary: "Exact local native custody/handback", reqBody: custody.HandbackRequest{}, resps: []respUnit{{http.StatusOK, custody.CustodyStatus{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
+		{method: http.MethodPost, path: "/api/v1/custody/hook", id: "custody_hook", tag: "custody", summary: "Exact local native custody/hook", reqBody: custody.HookRequest{}, resps: []respUnit{{http.StatusOK, custody.HookResult{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusForbidden, envelope.APIError{}}, {http.StatusConflict, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}}},
 	}
 }

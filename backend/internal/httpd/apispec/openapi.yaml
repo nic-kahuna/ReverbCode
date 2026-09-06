@@ -8,6 +8,49 @@ servers:
 - description: Local daemon (loopback only)
   url: http://127.0.0.1:3001
 paths:
+  /api/v1/admission/evidence:
+    post:
+      operationId: admission_evidence
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustodyEvidenceRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyEvidence'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native admission/evidence
+      tags:
+      - custody
   /api/v1/agents:
     get:
       operationId: listAgents
@@ -97,6 +140,301 @@ paths:
       summary: Refresh the cached local agent adapter catalog
       tags:
       - agents
+  /api/v1/custody/certificate:
+    post:
+      operationId: custody_certificate
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyCertificateExport'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native custody/certificate
+      tags:
+      - custody
+  /api/v1/custody/checkpoint:
+    post:
+      operationId: custody_checkpoint
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustodyCustodyRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyCustodyStatus'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native custody/checkpoint
+      tags:
+      - custody
+  /api/v1/custody/handback:
+    post:
+      operationId: custody_handback
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustodyHandbackRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyCustodyStatus'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native custody/handback
+      tags:
+      - custody
+  /api/v1/custody/hook:
+    post:
+      operationId: custody_hook
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustodyHookRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyHookResult'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native custody/hook
+      tags:
+      - custody
+  /api/v1/custody/request:
+    post:
+      operationId: custody_request
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustodyCustodyRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyCustodyStatus'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native custody/request
+      tags:
+      - custody
+  /api/v1/custody/status:
+    post:
+      operationId: custody_status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustodyCustodyRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyCustodyStatus'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native custody/status
+      tags:
+      - custody
+  /api/v1/custody/verify:
+    post:
+      operationId: custody_verify
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustodyCustodyRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustodyCustodyStatus'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Exact local native custody/verify
+      tags:
+      - custody
   /api/v1/events:
     get:
       operationId: streamEvents
@@ -2064,6 +2402,311 @@ components:
       - updatedAt
       - status
       - prs
+      type: object
+    CustodyAttemptEvidence:
+      properties:
+        attempt_id:
+          type: string
+        issue_number:
+          type: integer
+        operation:
+          type: string
+        phase:
+          type: string
+        project:
+          type: string
+        quiescence:
+          $ref: '#/components/schemas/CustodyCertificate'
+        runtime_handle_id:
+          type:
+          - "null"
+          - string
+        session_id:
+          type: string
+      required:
+      - project
+      - session_id
+      - attempt_id
+      - operation
+      - issue_number
+      - phase
+      - runtime_handle_id
+      - quiescence
+      type: object
+    CustodyCertificate:
+      properties:
+        certificate_id:
+          type: string
+        certificate_sha256:
+          type: string
+        preservation_complete:
+          type: boolean
+        writer_stopped:
+          type: boolean
+      required:
+      - certificate_id
+      - certificate_sha256
+      - preservation_complete
+      - writer_stopped
+      type: object
+    CustodyCertificateExport:
+      properties:
+        certificate_id:
+          type: string
+        certificate_sha256:
+          type: string
+        payload_base64:
+          type: string
+        schema:
+          type: string
+      required:
+      - schema
+      - certificate_id
+      - certificate_sha256
+      - payload_base64
+      type: object
+    CustodyCertificateRefRequest:
+      type: object
+    CustodyCertificateRequest:
+      type: object
+    CustodyCustodyRequest:
+      properties:
+        attempt_id:
+          type: string
+        foreground_id:
+          type: string
+        generation:
+          format: int64
+          type: integer
+        project:
+          type: string
+        request_id:
+          type: string
+        schema:
+          type: string
+        session_id:
+          type: string
+      required:
+      - schema
+      - project
+      - session_id
+      - attempt_id
+      - generation
+      - request_id
+      - foreground_id
+      type: object
+    CustodyCustodyStatus:
+      properties:
+        attempt_id:
+          type: string
+        blockers:
+          items:
+            type: string
+          type: array
+        certificate:
+          $ref: '#/components/schemas/CustodyCertificate'
+        fence:
+          type: string
+        foreground_id:
+          type: string
+        generation:
+          format: int64
+          type: integer
+        phase:
+          type: string
+        project:
+          type: string
+        ready:
+          type: boolean
+        request_id:
+          type: string
+        schema:
+          type: string
+        session_id:
+          type: string
+      required:
+      - schema
+      - project
+      - session_id
+      - attempt_id
+      - generation
+      - request_id
+      - foreground_id
+      - phase
+      - fence
+      - ready
+      - blockers
+      - certificate
+      type: object
+    CustodyEvidence:
+      properties:
+        attempts:
+          items:
+            $ref: '#/components/schemas/CustodyAttemptEvidence'
+          type: array
+        data_dir:
+          type: string
+        generation:
+          format: int64
+          type: integer
+        legacy_sessions:
+          items:
+            $ref: '#/components/schemas/CustodyLegacyEvidence'
+          type: array
+        projects:
+          items:
+            $ref: '#/components/schemas/CustodyProjectEvidence'
+          type: array
+        protocol:
+          type: integer
+        schema:
+          type: string
+      required:
+      - schema
+      - data_dir
+      - protocol
+      - generation
+      - projects
+      - attempts
+      - legacy_sessions
+      type: object
+    CustodyEvidenceRequest:
+      properties:
+        attempt_id:
+          type:
+          - "null"
+          - string
+        data_dir:
+          type: string
+        kind:
+          type: string
+        project:
+          type:
+          - "null"
+          - string
+        schema:
+          type: string
+        session_id:
+          type:
+          - "null"
+          - string
+      required:
+      - schema
+      - data_dir
+      - kind
+      - project
+      - session_id
+      - attempt_id
+      type: object
+    CustodyHandbackRequest:
+      properties:
+        attempt_id:
+          type: string
+        foreground_id:
+          type: string
+        generation:
+          format: int64
+          type: integer
+        message:
+          type: string
+        project:
+          type: string
+        request_id:
+          type: string
+        schema:
+          type: string
+        session_id:
+          type: string
+      required:
+      - schema
+      - project
+      - session_id
+      - attempt_id
+      - generation
+      - request_id
+      - foreground_id
+      - message
+      type: object
+    CustodyHookRequest:
+      properties:
+        event:
+          type: string
+        launch_attempt_id:
+          type: string
+        launch_generation:
+          format: int64
+          type: integer
+        pid:
+          type: integer
+        project:
+          type: string
+        provider_id:
+          type: string
+        session_id:
+          type: string
+        state:
+          type: string
+        transcript:
+          type: string
+        turn_id:
+          type: string
+        worktree:
+          type: string
+      required:
+      - project
+      - session_id
+      - launch_attempt_id
+      - launch_generation
+      - pid
+      - event
+      - state
+      - provider_id
+      - transcript
+      - worktree
+      - turn_id
+      type: object
+    CustodyHookResult:
+      properties:
+        ok:
+          type: boolean
+      required:
+      - ok
+      type: object
+    CustodyLegacyEvidence:
+      properties:
+        issue_number:
+          type:
+          - "null"
+          - integer
+        project:
+          type: string
+        reason:
+          type: string
+        runtime_handle_id:
+          type:
+          - "null"
+          - string
+        session_id:
+          type: string
+      required:
+      - project
+      - session_id
+      - issue_number
+      - runtime_handle_id
+      - reason
+      type: object
+    CustodyProjectEvidence:
+      properties:
+        canonical_checkout:
+          type: string
+        project:
+          type: string
+        repository:
+          type: string
+      required:
+      - project
+      - repository
+      - canonical_checkout
       type: object
     DegradedProject:
       properties:
