@@ -805,7 +805,7 @@ func (m *Manager) admitManagedWorker(ctx context.Context, project domain.Project
 		Route:      *rec.Metadata.RequestedRoute,
 	})
 	if err != nil {
-		return ports.WorkerAdmissionResult{}, fmt.Errorf("%w: %v", ErrWorkerAdmission, err)
+		return ports.WorkerAdmissionResult{}, fmt.Errorf("%w: %w", ErrWorkerAdmission, err)
 	}
 	return result, nil
 }

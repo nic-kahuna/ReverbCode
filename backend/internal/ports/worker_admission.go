@@ -10,6 +10,7 @@ import (
 // scoped ownership must be acquired or verified before worker effects begin.
 type WorkerAdmissionOperation string
 
+// Worker admission operations distinguish acquire/rebind from exact-owner verification.
 const (
 	WorkerAdmissionSpawn   WorkerAdmissionOperation = "spawn"
 	WorkerAdmissionRestore WorkerAdmissionOperation = "restore"

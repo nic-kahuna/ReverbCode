@@ -29,7 +29,7 @@ const (
 )
 
 var componentPattern = regexp.MustCompile(`^[a-z0-9_.-]+$`)
-var ticketPattern = regexp.MustCompile(`^github:([a-z0-9_.-]+)/([a-z0-9_.-]+)#[1-9][0-9]*$`)
+var ticketPattern = regexp.MustCompile(`^github:([a-z0-9_.-]+)/([a-z0-9_.-]+)#[1-9]\d*$`)
 
 type commandRunner func(context.Context, string) ([]byte, []byte, int, error)
 
@@ -171,7 +171,7 @@ func buildRequest(in ports.WorkerAdmissionRequest) (wireRequest, string, error) 
 		return wireRequest{}, "", fmt.Errorf("worker admission: %w", err)
 	}
 	issueMatch := ticketPattern.FindStringSubmatch(string(in.IssueID))
-	if issueMatch == nil || issueMatch[1]+"/"+issueMatch[2] != repo {
+	if len(issueMatch) != 3 || issueMatch[1]+"/"+issueMatch[2] != repo {
 		return wireRequest{}, "", errors.New("worker admission: ticket identity does not match repository")
 	}
 	if err := in.Route.Validate(); err != nil {
