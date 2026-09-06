@@ -16,9 +16,12 @@ import (
 
 // Protocol constants define the exact on-disk compatibility contract.
 const (
-	MarkerSchema      = "ao-data-compatibility/v1"
-	MarkerName        = "compatibility.json"
-	SupportedProtocol = 1
+	MarkerSchema = "ao-data-compatibility/v1"
+	MarkerName   = "compatibility.json"
+	// Protocol 2 means durable worker scheduling holds may exist. Binaries that
+	// only understand protocol 1 must refuse the data directory rather than
+	// restore or write to a worker whose hold they cannot observe.
+	SupportedProtocol = 2
 )
 
 // Stable errors allow offline tooling to distinguish refusal from uncertainty.

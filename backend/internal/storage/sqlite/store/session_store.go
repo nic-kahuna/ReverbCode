@@ -77,6 +77,9 @@ func (s *Store) SetSessionPreviewURL(ctx context.Context, id domain.SessionID, p
 // SetWorkerSchedulingHold persists one immutable scheduling hold per session.
 // Repeated calls return the first hold unchanged.
 func (s *Store) SetWorkerSchedulingHold(ctx context.Context, id domain.SessionID, heldAt time.Time) (domain.WorkerSchedulingHold, error) {
+	if err := s.RatchetCompatibility(2); err != nil {
+		return domain.WorkerSchedulingHold{}, fmt.Errorf("set worker scheduling hold for session %s: compatibility: %w", id, err)
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	row, err := s.qw.SetWorkerSchedulingHold(ctx, gen.SetWorkerSchedulingHoldParams{

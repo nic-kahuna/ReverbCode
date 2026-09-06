@@ -24,6 +24,14 @@ import (
 // Store is the SQLite-backed persistence layer.
 type Store = sqlitestore.Store
 
+// CompatibilityRatchet is attached by guarded daemon startup and consumed by
+// Store feature writes that raise the on-disk compatibility floor.
+type CompatibilityRatchet = sqlitestore.CompatibilityRatchet
+
+// ErrCompatibilityRatchetUnavailable means guarded startup did not attach its
+// live compatibility guard, so a newer durable feature write was refused.
+var ErrCompatibilityRatchetUnavailable = sqlitestore.ErrCompatibilityRatchetUnavailable
+
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 

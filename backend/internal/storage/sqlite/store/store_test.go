@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sync"
 	"testing"
@@ -12,6 +13,16 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
+
+type recordingRatchet struct {
+	calls []int
+	err   error
+}
+
+func (r *recordingRatchet) Ratchet(required int) error {
+	r.calls = append(r.calls, required)
+	return r.err
+}
 
 func newTestStore(t *testing.T) *sqlite.Store {
 	t.Helper()
@@ -315,6 +326,8 @@ func TestWorkerSchedulingHoldIsIdempotentAndSurvivesReopen(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	ratchet := &recordingRatchet{}
+	s.AttachCompatibilityRatchet(ratchet)
 	seedProject(t, s, "mer")
 	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
 	if err != nil {
@@ -337,6 +350,9 @@ func TestWorkerSchedulingHoldIsIdempotentAndSurvivesReopen(t *testing.T) {
 	if second != first {
 		t.Fatalf("second hold = %+v, want unchanged %+v", second, first)
 	}
+	if !reflect.DeepEqual(ratchet.calls, []int{2, 2}) {
+		t.Fatalf("compatibility ratchet calls = %v, want [2 2]", ratchet.calls)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -355,6 +371,32 @@ func TestWorkerSchedulingHoldIsIdempotentAndSurvivesReopen(t *testing.T) {
 	}
 	if _, ok, err := reopened.GetWorkerSchedulingHold(ctx, "mer-missing"); err != nil || ok {
 		t.Fatalf("missing hold: ok=%v err=%v, want false nil", ok, err)
+	}
+}
+
+func TestWorkerSchedulingHoldFailsBeforeWriteWithoutCompatibleRatchet(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldAt := time.Date(2026, 9, 5, 12, 30, 0, 0, time.UTC)
+	if _, err := s.SetWorkerSchedulingHold(ctx, rec.ID, heldAt); !errors.Is(err, sqlite.ErrCompatibilityRatchetUnavailable) {
+		t.Fatalf("missing ratchet error = %v", err)
+	}
+	if _, held, err := s.GetWorkerSchedulingHold(ctx, rec.ID); err != nil || held {
+		t.Fatalf("hold persisted without ratchet: held=%v err=%v", held, err)
+	}
+
+	refusal := errors.New("ratchet durability uncertain")
+	s.AttachCompatibilityRatchet(&recordingRatchet{err: refusal})
+	if _, err := s.SetWorkerSchedulingHold(ctx, rec.ID, heldAt); !errors.Is(err, refusal) {
+		t.Fatalf("ratchet refusal error = %v", err)
+	}
+	if _, held, err := s.GetWorkerSchedulingHold(ctx, rec.ID); err != nil || held {
+		t.Fatalf("hold persisted after ratchet refusal: held=%v err=%v", held, err)
 	}
 }
 

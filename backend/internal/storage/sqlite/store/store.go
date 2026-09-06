@@ -5,10 +5,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
+	"github.com/aoagents/agent-orchestrator/backend/internal/bootguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -26,8 +28,21 @@ type Store struct {
 	qr                *gen.Queries // bound to the reader pool
 	writeMu           sync.Mutex
 	admission         *admission.Gate
+	compatibilityMu   sync.RWMutex
+	compatibility     CompatibilityRatchet
 	newProjectsPaused bool
 }
+
+// CompatibilityRatchet is the daemon-owned pre-database guard capability.
+// Store write methods consume it internally; service callers never attest
+// compatibility on behalf of a write.
+type CompatibilityRatchet interface {
+	Ratchet(required int) error
+}
+
+// ErrCompatibilityRatchetUnavailable fails closed when a new durable feature
+// write is attempted through a Store that was not wired by guarded startup.
+var ErrCompatibilityRatchetUnavailable = errors.New("compatibility ratchet unavailable")
 
 // NewStore wraps an opened writer + reader *sql.DB (see Open) as a Store.
 func NewStore(writeDB, readDB *sql.DB) *Store {
@@ -65,3 +80,28 @@ func (s *Store) inTx(ctx context.Context, what string, fn func(*gen.Queries) err
 
 // AdmissionGate is shared by every launch and project config transition using this store.
 func (s *Store) AdmissionGate() *admission.Gate { return s.admission }
+
+// AttachCompatibilityRatchet wires the daemon-owned compatibility guard into
+// durable feature writes. Guarded startup calls this before constructing any
+// subsystem that can mutate the Store.
+func (s *Store) AttachCompatibilityRatchet(r CompatibilityRatchet) {
+	s.compatibilityMu.Lock()
+	defer s.compatibilityMu.Unlock()
+	s.compatibility = r
+}
+
+// RatchetCompatibility durably establishes at least required before a newer
+// state write. bootguard.ErrDowngrade means a higher supported floor is
+// already durable, which satisfies this minimum requirement.
+func (s *Store) RatchetCompatibility(required int) error {
+	s.compatibilityMu.RLock()
+	ratchet := s.compatibility
+	s.compatibilityMu.RUnlock()
+	if ratchet == nil {
+		return ErrCompatibilityRatchetUnavailable
+	}
+	if err := ratchet.Ratchet(required); err != nil && !errors.Is(err, bootguard.ErrDowngrade) {
+		return err
+	}
+	return nil
+}

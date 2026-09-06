@@ -17,6 +17,7 @@ func openGuardedStartupStore(ctx context.Context, guard *bootguard.Guard, paused
 	if err != nil {
 		return nil, nil, fmt.Errorf("open store: %w", err)
 	}
+	store.AttachCompatibilityRatchet(guard)
 	ids := []string{}
 	if paused {
 		ids, err = store.PauseAdmissionForStartup(ctx)

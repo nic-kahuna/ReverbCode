@@ -95,6 +95,43 @@ func TestPrepareStartPausedPersistsAdmissionAndPreservesOtherConfig(t *testing.T
 	}
 }
 
+func TestGuardedStoreHoldRatchetsCompatibilityFloor(t *testing.T) {
+	cfg := startupConfig(t)
+	ctx := context.Background()
+	guard, err := bootguard.Open(cfg.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _, err := openGuardedStartupStore(ctx, guard, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := domain.ProjectRecord{ID: "hold", Path: "/repos/hold", RegisteredAt: time.Now()}
+	if err := store.UpsertProject(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.CreateSession(ctx, domain.SessionRecord{ProjectID: "hold", Kind: domain.KindWorker, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetWorkerSchedulingHold(ctx, rec.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := bootguard.Inspect(cfg.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.RequiredProtocol != 2 || status.SupportedProtocol != 2 {
+		t.Fatalf("compatibility after hold = %+v", status)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStartupPauseNewProjectsAndLaterOrdinaryRestart(t *testing.T) {
 	cfg := startupConfig(t)
 	ctx := context.Background()
@@ -154,7 +191,7 @@ func TestStartupPauseNewProjectsAndLaterOrdinaryRestart(t *testing.T) {
 }
 
 func TestStartupRejectsFutureMarkerBeforeDatabaseOrRuntime(t *testing.T) {
-	for _, marker := range []string{`{"schema":"ao-data-compatibility/v1","requiredProtocol":2}` + "\n", `malformed`} {
+	for _, marker := range []string{`{"schema":"ao-data-compatibility/v1","requiredProtocol":3}` + "\n", `malformed`} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := startupConfig(t)
 			if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
