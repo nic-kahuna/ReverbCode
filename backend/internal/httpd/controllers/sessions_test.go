@@ -34,12 +34,13 @@ type fakeSessionService struct {
 	lastSpawn        ports.SpawnConfig
 	claimErr         error
 	listPRErr        error
+	holds            map[domain.SessionID]domain.WorkerSchedulingHold
 }
 
 func newFakeSessionService() *fakeSessionService {
 	now := time.Now().UTC()
 	s := domain.Session{SessionRecord: domain.SessionRecord{ID: "ao-1", ProjectID: "ao", Kind: domain.KindWorker, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle, TerminalHandleID: "ao-1/terminal_0"}
-	return &fakeSessionService{sessions: map[domain.SessionID]domain.Session{s.ID: s}}
+	return &fakeSessionService{sessions: map[domain.SessionID]domain.Session{s.ID: s}, holds: map[domain.SessionID]domain.WorkerSchedulingHold{}}
 }
 
 func (f *fakeSessionService) List(_ context.Context, filter sessionsvc.ListFilter) ([]domain.Session, error) {
@@ -152,6 +153,32 @@ func (f *fakeSessionService) Kill(_ context.Context, id domain.SessionID) (bool,
 	return true, nil
 }
 
+func (f *fakeSessionService) WorkerHold(_ context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	hold, held := f.holds[id]
+	return hold, held, nil
+}
+
+func (f *fakeSessionService) HoldWorker(_ context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error) {
+	hold := domain.WorkerSchedulingHold{SessionID: id, HeldAt: time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC)}
+	f.holds[id] = hold
+	return hold, nil
+}
+
+func (f *fakeSessionService) CheckpointHeldWorker(_ context.Context, id domain.SessionID) error {
+	if _, held := f.holds[id]; !held {
+		return apierr.Conflict("WORKER_HOLD_REQUIRED", "hold required", nil)
+	}
+	return nil
+}
+
+func (f *fakeSessionService) StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (sessionsvc.StopWorkerRetainedResult, error) {
+	hold, err := f.HoldWorker(ctx, id)
+	if err != nil {
+		return sessionsvc.StopWorkerRetainedResult{}, err
+	}
+	return sessionsvc.StopWorkerRetainedResult{SessionID: id, Hold: hold, RuntimeTermination: "stopped", WorktreeRetained: true, ReconciliationRequired: true}, nil
+}
+
 func (f *fakeSessionService) RollbackSpawn(_ context.Context, id domain.SessionID) (sessionsvc.RollbackOutcome, error) {
 	if _, ok := f.sessions[id]; ok {
 		delete(f.sessions, id)
@@ -210,6 +237,33 @@ func TestSessionsAPI_SendAdmissionRoutes(t *testing.T) {
 				t.Fatalf("status=%d admitted=%v sent=%q body=%s", status, svc.sentAdmitted, svc.sent, body)
 			}
 		})
+	}
+}
+
+func TestSessionsAPI_WorkerHoldCheckpointAndRetainedStop(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+
+	body, status, _ := doRequest(t, srv, http.MethodGet, "/api/v1/sessions/ao-1/hold", "")
+	if status != http.StatusOK || !strings.Contains(string(body), `"held":false`) {
+		t.Fatalf("initial hold status=%d body=%s", status, body)
+	}
+	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/checkpoint", `{}`)
+	assertErrorCode(t, body, status, http.StatusConflict, "WORKER_HOLD_REQUIRED")
+
+	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/hold", `{}`)
+	if status != http.StatusOK || !strings.Contains(string(body), `"held":true`) {
+		t.Fatalf("hold status=%d body=%s", status, body)
+	}
+	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/checkpoint", `{}`)
+	if status != http.StatusOK || !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("checkpoint status=%d body=%s", status, body)
+	}
+	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/stop-retained", `{}`)
+	for _, want := range []string{`"runtimeTermination":"stopped"`, `"worktreeRetained":true`, `"reconciliationRequired":true`, `detached or external jobs are not verified`} {
+		if status != http.StatusOK || !strings.Contains(string(body), want) {
+			t.Fatalf("retained stop status=%d body=%s missing %q", status, body, want)
+		}
 	}
 }
 

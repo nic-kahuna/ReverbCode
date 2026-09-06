@@ -31,6 +31,7 @@ type fakeStore struct {
 	listAllCalls  int
 	// worktrees maps session ID to its saved worktree rows (shutdown-saved marker).
 	worktrees map[domain.SessionID][]domain.SessionWorktreeRecord
+	holds     map[domain.SessionID]domain.WorkerSchedulingHold
 	// sharedLog, when non-nil, receives an ordered call entry for each
 	// UpsertSessionWorktree invocation so ordering tests can compare across fakes.
 	sharedLog *[]string
@@ -43,6 +44,7 @@ func newFakeStore() *fakeStore {
 		projects:      map[string]domain.ProjectRecord{},
 		workspaceRepo: map[string][]domain.WorkspaceRepoRecord{},
 		worktrees:     map[domain.SessionID][]domain.SessionWorktreeRecord{},
+		holds:         map[domain.SessionID]domain.WorkerSchedulingHold{},
 	}
 }
 func (f *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectRecord, bool, error) {
@@ -89,6 +91,18 @@ func (f *fakeStore) ListAllSessions(context.Context) ([]domain.SessionRecord, er
 		out = append(out, r)
 	}
 	return out, nil
+}
+func (f *fakeStore) SetWorkerSchedulingHold(_ context.Context, id domain.SessionID, heldAt time.Time) (domain.WorkerSchedulingHold, error) {
+	if hold, ok := f.holds[id]; ok {
+		return hold, nil
+	}
+	hold := domain.WorkerSchedulingHold{SessionID: id, HeldAt: heldAt}
+	f.holds[id] = hold
+	return hold, nil
+}
+func (f *fakeStore) GetWorkerSchedulingHold(_ context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	hold, ok := f.holds[id]
+	return hold, ok, nil
 }
 func (f *fakeStore) DeleteSession(_ context.Context, id domain.SessionID) (bool, error) {
 	if f.deleteErr != nil {
@@ -183,6 +197,7 @@ type fakeRuntime struct {
 	createLeavesAlive  bool
 	returnedHandle     string
 	destroyErr         error
+	destroyLeavesAlive bool
 	created, destroyed int
 	lastCfg            ports.RuntimeConfig
 	outputs            []string
@@ -223,7 +238,7 @@ func (r *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.
 func (r *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) error {
 	r.destroyed++
 	r.destroyedIDs = append(r.destroyedIDs, handle.ID)
-	if r.destroyErr == nil && r.aliveByHandle != nil {
+	if r.destroyErr == nil && !r.destroyLeavesAlive && r.aliveByHandle != nil {
 		r.aliveByHandle[handle.ID] = false
 	}
 	return r.destroyErr
@@ -548,6 +563,161 @@ func seedTerminal(st *fakeStore, id domain.SessionID, meta domain.SessionMetadat
 }
 func mkLive(id domain.SessionID) domain.SessionRecord {
 	return domain.SessionRecord{ID: id, ProjectID: "mer", Metadata: domain.SessionMetadata{WorkspacePath: "/ws/" + string(id), RuntimeHandleID: "h1"}, Activity: domain.Activity{State: domain.ActivityActive}}
+}
+
+func TestWorkerHoldIsWorkerOnlyAndIdempotent(t *testing.T) {
+	m, st, _, _ := newManager()
+	worker := mkLive("mer-1")
+	worker.Kind = domain.KindWorker
+	st.sessions[worker.ID] = worker
+
+	first, err := m.HoldWorker(ctx, worker.ID)
+	if err != nil {
+		t.Fatalf("HoldWorker: %v", err)
+	}
+	second, err := m.HoldWorker(ctx, worker.ID)
+	if err != nil {
+		t.Fatalf("HoldWorker idempotent: %v", err)
+	}
+	if first != second || first.HeldAt.IsZero() {
+		t.Fatalf("holds = %#v then %#v, want same durable hold", first, second)
+	}
+
+	orchestrator := mkLive("mer-2")
+	orchestrator.Kind = domain.KindOrchestrator
+	st.sessions[orchestrator.ID] = orchestrator
+	if _, err := m.HoldWorker(ctx, orchestrator.ID); !errors.Is(err, ErrWorkerOnly) {
+		t.Fatalf("orchestrator hold error = %v, want ErrWorkerOnly", err)
+	}
+}
+
+func TestHeldWorkerRejectsSendAndRestoreBeforeEffects(t *testing.T) {
+	m, st, rt, ws := newManager()
+	worker := mkLive("mer-1")
+	worker.Kind = domain.KindWorker
+	st.sessions[worker.ID] = worker
+	if _, err := m.HoldWorker(ctx, worker.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Send(ctx, worker.ID, "new turn"); !errors.Is(err, ErrWorkerHeld) {
+		t.Fatalf("Send error = %v, want ErrWorkerHeld", err)
+	}
+
+	worker.IsTerminated = true
+	worker.Activity.State = domain.ActivityExited
+	st.sessions[worker.ID] = worker
+	if _, err := m.Restore(ctx, worker.ID); !errors.Is(err, ErrWorkerHeld) {
+		t.Fatalf("Restore error = %v, want ErrWorkerHeld", err)
+	}
+	if rt.created != 0 || len(ws.calls) != 0 {
+		t.Fatalf("held restore effects: runtime creates=%d workspace calls=%v", rt.created, ws.calls)
+	}
+}
+
+func TestRestoreAllSkipsHeldWorkerAcrossRestart(t *testing.T) {
+	m, st, rt, ws := newManager()
+	worker := mkLive("mer-1")
+	worker.Kind = domain.KindWorker
+	worker.IsTerminated = true
+	worker.Activity.State = domain.ActivityExited
+	worker.Metadata.Branch = "codex/work"
+	st.sessions[worker.ID] = worker
+	st.holds[worker.ID] = domain.WorkerSchedulingHold{SessionID: worker.ID, HeldAt: time.Now()}
+	st.worktrees[worker.ID] = []domain.SessionWorktreeRecord{{SessionID: worker.ID, RepoName: domain.RootWorkspaceRepoName, Branch: worker.Metadata.Branch, WorktreePath: worker.Metadata.WorkspacePath, State: "removed"}}
+
+	if err := m.RestoreAll(ctx); err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if !st.sessions[worker.ID].IsTerminated || rt.created != 0 || len(ws.calls) != 0 {
+		t.Fatalf("held restart mutated state: terminated=%v runtime creates=%d workspace calls=%v", st.sessions[worker.ID].IsTerminated, rt.created, ws.calls)
+	}
+}
+
+func TestCheckpointHeldWorkerUsesFixedTypedPrompt(t *testing.T) {
+	st := newFakeStore()
+	worker := mkLive("mer-1")
+	worker.Kind = domain.KindWorker
+	st.sessions[worker.ID] = worker
+	st.holds[worker.ID] = domain.WorkerSchedulingHold{SessionID: worker.ID, HeldAt: time.Now()}
+	raw := &fakeMessenger{}
+	m := New(Deps{Runtime: &fakeRuntime{}, Agents: fakeAgents{}, Workspace: &fakeWorkspace{}, Store: st, Messenger: raw, Lifecycle: &fakeLCM{store: st}})
+
+	if err := m.CheckpointHeldWorker(ctx, worker.ID); err != nil {
+		t.Fatalf("CheckpointHeldWorker: %v", err)
+	}
+	if len(raw.msgs) != 1 || raw.msgs[0] != domain.WorkerCheckpointPrompt {
+		t.Fatalf("messages = %#v, want fixed checkpoint prompt", raw.msgs)
+	}
+	delete(st.holds, worker.ID)
+	if err := m.CheckpointHeldWorker(ctx, worker.ID); !errors.Is(err, ErrCheckpointRequiresHold) {
+		t.Fatalf("unheld checkpoint error = %v, want ErrCheckpointRequiresHold", err)
+	}
+}
+
+func TestStopWorkerRetainingWorktreeMarksTerminatedOnlyAfterAbsentProbe(t *testing.T) {
+	m, st, rt, ws := newManager()
+	worker := mkLive("mer-1")
+	worker.Kind = domain.KindWorker
+	worker.Metadata.Branch = "codex/work"
+	st.sessions[worker.ID] = worker
+	rt.aliveByHandle = map[string]bool{"h1": true}
+
+	result, err := m.StopWorkerRetainingWorktree(ctx, worker.ID)
+	if err != nil {
+		t.Fatalf("StopWorkerRetainingWorktree: %v", err)
+	}
+	if result.RuntimeTermination != RuntimeTerminationStopped || !result.WorktreeRetained || !result.ReconciliationRequired {
+		t.Fatalf("result = %#v", result)
+	}
+	if !st.sessions[worker.ID].IsTerminated {
+		t.Fatal("worker not marked terminated after definitive absent probe")
+	}
+	if len(ws.calls) != 0 || ws.stashCalls != 0 || ws.destroyed != 0 {
+		t.Fatalf("workspace was touched: calls=%v stash=%d destroy=%d", ws.calls, ws.stashCalls, ws.destroyed)
+	}
+}
+
+func TestStopWorkerRetainingWorktreeUnknownKeepsHoldAndLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*fakeRuntime, *domain.SessionRecord)
+	}{
+		{"destroy error", func(rt *fakeRuntime, _ *domain.SessionRecord) { rt.destroyErr = errors.New("tmux unavailable") }},
+		{"probe error", func(rt *fakeRuntime, _ *domain.SessionRecord) { rt.aliveErr = errors.New("probe unavailable") }},
+		{"still alive", func(rt *fakeRuntime, _ *domain.SessionRecord) {
+			rt.aliveByHandle = map[string]bool{"h1": true}
+			rt.destroyLeavesAlive = true
+		}},
+		{"missing handle", func(_ *fakeRuntime, rec *domain.SessionRecord) { rec.Metadata.RuntimeHandleID = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			worker := mkLive("mer-1")
+			worker.Kind = domain.KindWorker
+			worker.Metadata.Branch = "codex/work"
+			st.sessions[worker.ID] = worker
+			rt.aliveByHandle = map[string]bool{"h1": true}
+			tc.configure(rt, &worker)
+			st.sessions[worker.ID] = worker
+
+			result, err := m.StopWorkerRetainingWorktree(ctx, worker.ID)
+			if err != nil {
+				t.Fatalf("StopWorkerRetainingWorktree: %v", err)
+			}
+			if result.RuntimeTermination != RuntimeTerminationUnknown {
+				t.Fatalf("runtime termination = %q, want unknown", result.RuntimeTermination)
+			}
+			if st.sessions[worker.ID].IsTerminated {
+				t.Fatal("unknown runtime outcome marked worker terminated")
+			}
+			if _, held, _ := st.GetWorkerSchedulingHold(ctx, worker.ID); !held {
+				t.Fatal("unknown runtime outcome lost durable hold")
+			}
+			if len(ws.calls) != 0 || ws.stashCalls != 0 || ws.destroyed != 0 {
+				t.Fatalf("workspace was touched: calls=%v", ws.calls)
+			}
+		})
+	}
 }
 
 func TestSpawn_ResolvesProjectConfig(t *testing.T) {

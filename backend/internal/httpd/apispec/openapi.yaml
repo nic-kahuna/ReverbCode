@@ -1162,6 +1162,128 @@ paths:
       summary: Report an agent activity-state signal for a session
       tags:
       - sessions
+  /api/v1/sessions/{sessionId}/checkpoint:
+    post:
+      operationId: checkpointHeldWorker
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerCheckpointResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Send the fixed checkpoint request to a held worker
+      tags:
+      - sessions
+  /api/v1/sessions/{sessionId}/hold:
+    get:
+      operationId: getWorkerHold
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerHoldResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Get a worker scheduling hold
+      tags:
+      - sessions
+    post:
+      operationId: holdWorker
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerHoldResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Durably hold future worker turns and restores
+      tags:
+      - sessions
   /api/v1/sessions/{sessionId}/kill:
     post:
       operationId: killSession
@@ -1817,6 +1939,45 @@ paths:
           description: Internal Server Error
       summary: Send a background message while holding open project admission through
         delivery; existing writers are not stopped
+      tags:
+      - sessions
+  /api/v1/sessions/{sessionId}/stop-retained:
+    post:
+      operationId: stopWorkerRetained
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StopWorkerRetainedResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Stop the known worker runtime while retaining its worktree
       tags:
       - sessions
   /api/v1/sessions/cleanup:
@@ -3110,6 +3271,35 @@ components:
       required:
       - projectId
       type: object
+    StopWorkerRetainedResponse:
+      properties:
+        held:
+          type: boolean
+        heldAt:
+          format: date-time
+          type: string
+        reconciliationRequired:
+          type: boolean
+        runtimeTermination:
+          enum:
+          - stopped
+          - unknown
+          type: string
+        scope:
+          type: string
+        sessionId:
+          type: string
+        worktreeRetained:
+          type: boolean
+      required:
+      - sessionId
+      - held
+      - heldAt
+      - runtimeTermination
+      - worktreeRetained
+      - reconciliationRequired
+      - scope
+      type: object
     SubmitReviewInput:
       properties:
         body:
@@ -3172,6 +3362,29 @@ components:
       required:
       - reviewerHandleId
       - reviews
+      type: object
+    WorkerCheckpointResponse:
+      properties:
+        ok:
+          type: boolean
+        sessionId:
+          type: string
+      required:
+      - ok
+      - sessionId
+      type: object
+    WorkerHoldResponse:
+      properties:
+        held:
+          type: boolean
+        heldAt:
+          format: date-time
+          type: string
+        sessionId:
+          type: string
+      required:
+      - sessionId
+      - held
       type: object
     WorkspaceRepo:
       properties:

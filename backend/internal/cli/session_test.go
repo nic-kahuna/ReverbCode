@@ -88,6 +88,14 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-1","freed":true}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/restore":
 			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-1","session":`+sessionJSON("demo-1", "demo", "worker", "idle", false)+`}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-1/hold":
+			_, _ = io.WriteString(w, `{"sessionId":"demo-1","held":true,"heldAt":"2026-09-06T02:00:00Z"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/hold":
+			_, _ = io.WriteString(w, `{"sessionId":"demo-1","held":true,"heldAt":"2026-09-06T02:00:00Z"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/checkpoint":
+			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-1"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/stop-retained":
+			_, _ = io.WriteString(w, `{"sessionId":"demo-1","held":true,"heldAt":"2026-09-06T02:00:00Z","runtimeTermination":"unknown","worktreeRetained":true,"reconciliationRequired":true,"scope":"named managed runtime only; detached or external jobs are not verified"}`)
 		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/sessions/demo-1":
 			var req sessionRenameRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -297,6 +305,47 @@ func TestSessionRestore_SuccessWithProjectScope(t *testing.T) {
 		t.Fatalf("unexpected restore output:\n%s", out)
 	}
 	want := []string{"GET /api/v1/sessions/demo-1", "POST /api/v1/sessions/demo-1/restore"}
+	if got := log.all(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("requests = %#v, want %#v", got, want)
+	}
+}
+
+func TestSessionWorkerHoldCheckpointAndRetainedStop(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, log := sessionCommandServer(t)
+	writeRunFileFor(t, cfg, srv)
+	deps := Deps{ProcessAlive: func(int) bool { return true }}
+
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"session", "hold", "demo-1"}, "worker demo-1 held since 2026-09-06T02:00:00Z"},
+		{[]string{"session", "hold-status", "demo-1"}, "worker demo-1 held since 2026-09-06T02:00:00Z"},
+		{[]string{"session", "checkpoint", "demo-1"}, "checkpoint requested from held worker demo-1"},
+		{[]string{"session", "stop-retained", "demo-1"}, "managed runtime termination unknown; stop is not confirmed"},
+	} {
+		out, errOut, err := executeCLI(t, deps, tc.args...)
+		if err != nil {
+			t.Fatalf("%v failed: %v\nstderr=%s", tc.args, err, errOut)
+		}
+		if !strings.Contains(out, tc.want) {
+			t.Fatalf("%v output missing %q:\n%s", tc.args, tc.want, out)
+		}
+		if tc.args[1] == "stop-retained" {
+			for _, note := range []string{"worktree retained in place", "shared operations must be reconciled separately", "detached or external jobs are not verified"} {
+				if !strings.Contains(out, note) {
+					t.Fatalf("retained stop output missing %q:\n%s", note, out)
+				}
+			}
+		}
+	}
+	want := []string{
+		"POST /api/v1/sessions/demo-1/hold",
+		"GET /api/v1/sessions/demo-1/hold",
+		"POST /api/v1/sessions/demo-1/checkpoint",
+		"POST /api/v1/sessions/demo-1/stop-retained",
+	}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %#v, want %#v", got, want)
 	}

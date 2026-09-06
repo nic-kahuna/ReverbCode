@@ -55,6 +55,19 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (Session,
 	return i, err
 }
 
+const getWorkerSchedulingHold = `-- name: GetWorkerSchedulingHold :one
+SELECT session_id, held_at
+FROM worker_scheduling_holds
+WHERE session_id = ?
+`
+
+func (q *Queries) GetWorkerSchedulingHold(ctx context.Context, sessionID string) (WorkerSchedulingHold, error) {
+	row := q.db.QueryRowContext(ctx, getWorkerSchedulingHold, sessionID)
+	var i WorkerSchedulingHold
+	err := row.Scan(&i.SessionID, &i.HeldAt)
+	return i, err
+}
+
 const insertSession = `-- name: InsertSession :exec
 INSERT INTO sessions (
     id, project_id, num, issue_id, kind, harness, display_name,
@@ -315,6 +328,26 @@ func (q *Queries) SetSessionPreviewURL(ctx context.Context, arg SetSessionPrevie
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const setWorkerSchedulingHold = `-- name: SetWorkerSchedulingHold :one
+INSERT INTO worker_scheduling_holds (session_id, held_at)
+VALUES (?, ?)
+ON CONFLICT (session_id) DO UPDATE SET held_at = worker_scheduling_holds.held_at
+RETURNING session_id, held_at
+`
+
+type SetWorkerSchedulingHoldParams struct {
+	SessionID string
+	HeldAt    time.Time
+}
+
+// Preserve the first hold timestamp so repeated requests are idempotent.
+func (q *Queries) SetWorkerSchedulingHold(ctx context.Context, arg SetWorkerSchedulingHoldParams) (WorkerSchedulingHold, error) {
+	row := q.db.QueryRowContext(ctx, setWorkerSchedulingHold, arg.SessionID, arg.HeldAt)
+	var i WorkerSchedulingHold
+	err := row.Scan(&i.SessionID, &i.HeldAt)
+	return i, err
 }
 
 const updateSession = `-- name: UpdateSession :exec

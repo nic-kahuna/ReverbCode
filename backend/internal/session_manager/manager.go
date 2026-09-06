@@ -62,6 +62,15 @@ var (
 	// would answer it on the user's behalf. The API maps it to a 409; the
 	// caller retries once the user has answered in the terminal.
 	ErrAwaitingDecision = errors.New("session: awaiting a user decision")
+	// ErrWorkerHeld means the durable per-worker scheduling hold prevented a
+	// new turn or restore before it could reach the runtime or workspace.
+	ErrWorkerHeld = errors.New("session: worker scheduling hold is active")
+	// ErrWorkerOnly keeps hold/checkpoint/retained-stop semantics scoped to
+	// workers; orchestrator/controller scheduling remains unchanged.
+	ErrWorkerOnly = errors.New("session: operation is available only for workers")
+	// ErrCheckpointRequiresHold prevents the typed checkpoint path from
+	// becoming a general send bypass.
+	ErrCheckpointRequiresHold = errors.New("session: checkpoint requires an active worker hold")
 )
 
 // Env vars a spawned process reads to learn who it is.
@@ -105,6 +114,8 @@ type Store interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	ListSessions(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error)
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	SetWorkerSchedulingHold(ctx context.Context, id domain.SessionID, heldAt time.Time) (domain.WorkerSchedulingHold, error)
+	GetWorkerSchedulingHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error)
 	// DeleteSession removes a session row only if it is still in seed state
 	// (no workspace, runtime handle, agent session id, or prompt; not
 	// terminated). Returns deleted=true when removal happened; deleted=false
@@ -837,6 +848,157 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	return freed, nil
 }
 
+// StopWorkerRetainedResult reports only what the retained-worktree stop path
+// can prove about the named managed runtime. It deliberately makes no claim
+// about detached or external jobs.
+type StopWorkerRetainedResult struct {
+	SessionID              domain.SessionID
+	Hold                   domain.WorkerSchedulingHold
+	RuntimeTermination     string
+	WorktreeRetained       bool
+	ReconciliationRequired bool
+}
+
+const (
+	// RuntimeTerminationStopped means the exact recorded runtime handle was
+	// confirmed absent after destroy.
+	RuntimeTerminationStopped = "stopped"
+	// RuntimeTerminationUnknown means the stop could not be proved; callers
+	// must retain the hold and avoid claiming termination.
+	RuntimeTerminationUnknown = "unknown"
+)
+
+// WorkerHold returns the durable hold state for one worker.
+func (m *Manager) WorkerHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return domain.WorkerSchedulingHold{}, false, fmt.Errorf("worker hold %s: %w", id, err)
+	}
+	if !ok {
+		return domain.WorkerSchedulingHold{}, false, ErrNotFound
+	}
+	if rec.Kind != domain.KindWorker {
+		return domain.WorkerSchedulingHold{}, false, ErrWorkerOnly
+	}
+	hold, held, err := m.store.GetWorkerSchedulingHold(ctx, id)
+	if err != nil {
+		return domain.WorkerSchedulingHold{}, false, fmt.Errorf("worker hold %s: %w", id, err)
+	}
+	return hold, held, nil
+}
+
+// HoldWorker durably prevents future ordinary sends and restores. It is
+// idempotent and does not touch the runtime or workspace.
+func (m *Manager) HoldWorker(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error) {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return domain.WorkerSchedulingHold{}, fmt.Errorf("hold worker %s: %w", id, err)
+	}
+	if !ok {
+		return domain.WorkerSchedulingHold{}, ErrNotFound
+	}
+	if rec.Kind != domain.KindWorker {
+		return domain.WorkerSchedulingHold{}, ErrWorkerOnly
+	}
+	// Share the project operation lane with Restore. Once this durable write
+	// commits, no later restore can pass its own lane re-read before seeing the
+	// hold. Unlike lockAdmission, this does not require project admission to be
+	// open: a foreground hold must remain available while launches are paused.
+	unlock, err := m.admission.Lock(ctx, rec.ProjectID)
+	if err != nil {
+		return domain.WorkerSchedulingHold{}, fmt.Errorf("hold worker %s: %w", id, err)
+	}
+	defer unlock()
+	if hold, held, err := m.WorkerHold(ctx, id); err != nil {
+		return domain.WorkerSchedulingHold{}, err
+	} else if held {
+		return hold, nil
+	}
+	hold, err := m.store.SetWorkerSchedulingHold(ctx, id, m.clock().UTC())
+	if err != nil {
+		return domain.WorkerSchedulingHold{}, fmt.Errorf("hold worker %s: %w", id, err)
+	}
+	return hold, nil
+}
+
+// CheckpointHeldWorker sends the one fixed checkpoint request allowed through
+// a worker's scheduling hold. No caller-provided text can use this bypass.
+func (m *Manager) CheckpointHeldWorker(ctx context.Context, id domain.SessionID) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return fmt.Errorf("checkpoint worker %s: %w", id, err)
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	if rec.Kind != domain.KindWorker {
+		return ErrWorkerOnly
+	}
+	outcome, err := m.messenger.Checkpoint(ctx, id)
+	if err != nil {
+		return fmt.Errorf("checkpoint worker %s: %w", id, err)
+	}
+	switch outcome {
+	case sessionguard.Sent:
+		return nil
+	case sessionguard.SuppressedNotFound:
+		return ErrNotFound
+	case sessionguard.SuppressedTerminated:
+		return ErrTerminated
+	case sessionguard.SuppressedAwaitingUser:
+		return ErrAwaitingDecision
+	case sessionguard.SuppressedNotHeld:
+		return ErrCheckpointRequiresHold
+	default:
+		return fmt.Errorf("checkpoint worker %s: hold state unknown", id)
+	}
+}
+
+// StopWorkerRetainingWorktree persists the scheduling hold before touching the
+// named managed runtime. It never calls a workspace operation. Only a
+// successful destroy followed by a definitive absent probe records terminal
+// lifecycle state; every uncertain outcome retains the hold and reports
+// unknown without false confirmation.
+func (m *Manager) StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (StopWorkerRetainedResult, error) {
+	hold, err := m.HoldWorker(ctx, id)
+	result := StopWorkerRetainedResult{
+		SessionID:              id,
+		Hold:                   hold,
+		RuntimeTermination:     RuntimeTerminationUnknown,
+		WorktreeRetained:       true,
+		ReconciliationRequired: true,
+	}
+	if err != nil {
+		return result, err
+	}
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return result, fmt.Errorf("stop worker retained %s: %w", id, err)
+	}
+	if !ok {
+		return result, ErrNotFound
+	}
+	handle := runtimeHandle(rec.Metadata)
+	if handle.ID == "" {
+		return result, nil
+	}
+	if err := m.runtime.Destroy(ctx, handle); err != nil {
+		return result, nil //nolint:nilerr // unknown is the explicit operation result, not success confirmation
+	}
+	alive, err := m.runtime.IsAlive(ctx, handle)
+	if err != nil || alive {
+		return result, nil //nolint:nilerr // unknown is the explicit operation result, not success confirmation
+	}
+	result.RuntimeTermination = RuntimeTerminationStopped
+	if rec.IsTerminated {
+		return result, nil
+	}
+	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
+		return result, fmt.Errorf("stop worker retained %s: mark terminated: %w", id, err)
+	}
+	return result, nil
+}
+
 // RetireForReplacement terminates a live orchestrator and releases its branch
 // for a replacement session. Unlike Kill, this captures uncommitted work before
 // force-removing the worktree, so a dirty canonical orchestrator worktree does
@@ -960,6 +1122,11 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	}
 	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
+	}
+	if _, held, holdErr := m.store.GetWorkerSchedulingHold(ctx, id); holdErr != nil {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: read worker hold: %w", id, holdErr)
+	} else if held {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrWorkerHeld)
 	}
 	if !rec.IsTerminated {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
@@ -1312,6 +1479,15 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		if rec.IsTerminated {
 			continue
 		}
+		if _, held, holdErr := m.store.GetWorkerSchedulingHold(ctx, rec.ID); holdErr != nil {
+			m.logger.Error("reconcile: worker hold state unknown; preserving session", "sessionID", rec.ID, "error", holdErr)
+			continue
+		} else if held {
+			// A hold is a durable scheduling fence. Preserve the live record,
+			// runtime, and worktree exactly as found; the explicit retained-stop
+			// path owns any later runtime transition.
+			continue
+		}
 		if m.policy.IsDisabled(string(rec.Harness)) {
 			if err := m.reconcileCessation(ctx, rec, m.reconcileDisabled); err != nil {
 				m.logger.Error("reconcile: disabled session retirement failed", "sessionID", rec.ID, "error", err)
@@ -1449,6 +1625,13 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 			rec = fresh
 
 			if !rec.IsTerminated {
+				return
+			}
+			if _, held, holdErr := m.store.GetWorkerSchedulingHold(ctx, rec.ID); holdErr != nil {
+				m.logger.Error("restore-all: worker hold state unknown; preserving session", "sessionID", rec.ID, "error", holdErr)
+				return
+			} else if held {
+				m.logger.Info("restore-all: held worker left terminated", "sessionID", rec.ID)
 				return
 			}
 			if m.policy.IsDisabled(string(rec.Harness)) {
@@ -1873,6 +2056,8 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 		return fmt.Errorf("send %s: %w", id, ErrTerminated)
 	case sessionguard.SuppressedAwaitingUser:
 		return fmt.Errorf("send %s: %w", id, ErrAwaitingDecision)
+	case sessionguard.SuppressedHeld:
+		return fmt.Errorf("send %s: %w", id, ErrWorkerHeld)
 	}
 	// confirmActive only helps — and is only SAFE — when the harness reports
 	// both a prompt-submit signal (so the loop can observe active) and a
@@ -2507,6 +2692,8 @@ func (m *Manager) deliverAfterStartPrompt(ctx context.Context, agent ports.Agent
 		return fmt.Errorf("send %s: %w", id, ErrTerminated)
 	case sessionguard.SuppressedAwaitingUser:
 		return fmt.Errorf("send %s: %w", id, ErrAwaitingDecision)
+	case sessionguard.SuppressedHeld:
+		return fmt.Errorf("send %s: %w", id, ErrWorkerHeld)
 	case sessionguard.SuppressedUnknown:
 		return fmt.Errorf("send %s: pre-write session read failed", id)
 	default:

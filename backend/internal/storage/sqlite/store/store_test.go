@@ -307,6 +307,57 @@ func TestSessionFirstSignalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWorkerSchedulingHoldIsIdempotentAndSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	heldAt := time.Date(2026, 9, 5, 12, 30, 0, 0, time.UTC)
+	first, err := s.SetWorkerSchedulingHold(ctx, rec.ID, heldAt)
+	if err != nil {
+		t.Fatalf("set hold: %v", err)
+	}
+	if first.SessionID != rec.ID || !first.HeldAt.Equal(heldAt) {
+		t.Fatalf("first hold = %+v, want session %s at %v", first, rec.ID, heldAt)
+	}
+
+	second, err := s.SetWorkerSchedulingHold(ctx, rec.ID, heldAt.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("set hold again: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second hold = %+v, want unchanged %+v", second, first)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	got, ok, err := reopened.GetWorkerSchedulingHold(ctx, rec.ID)
+	if err != nil || !ok {
+		t.Fatalf("get hold after reopen: ok=%v err=%v", ok, err)
+	}
+	if got != first {
+		t.Fatalf("hold after reopen = %+v, want %+v", got, first)
+	}
+	if _, ok, err := reopened.GetWorkerSchedulingHold(ctx, "mer-missing"); err != nil || ok {
+		t.Fatalf("missing hold: ok=%v err=%v, want false nil", ok, err)
+	}
+}
+
 func TestPRCRUD(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

@@ -80,6 +80,22 @@ func (f *fakeSessionService) Kill(context.Context, domain.SessionID) (bool, erro
 	return false, nil
 }
 
+func (f *fakeSessionService) WorkerHold(context.Context, domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	return domain.WorkerSchedulingHold{}, false, nil
+}
+
+func (f *fakeSessionService) HoldWorker(context.Context, domain.SessionID) (domain.WorkerSchedulingHold, error) {
+	return domain.WorkerSchedulingHold{}, nil
+}
+
+func (f *fakeSessionService) CheckpointHeldWorker(context.Context, domain.SessionID) error {
+	return nil
+}
+
+func (f *fakeSessionService) StopWorkerRetainingWorktree(context.Context, domain.SessionID) (sessionsvc.StopWorkerRetainedResult, error) {
+	return sessionsvc.StopWorkerRetainedResult{}, nil
+}
+
 func (f *fakeSessionService) RollbackSpawn(context.Context, domain.SessionID) (sessionsvc.RollbackOutcome, error) {
 	return sessionsvc.RollbackOutcome{}, nil
 }

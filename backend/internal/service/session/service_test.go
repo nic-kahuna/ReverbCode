@@ -253,6 +253,16 @@ func (f *fakeCommander) Kill(_ context.Context, id domain.SessionID) (bool, erro
 	f.killed = append(f.killed, id)
 	return true, nil
 }
+func (f *fakeCommander) WorkerHold(_ context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	return domain.WorkerSchedulingHold{SessionID: id, HeldAt: time.Now().UTC()}, true, nil
+}
+func (f *fakeCommander) HoldWorker(_ context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error) {
+	return domain.WorkerSchedulingHold{SessionID: id, HeldAt: time.Now().UTC()}, nil
+}
+func (f *fakeCommander) CheckpointHeldWorker(context.Context, domain.SessionID) error { return nil }
+func (f *fakeCommander) StopWorkerRetainingWorktree(_ context.Context, id domain.SessionID) (sessionmanager.StopWorkerRetainedResult, error) {
+	return sessionmanager.StopWorkerRetainedResult{SessionID: id, RuntimeTermination: sessionmanager.RuntimeTerminationStopped, WorktreeRetained: true, ReconciliationRequired: true}, nil
+}
 func (f *fakeCommander) RetireForReplacement(_ context.Context, id domain.SessionID) error {
 	if f.retireErr != nil {
 		return f.retireErr
@@ -648,6 +658,9 @@ func TestToAPIErrorMapsWorkspaceBranchSentinels(t *testing.T) {
 		{"disabled agent", fmt.Errorf("spawn: %w: %q", sessionmanager.ErrAgentDisabled, "claude-code"), apierr.KindConflict, "AGENT_DISABLED"},
 		{"missing harness", fmt.Errorf("spawn: %w: configure project worker.agent or pass --harness", sessionmanager.ErrMissingHarness), apierr.KindInvalid, "AGENT_REQUIRED"},
 		{"awaiting decision", fmt.Errorf("send mer-1: %w", sessionmanager.ErrAwaitingDecision), apierr.KindConflict, "SESSION_AWAITING_DECISION"},
+		{"worker held", fmt.Errorf("send mer-1: %w", sessionmanager.ErrWorkerHeld), apierr.KindConflict, "WORKER_SCHEDULING_HELD"},
+		{"worker required", sessionmanager.ErrWorkerOnly, apierr.KindInvalid, "WORKER_REQUIRED"},
+		{"hold required", sessionmanager.ErrCheckpointRequiresHold, apierr.KindConflict, "WORKER_HOLD_REQUIRED"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

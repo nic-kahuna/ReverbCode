@@ -86,6 +86,22 @@ type restoreSessionResponse struct {
 	Session   sessionDTO `json:"session"`
 }
 
+type workerHoldResponse struct {
+	SessionID string    `json:"sessionId"`
+	Held      bool      `json:"held"`
+	HeldAt    time.Time `json:"heldAt,omitempty"`
+}
+
+type stopWorkerRetainedResponse struct {
+	SessionID              string    `json:"sessionId"`
+	Held                   bool      `json:"held"`
+	HeldAt                 time.Time `json:"heldAt"`
+	RuntimeTermination     string    `json:"runtimeTermination"`
+	WorktreeRetained       bool      `json:"worktreeRetained"`
+	ReconciliationRequired bool      `json:"reconciliationRequired"`
+	Scope                  string    `json:"scope"`
+}
+
 type renameSessionResponse struct {
 	SessionID   string `json:"sessionId"`
 	DisplayName string `json:"displayName"`
@@ -156,6 +172,10 @@ func newSessionCommand(ctx *commandContext) *cobra.Command {
 	cmd.AddCommand(newSessionGetCommand(ctx))
 	cmd.AddCommand(newSessionKillCommand(ctx))
 	cmd.AddCommand(newSessionRestoreCommand(ctx))
+	cmd.AddCommand(newSessionHoldCommand(ctx))
+	cmd.AddCommand(newSessionHoldStatusCommand(ctx))
+	cmd.AddCommand(newSessionCheckpointCommand(ctx))
+	cmd.AddCommand(newSessionStopRetainedCommand(ctx))
 	cmd.AddCommand(newSessionRenameCommand(ctx))
 	cmd.AddCommand(newSessionCleanupCommand(ctx))
 	cmd.AddCommand(newSessionClaimPRCommand(ctx))
@@ -233,6 +253,81 @@ func newSessionRestoreCommand(ctx *commandContext) *cobra.Command {
 		},
 	}
 	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	return cmd
+}
+
+func newSessionHoldCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionOptions
+	cmd := &cobra.Command{
+		Use:   "hold <id>",
+		Short: "Hold future turns and restores for a worker",
+		Args:  oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			return ctx.holdWorker(cmd.Context(), cmd, id, opts)
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
+	return cmd
+}
+
+func newSessionHoldStatusCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionOptions
+	cmd := &cobra.Command{
+		Use:   "hold-status <id>",
+		Short: "Show a worker scheduling hold",
+		Args:  oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			return ctx.workerHoldStatus(cmd.Context(), cmd, id, opts)
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
+	return cmd
+}
+
+func newSessionCheckpointCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionOptions
+	cmd := &cobra.Command{
+		Use:   "checkpoint <id>",
+		Short: "Request a progress checkpoint from a held worker",
+		Args:  oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			return ctx.checkpointHeldWorker(cmd.Context(), cmd, id, opts)
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	return cmd
+}
+
+func newSessionStopRetainedCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionOptions
+	cmd := &cobra.Command{
+		Use:   "stop-retained <id>",
+		Short: "Stop a worker runtime and retain its worktree",
+		Args:  oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			return ctx.stopWorkerRetained(cmd.Context(), cmd, id, opts)
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
 	return cmd
 }
 
@@ -480,6 +575,91 @@ func (c *commandContext) restoreSession(ctx context.Context, cmd *cobra.Command,
 		}
 	}
 	return nil
+}
+
+func (c *commandContext) holdWorker(ctx context.Context, cmd *cobra.Command, id string, opts sessionOptions) error {
+	if opts.project != "" {
+		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
+			return err
+		}
+	}
+	var res workerHoldResponse
+	if err := c.postJSON(ctx, "sessions/"+url.PathEscape(id)+"/hold", struct{}{}, &res); err != nil {
+		return err
+	}
+	return writeWorkerHold(cmd, res, opts.json)
+}
+
+func (c *commandContext) workerHoldStatus(ctx context.Context, cmd *cobra.Command, id string, opts sessionOptions) error {
+	if opts.project != "" {
+		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
+			return err
+		}
+	}
+	var res workerHoldResponse
+	if err := c.getJSON(ctx, "sessions/"+url.PathEscape(id)+"/hold", &res); err != nil {
+		return err
+	}
+	return writeWorkerHold(cmd, res, opts.json)
+}
+
+func writeWorkerHold(cmd *cobra.Command, res workerHoldResponse, jsonOutput bool) error {
+	if jsonOutput {
+		return writeJSON(cmd.OutOrStdout(), res)
+	}
+	if !res.Held {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "worker %s is not held\n", res.SessionID)
+		return err
+	}
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "worker %s held since %s\n", res.SessionID, res.HeldAt.Format(time.RFC3339))
+	return err
+}
+
+func (c *commandContext) checkpointHeldWorker(ctx context.Context, cmd *cobra.Command, id string, opts sessionOptions) error {
+	if opts.project != "" {
+		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
+			return err
+		}
+	}
+	var res struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := c.postJSON(ctx, "sessions/"+url.PathEscape(id)+"/checkpoint", struct{}{}, &res); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "checkpoint requested from held worker %s\n", res.SessionID)
+	return err
+}
+
+func (c *commandContext) stopWorkerRetained(ctx context.Context, cmd *cobra.Command, id string, opts sessionOptions) error {
+	if opts.project != "" {
+		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
+			return err
+		}
+	}
+	var res stopWorkerRetainedResponse
+	if err := c.postJSON(ctx, "sessions/"+url.PathEscape(id)+"/stop-retained", struct{}{}, &res); err != nil {
+		return err
+	}
+	if opts.json {
+		return writeJSON(cmd.OutOrStdout(), res)
+	}
+	out := cmd.OutOrStdout()
+	if res.RuntimeTermination == "stopped" {
+		if _, err := fmt.Fprintf(out, "worker %s managed runtime stopped\n", res.SessionID); err != nil {
+			return err
+		}
+	} else if _, err := fmt.Fprintf(out, "worker %s managed runtime termination unknown; stop is not confirmed\n", res.SessionID); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(out, "worktree retained in place"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(out, "shared operations must be reconciled separately"); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintln(out, res.Scope)
+	return err
 }
 
 func (c *commandContext) renameSession(ctx context.Context, cmd *cobra.Command, id, displayName string, opts sessionOptions) error {

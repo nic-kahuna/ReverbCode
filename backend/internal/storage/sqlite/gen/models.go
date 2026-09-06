@@ -211,6 +211,11 @@ type TelemetryEvent struct {
 	PayloadJson string
 }
 
+type WorkerSchedulingHold struct {
+	SessionID string
+	HeldAt    time.Time
+}
+
 type WorkspaceRepo struct {
 	ProjectID     domain.ProjectID
 	Name          string

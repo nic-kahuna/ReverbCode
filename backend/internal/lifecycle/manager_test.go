@@ -15,6 +15,7 @@ var ctx = context.Background()
 
 type fakeStore struct {
 	sessions   map[domain.SessionID]domain.SessionRecord
+	holds      map[domain.SessionID]domain.WorkerSchedulingHold
 	prs        map[domain.SessionID][]domain.PullRequest
 	signatures map[string]string
 
@@ -23,12 +24,17 @@ type fakeStore struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{sessions: map[domain.SessionID]domain.SessionRecord{}, prs: map[domain.SessionID][]domain.PullRequest{}, signatures: map[string]string{}}
+	return &fakeStore{sessions: map[domain.SessionID]domain.SessionRecord{}, holds: map[domain.SessionID]domain.WorkerSchedulingHold{}, prs: map[domain.SessionID][]domain.PullRequest{}, signatures: map[string]string{}}
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
 	r, ok := f.sessions[id]
 	return r, ok, nil
+}
+
+func (f *fakeStore) GetWorkerSchedulingHold(_ context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	hold, ok := f.holds[id]
+	return hold, ok, nil
 }
 
 func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {

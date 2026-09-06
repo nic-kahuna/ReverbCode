@@ -74,6 +74,34 @@ func (s *Store) SetSessionPreviewURL(ctx context.Context, id domain.SessionID, p
 	return rows > 0, nil
 }
 
+// SetWorkerSchedulingHold persists one immutable scheduling hold per session.
+// Repeated calls return the first hold unchanged.
+func (s *Store) SetWorkerSchedulingHold(ctx context.Context, id domain.SessionID, heldAt time.Time) (domain.WorkerSchedulingHold, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	row, err := s.qw.SetWorkerSchedulingHold(ctx, gen.SetWorkerSchedulingHoldParams{
+		SessionID: string(id),
+		HeldAt:    heldAt,
+	})
+	if err != nil {
+		return domain.WorkerSchedulingHold{}, fmt.Errorf("set worker scheduling hold for session %s: %w", id, err)
+	}
+	return domain.WorkerSchedulingHold{SessionID: domain.SessionID(row.SessionID), HeldAt: row.HeldAt}, nil
+}
+
+// GetWorkerSchedulingHold returns the durable hold for a session, or ok=false
+// when the session has no hold.
+func (s *Store) GetWorkerSchedulingHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	row, err := s.qr.GetWorkerSchedulingHold(ctx, string(id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.WorkerSchedulingHold{}, false, nil
+	}
+	if err != nil {
+		return domain.WorkerSchedulingHold{}, false, fmt.Errorf("get worker scheduling hold for session %s: %w", id, err)
+	}
+	return domain.WorkerSchedulingHold{SessionID: domain.SessionID(row.SessionID), HeldAt: row.HeldAt}, true, nil
+}
+
 // DeleteSession removes a session row, but only if it is still in seed state
 // (no workspace, no runtime handle, no agent session id, no prompt, and not
 // already terminated). Rows that have observable spawn output are immutable

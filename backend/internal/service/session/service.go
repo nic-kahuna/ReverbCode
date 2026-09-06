@@ -48,6 +48,10 @@ type commander interface {
 	Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error)
 	Restore(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error)
 	Kill(ctx context.Context, id domain.SessionID) (bool, error)
+	WorkerHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error)
+	HoldWorker(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error)
+	CheckpointHeldWorker(ctx context.Context, id domain.SessionID) error
+	StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (sessionmanager.StopWorkerRetainedResult, error)
 	RetireForReplacement(ctx context.Context, id domain.SessionID) error
 	Send(ctx context.Context, id domain.SessionID, message string) error
 	SendAdmitted(ctx context.Context, id domain.SessionID, message string) error
@@ -75,6 +79,9 @@ type CleanupSkipped struct {
 	SessionID domain.SessionID `json:"sessionId"`
 	Reason    string           `json:"reason"`
 }
+
+// StopWorkerRetainedResult is the command result exposed to the HTTP boundary.
+type StopWorkerRetainedResult = sessionmanager.StopWorkerRetainedResult
 
 type scmProvider interface {
 	ParseRepository(remote string) (ports.SCMRepo, bool)
@@ -424,6 +431,32 @@ func (s *Service) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	return freed, toAPIError(err)
 }
 
+// WorkerHold returns the persisted scheduling state for one worker.
+func (s *Service) WorkerHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	hold, held, err := s.manager.WorkerHold(ctx, id)
+	return hold, held, toAPIError(err)
+}
+
+// HoldWorker persists the worker's scheduling hold without touching its
+// runtime or worktree.
+func (s *Service) HoldWorker(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error) {
+	hold, err := s.manager.HoldWorker(ctx, id)
+	return hold, toAPIError(err)
+}
+
+// CheckpointHeldWorker requests the fixed checkpoint operation allowed while
+// the worker is held.
+func (s *Service) CheckpointHeldWorker(ctx context.Context, id domain.SessionID) error {
+	return toAPIError(s.manager.CheckpointHeldWorker(ctx, id))
+}
+
+// StopWorkerRetainingWorktree stops only the known managed runtime and leaves
+// all workspace state in place.
+func (s *Service) StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (sessionmanager.StopWorkerRetainedResult, error) {
+	result, err := s.manager.StopWorkerRetainingWorktree(ctx, id)
+	return result, toAPIError(err)
+}
+
 // RollbackSpawn deletes a seed-state session row, or falls back to a Kill if
 // the session has spawn output. Used by the CLI to undo a `spawn --claim-pr`
 // when the claim step fails, avoiding the orphan terminated row that a plain
@@ -596,6 +629,12 @@ func toAPIError(err error) error {
 	case errors.Is(err, sessionmanager.ErrAwaitingDecision):
 		return apierr.Conflict("SESSION_AWAITING_DECISION",
 			"Session is paused on a permission decision; answer it in the session terminal first", nil)
+	case errors.Is(err, sessionmanager.ErrWorkerHeld):
+		return apierr.Conflict("WORKER_SCHEDULING_HELD", "Worker scheduling hold blocks new turns and restores", nil)
+	case errors.Is(err, sessionmanager.ErrWorkerOnly):
+		return apierr.Invalid("WORKER_REQUIRED", "Operation is available only for worker sessions", nil)
+	case errors.Is(err, sessionmanager.ErrCheckpointRequiresHold):
+		return apierr.Conflict("WORKER_HOLD_REQUIRED", "Checkpoint requires an active worker scheduling hold", nil)
 	case errors.Is(err, sessionmanager.ErrIncompleteHandle):
 		return apierr.Conflict("SESSION_INCOMPLETE_HANDLE", "Session is missing runtime or workspace handles", nil)
 	case errors.Is(err, sessionmanager.ErrNotResumable):

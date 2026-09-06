@@ -3,15 +3,24 @@ package sessionguard
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 type fakeStore struct {
-	rec domain.SessionRecord
-	ok  bool
-	err error
+	rec     domain.SessionRecord
+	ok      bool
+	err     error
+	hold    domain.WorkerSchedulingHold
+	held    bool
+	holdErr error
+}
+
+func (s *fakeStore) GetWorkerSchedulingHold(_ context.Context, _ domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	return s.hold, s.held, s.holdErr
 }
 
 func (s *fakeStore) GetSession(_ context.Context, _ domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -96,6 +105,104 @@ func TestGuard_StoreErrorFailsClosed(t *testing.T) {
 	}
 	if len(msgr.sent) != 0 {
 		t.Errorf("messenger was called %d times on unknown state, want 0", len(msgr.sent))
+	}
+}
+
+func TestGuard_HoldPolicy(t *testing.T) {
+	held := &fakeStore{
+		rec:  record(domain.ActivityActive, false),
+		ok:   true,
+		hold: domain.WorkerSchedulingHold{SessionID: "s1", HeldAt: time.Now()},
+		held: true,
+	}
+	for _, method := range []string{"Deliver", "Nudge"} {
+		msgr := &fakeMessenger{}
+		g := New(held, msgr, nil)
+		var got Outcome
+		var err error
+		if method == "Deliver" {
+			got, err = g.Deliver(context.Background(), "s1", "ordinary")
+		} else {
+			got, err = g.Nudge(context.Background(), "s1", "ordinary")
+		}
+		if err != nil || got != SuppressedHeld {
+			t.Fatalf("%s held outcome = %v, err=%v; want SuppressedHeld, nil", method, got, err)
+		}
+		if len(msgr.sent) != 0 {
+			t.Fatalf("%s sent %d messages while held, want 0", method, len(msgr.sent))
+		}
+	}
+	held.rec = record(domain.ActivityExited, false)
+	got, err := New(held, &fakeMessenger{}, nil).Deliver(context.Background(), "s1", "ordinary")
+	if err != nil || got != SuppressedHeld {
+		t.Fatalf("held exited delivery outcome = %v, err=%v; want SuppressedHeld, nil", got, err)
+	}
+	held.rec = record(domain.ActivityActive, false)
+
+	msgr := &fakeMessenger{}
+	g := New(held, msgr, nil)
+	got, err = g.Checkpoint(context.Background(), "s1")
+	if err != nil || got != Sent {
+		t.Fatalf("checkpoint held outcome = %v, err=%v; want Sent, nil", got, err)
+	}
+	if !reflect.DeepEqual(msgr.sent, []string{domain.WorkerCheckpointPrompt}) {
+		t.Fatalf("checkpoint messages = %#v, want fixed prompt", msgr.sent)
+	}
+
+	msgr = &fakeMessenger{}
+	g = New(&fakeStore{rec: record(domain.ActivityActive, false), ok: true}, msgr, nil)
+	got, err = g.Checkpoint(context.Background(), "s1")
+	if err != nil || got != SuppressedNotHeld {
+		t.Fatalf("checkpoint unheld outcome = %v, err=%v; want SuppressedNotHeld, nil", got, err)
+	}
+	if len(msgr.sent) != 0 {
+		t.Fatalf("unheld checkpoint sent %d messages, want 0", len(msgr.sent))
+	}
+}
+
+func TestGuard_CheckpointRefusesUnsafeStates(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  domain.SessionRecord
+		ok   bool
+		want Outcome
+	}{
+		{"missing", domain.SessionRecord{}, false, SuppressedNotFound},
+		{"terminated", record(domain.ActivityIdle, true), true, SuppressedTerminated},
+		{"exited", record(domain.ActivityExited, false), true, SuppressedTerminated},
+		{"blocked", record(domain.ActivityBlocked, false), true, SuppressedAwaitingUser},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msgr := &fakeMessenger{}
+			g := New(&fakeStore{rec: tc.rec, ok: tc.ok, held: true}, msgr, nil)
+			got, err := g.Checkpoint(context.Background(), "s1")
+			if err != nil || got != tc.want {
+				t.Fatalf("checkpoint outcome = %v, err=%v; want %v, nil", got, err, tc.want)
+			}
+			if len(msgr.sent) != 0 {
+				t.Fatalf("checkpoint sent %d messages, want 0", len(msgr.sent))
+			}
+		})
+	}
+}
+
+func TestGuard_HoldReadErrorFailsClosed(t *testing.T) {
+	holdErr := errors.New("hold table unavailable")
+	msgr := &fakeMessenger{}
+	g := New(&fakeStore{rec: record(domain.ActivityActive, false), ok: true, holdErr: holdErr}, msgr, nil)
+	for name, call := range map[string]func() (Outcome, error){
+		"Deliver":    func() (Outcome, error) { return g.Deliver(context.Background(), "s1", "x") },
+		"Nudge":      func() (Outcome, error) { return g.Nudge(context.Background(), "s1", "x") },
+		"Checkpoint": func() (Outcome, error) { return g.Checkpoint(context.Background(), "s1") },
+	} {
+		got, err := call()
+		if !errors.Is(err, holdErr) || got != SuppressedUnknown {
+			t.Errorf("%s outcome = %v, err=%v; want SuppressedUnknown wrapping %v", name, got, err, holdErr)
+		}
+	}
+	if len(msgr.sent) != 0 {
+		t.Fatalf("hold read failure sent %d messages, want 0", len(msgr.sent))
 	}
 }
 

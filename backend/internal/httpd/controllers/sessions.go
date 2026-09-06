@@ -38,6 +38,10 @@ type SessionService interface {
 	Get(ctx context.Context, id domain.SessionID) (domain.Session, error)
 	Restore(ctx context.Context, id domain.SessionID) (domain.Session, error)
 	Kill(ctx context.Context, id domain.SessionID) (bool, error)
+	WorkerHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error)
+	HoldWorker(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error)
+	CheckpointHeldWorker(ctx context.Context, id domain.SessionID) error
+	StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (sessionsvc.StopWorkerRetainedResult, error)
 	RollbackSpawn(ctx context.Context, id domain.SessionID) (sessionsvc.RollbackOutcome, error)
 	Cleanup(ctx context.Context, project domain.ProjectID) (sessionsvc.CleanupOutcome, error)
 	Rename(ctx context.Context, id domain.SessionID, displayName string) error
@@ -79,6 +83,10 @@ func (c *SessionsController) Register(r chi.Router) {
 	r.Patch("/sessions/{sessionId}", c.rename)
 	r.Post("/sessions/{sessionId}/restore", c.restore)
 	r.Post("/sessions/{sessionId}/kill", c.kill)
+	r.Get("/sessions/{sessionId}/hold", c.workerHold)
+	r.Post("/sessions/{sessionId}/hold", c.holdWorker)
+	r.Post("/sessions/{sessionId}/checkpoint", c.checkpointHeldWorker)
+	r.Post("/sessions/{sessionId}/stop-retained", c.stopWorkerRetained)
 	r.Post("/sessions/{sessionId}/rollback", c.rollback)
 	r.Post("/sessions/{sessionId}/send", c.send)
 	r.Post("/sessions/{sessionId}/send-admitted", c.sendAdmitted)
@@ -391,6 +399,69 @@ func (c *SessionsController) kill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, KillSessionResponse{OK: true, SessionID: sessionID(r), Freed: freed})
+}
+
+func (c *SessionsController) workerHold(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "GET", "/api/v1/sessions/{sessionId}/hold")
+		return
+	}
+	hold, held, err := c.Svc.WorkerHold(r.Context(), sessionID(r))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, workerHoldResponse(sessionID(r), hold, held))
+}
+
+func (c *SessionsController) holdWorker(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/hold")
+		return
+	}
+	hold, err := c.Svc.HoldWorker(r.Context(), sessionID(r))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, workerHoldResponse(sessionID(r), hold, true))
+}
+
+func (c *SessionsController) checkpointHeldWorker(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/checkpoint")
+		return
+	}
+	if err := c.Svc.CheckpointHeldWorker(r.Context(), sessionID(r)); err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, WorkerCheckpointResponse{OK: true, SessionID: sessionID(r)})
+}
+
+func (c *SessionsController) stopWorkerRetained(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/stop-retained")
+		return
+	}
+	result, err := c.Svc.StopWorkerRetainingWorktree(r.Context(), sessionID(r))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, StopWorkerRetainedResponse{
+		SessionID:              result.SessionID,
+		Held:                   true,
+		HeldAt:                 result.Hold.HeldAt,
+		RuntimeTermination:     result.RuntimeTermination,
+		WorktreeRetained:       result.WorktreeRetained,
+		ReconciliationRequired: result.ReconciliationRequired,
+		Scope:                  "named managed runtime only; detached or external jobs are not verified",
+	})
+}
+
+func workerHoldResponse(id domain.SessionID, hold domain.WorkerSchedulingHold, held bool) WorkerHoldResponse {
+	return WorkerHoldResponse{SessionID: id, Held: held, HeldAt: hold.HeldAt}
 }
 
 // rollback undoes a partially-completed spawn: if the session row is still in

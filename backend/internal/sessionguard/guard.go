@@ -18,10 +18,11 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
-// SessionReader is the single store read the guard needs: the session's
-// current liveness and activity state.
+// SessionReader supplies the live session facts and durable scheduling hold
+// that the guard re-reads immediately before a pane write.
 type SessionReader interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
+	GetWorkerSchedulingHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error)
 }
 
 // Outcome reports what a guarded write did. Anything other than Sent means the
@@ -46,6 +47,12 @@ const (
 	// permission decision (Deliver and Nudge), or waiting at the prompt for
 	// the next instruction (Nudge only).
 	SuppressedAwaitingUser
+	// SuppressedHeld means an ordinary delivery or nudge was refused because
+	// the session has a durable scheduling hold.
+	SuppressedHeld
+	// SuppressedNotHeld means the typed checkpoint path was refused because
+	// the session does not have a durable scheduling hold.
+	SuppressedNotHeld
 )
 
 // String names the outcome for logs.
@@ -59,6 +66,10 @@ func (o Outcome) String() string {
 		return "suppressed_terminated"
 	case SuppressedAwaitingUser:
 		return "suppressed_awaiting_user"
+	case SuppressedHeld:
+		return "suppressed_held"
+	case SuppressedNotHeld:
+		return "suppressed_not_held"
 	default:
 		return "suppressed_unknown"
 	}
@@ -101,12 +112,11 @@ func (g *Guard) Send(ctx context.Context, id domain.SessionID, msg string) error
 }
 
 // Deliver writes a user-initiated message (or its Enter-only re-submit: an
-// empty msg) into the session. It refuses only when the session is blocked on
-// a pending decision — waiting_input does NOT suppress, because an agent
-// sitting at an idle prompt is exactly where a user message (or the Enter that
-// submits its unsent draft) belongs.
+// empty msg) into the session. A scheduling hold or pending decision refuses
+// it. waiting_input does not suppress, because an agent sitting at an idle
+// prompt is exactly where a user message belongs.
 func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
-	return g.send(ctx, id, msg, func(state domain.ActivityState) bool {
+	return g.send(ctx, id, msg, holdForbidden, func(state domain.ActivityState) bool {
 		return state == domain.ActivityBlocked
 	})
 }
@@ -116,10 +126,26 @@ func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (O
 // decision or waiting at the prompt — because an automated paste+Enter there
 // either answers a dialog or submits text the user never saw.
 func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
-	return g.send(ctx, id, msg, func(state domain.ActivityState) bool {
+	return g.send(ctx, id, msg, holdForbidden, func(state domain.ActivityState) bool {
 		return state.NeedsInput()
 	})
 }
+
+// Checkpoint sends the fixed checkpoint prompt only when the session is held
+// and live. It refuses blocked activity so the messenger's trailing Enter can
+// never answer a pending approval dialog.
+func (g *Guard) Checkpoint(ctx context.Context, id domain.SessionID) (Outcome, error) {
+	return g.send(ctx, id, domain.WorkerCheckpointPrompt, holdRequired, func(state domain.ActivityState) bool {
+		return state == domain.ActivityBlocked
+	})
+}
+
+type holdPolicy int
+
+const (
+	holdForbidden holdPolicy = iota
+	holdRequired
+)
 
 // send re-reads the session immediately before pasting so the window between
 // "state looked safe" and "bytes hit the pane" is as small as this process can
@@ -127,7 +153,7 @@ func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Out
 // appear mid-paste — but the just-in-time read is the strongest guarantee
 // available without scraping the terminal. Fail closed: a store error
 // suppresses the write rather than pressing Enter on an unknown state.
-func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse func(domain.ActivityState) bool) (Outcome, error) {
+func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, policy holdPolicy, refuse func(domain.ActivityState) bool) (Outcome, error) {
 	rec, ok, err := g.store.GetSession(ctx, id)
 	if err != nil {
 		return SuppressedUnknown, fmt.Errorf("guard %s: read session: %w", id, err)
@@ -135,6 +161,18 @@ func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refus
 	if !ok {
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "not_found")
 		return SuppressedNotFound, nil
+	}
+	_, held, err := g.store.GetWorkerSchedulingHold(ctx, id)
+	if err != nil {
+		return SuppressedUnknown, fmt.Errorf("guard %s: read worker scheduling hold: %w", id, err)
+	}
+	if policy == holdForbidden && held {
+		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "held")
+		return SuppressedHeld, nil
+	}
+	if policy == holdRequired && !held {
+		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "not_held")
+		return SuppressedNotHeld, nil
 	}
 	// ActivityExited is refused alongside IsTerminated as defense-in-depth:
 	// every exited writer today also sets IsTerminated, but a pane whose agent

@@ -215,6 +215,32 @@ type KillSessionResponse struct {
 	Freed     bool             `json:"freed,omitempty"`
 }
 
+// WorkerHoldResponse is the durable per-worker scheduling hold state.
+type WorkerHoldResponse struct {
+	SessionID domain.SessionID `json:"sessionId"`
+	Held      bool             `json:"held"`
+	HeldAt    time.Time        `json:"heldAt,omitempty"`
+}
+
+// WorkerCheckpointResponse acknowledges delivery of the fixed typed
+// checkpoint request. Callers cannot supply arbitrary message text.
+type WorkerCheckpointResponse struct {
+	OK        bool             `json:"ok"`
+	SessionID domain.SessionID `json:"sessionId"`
+}
+
+// StopWorkerRetainedResponse distinguishes a verified stopped runtime from an
+// unknown termination result while stating the preservation boundary.
+type StopWorkerRetainedResponse struct {
+	SessionID              domain.SessionID `json:"sessionId"`
+	Held                   bool             `json:"held"`
+	HeldAt                 time.Time        `json:"heldAt"`
+	RuntimeTermination     string           `json:"runtimeTermination" enum:"stopped,unknown"`
+	WorktreeRetained       bool             `json:"worktreeRetained"`
+	ReconciliationRequired bool             `json:"reconciliationRequired"`
+	Scope                  string           `json:"scope"`
+}
+
 // RollbackSessionResponse is the body of POST /api/v1/sessions/{sessionId}/rollback.
 // Exactly one of Deleted/Killed is true on a successful rollback; both are
 // false when the session was already absent or already terminated (benign).
