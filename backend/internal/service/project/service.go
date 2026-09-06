@@ -552,7 +552,14 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 		}
 		in.Config.AdmissionPaused = row.Config.AdmissionPaused
 	}
+	if !in.Config.DesktopProjectsAdmissionSet && !in.Config.DesktopProjectsAdmission {
+		if row.ConfigDecodeError != "" {
+			return Project{}, apierr.Conflict("PROJECT_ADMISSION_UNKNOWN", "Config repair requires explicit desktopProjectsAdmission", nil)
+		}
+		in.Config.DesktopProjectsAdmission = row.Config.DesktopProjectsAdmission
+	}
 	in.Config.AdmissionPausedSet = false
+	in.Config.DesktopProjectsAdmissionSet = false
 	row.Config = in.Config
 	if err := m.store.UpsertProject(ctx, row); err != nil {
 		return Project{}, apierr.Internal("PROJECT_CONFIG_UPDATE_FAILED", "Failed to update project config")

@@ -444,6 +444,40 @@ func TestManager_SetConfig(t *testing.T) {
 	wantCode(t, err, "PROJECT_NOT_FOUND")
 }
 
+func TestManager_SetConfigPreservesDesktopProjectsAdmissionWhenOmitted(t *testing.T) {
+	ctx := context.Background()
+	m := newManager(t)
+	repo := gitRepo(t)
+
+	enabled := domain.ProjectConfig{
+		DesktopProjectsAdmission:    true,
+		DesktopProjectsAdmissionSet: true,
+		DefaultBranch:               "main",
+	}
+	if _, err := m.Add(ctx, project.AddInput{Path: repo, ProjectID: ptr("ao"), Config: &enabled}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	updated, err := m.SetConfig(ctx, "ao", project.SetConfigInput{Config: domain.ProjectConfig{DefaultBranch: "develop"}})
+	if err != nil {
+		t.Fatalf("SetConfig omitted setting: %v", err)
+	}
+	if updated.Config == nil || !updated.Config.DesktopProjectsAdmission {
+		t.Fatalf("omitted setting disabled admission: %#v", updated.Config)
+	}
+
+	disabled, err := m.SetConfig(ctx, "ao", project.SetConfigInput{Config: domain.ProjectConfig{
+		DesktopProjectsAdmissionSet: true,
+		DefaultBranch:               "develop",
+	}})
+	if err != nil {
+		t.Fatalf("SetConfig explicit false: %v", err)
+	}
+	if disabled.Config == nil || disabled.Config.DesktopProjectsAdmission {
+		t.Fatalf("explicit false was not persisted: %#v", disabled.Config)
+	}
+}
+
 func TestManager_ListIncludesOnlySummarySafeProjectConfig(t *testing.T) {
 	ctx := context.Background()
 	m := newManager(t)
