@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -32,6 +33,7 @@ type fakeStore struct {
 	// worktrees maps session ID to its saved worktree rows (shutdown-saved marker).
 	worktrees map[domain.SessionID][]domain.SessionWorktreeRecord
 	holds     map[domain.SessionID]domain.WorkerSchedulingHold
+	gate      *admission.Gate
 	// sharedLog, when non-nil, receives an ordered call entry for each
 	// UpsertSessionWorktree invocation so ordering tests can compare across fakes.
 	sharedLog *[]string
@@ -45,8 +47,11 @@ func newFakeStore() *fakeStore {
 		workspaceRepo: map[string][]domain.WorkspaceRepoRecord{},
 		worktrees:     map[domain.SessionID][]domain.SessionWorktreeRecord{},
 		holds:         map[domain.SessionID]domain.WorkerSchedulingHold{},
+		gate:          admission.New(),
 	}
 }
+
+func (f *fakeStore) AdmissionGate() *admission.Gate { return f.gate }
 func (f *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectRecord, bool, error) {
 	r, ok := f.projects[id]
 	return r, ok, nil
@@ -207,7 +212,10 @@ type fakeRuntime struct {
 	aliveByHandle map[string]bool
 	aliveErr      error
 	destroyedIDs  []string
+	verifiedStop  bool
 }
+
+func (r *fakeRuntime) SupportsVerifiedRetainedStop() bool { return r.verifiedStop }
 
 func (r *fakeRuntime) HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	return ports.RuntimeHandle{ID: string(cfg.SessionID)}, nil
@@ -661,6 +669,7 @@ func TestStopWorkerRetainingWorktreeMarksTerminatedOnlyAfterAbsentProbe(t *testi
 	worker.Metadata.Branch = "codex/work"
 	st.sessions[worker.ID] = worker
 	rt.aliveByHandle = map[string]bool{"h1": true}
+	rt.verifiedStop = true
 
 	result, err := m.StopWorkerRetainingWorktree(ctx, worker.ID)
 	if err != nil {
@@ -698,6 +707,7 @@ func TestStopWorkerRetainingWorktreeUnknownKeepsHoldAndLifecycle(t *testing.T) {
 			st.sessions[worker.ID] = worker
 			rt.aliveByHandle = map[string]bool{"h1": true}
 			tc.configure(rt, &worker)
+			rt.verifiedStop = true
 			st.sessions[worker.ID] = worker
 
 			result, err := m.StopWorkerRetainingWorktree(ctx, worker.ID)
@@ -717,6 +727,35 @@ func TestStopWorkerRetainingWorktreeUnknownKeepsHoldAndLifecycle(t *testing.T) {
 				t.Fatalf("workspace was touched: calls=%v", ws.calls)
 			}
 		})
+	}
+}
+
+func TestStopWorkerRetainingWorktreeUnsupportedDoesNotDestroyOrCompleteLifecycle(t *testing.T) {
+	m, st, rt, ws := newManager()
+	worker := mkLive("mer-1")
+	worker.Kind = domain.KindWorker
+	worker.Metadata.Branch = "codex/work"
+	st.sessions[worker.ID] = worker
+	rt.aliveByHandle = map[string]bool{"h1": true}
+
+	result, err := m.StopWorkerRetainingWorktree(ctx, worker.ID)
+	if err != nil {
+		t.Fatalf("StopWorkerRetainingWorktree: %v", err)
+	}
+	if result.RuntimeTermination != RuntimeTerminationUnsupported {
+		t.Fatalf("runtime termination = %q, want unsupported", result.RuntimeTermination)
+	}
+	if rt.destroyed != 0 {
+		t.Fatalf("unsupported runtime destroy calls = %d, want 0", rt.destroyed)
+	}
+	if st.sessions[worker.ID].IsTerminated {
+		t.Fatal("unsupported runtime was marked terminated")
+	}
+	if _, held, _ := st.GetWorkerSchedulingHold(ctx, worker.ID); !held {
+		t.Fatal("unsupported result lost durable hold")
+	}
+	if len(ws.calls) != 0 || ws.stashCalls != 0 || ws.destroyed != 0 {
+		t.Fatalf("workspace was touched: calls=%v", ws.calls)
 	}
 }
 

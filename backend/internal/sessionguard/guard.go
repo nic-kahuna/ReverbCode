@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -76,14 +77,15 @@ func (o Outcome) String() string {
 }
 
 // Guard is the guarded pane-write primitive shared by the session manager and
-// lifecycle. It takes no locks of its own, so callers may hold theirs across a
-// call (lifecycle's sendOnce calls it under react.mu). It implements
+// lifecycle. It holds the project's short-lived operation lane across the
+// final state re-read and pane write. It implements
 // ports.AgentMessenger (via Send) so it can transparently replace a raw
 // messenger wherever only the error matters.
 type Guard struct {
 	store     SessionReader
 	messenger ports.AgentMessenger
 	logger    *slog.Logger
+	gate      *admission.Gate
 }
 
 var _ ports.AgentMessenger = (*Guard)(nil)
@@ -94,7 +96,7 @@ func New(store SessionReader, messenger ports.AgentMessenger, logger *slog.Logge
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Guard{store: store, messenger: messenger, logger: logger}
+	return &Guard{store: store, messenger: messenger, logger: logger, gate: admission.For(store)}
 }
 
 // Send satisfies ports.AgentMessenger so a Guard can sit in for the raw
@@ -154,9 +156,27 @@ const (
 // available without scraping the terminal. Fail closed: a store error
 // suppresses the write rather than pressing Enter on an unknown state.
 func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, policy holdPolicy, refuse func(domain.ActivityState) bool) (Outcome, error) {
-	rec, ok, err := g.store.GetSession(ctx, id)
+	initial, ok, err := g.store.GetSession(ctx, id)
 	if err != nil {
 		return SuppressedUnknown, fmt.Errorf("guard %s: read session: %w", id, err)
+	}
+	if !ok {
+		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "not_found")
+		return SuppressedNotFound, nil
+	}
+	// Serialize the durable hold transition with the actual runtime write. If a
+	// write owns the lane first, HoldWorker cannot return until that bounded
+	// write finishes. If the hold commits first, the re-read below suppresses
+	// the write. Contexts from composite manager operations may already own this
+	// lane; Gate.Lock treats those as re-entrant.
+	unlock, err := g.gate.Lock(ctx, initial.ProjectID)
+	if err != nil {
+		return SuppressedUnknown, fmt.Errorf("guard %s: acquire project lane: %w", id, err)
+	}
+	defer unlock()
+	rec, ok, err := g.store.GetSession(ctx, id)
+	if err != nil {
+		return SuppressedUnknown, fmt.Errorf("guard %s: re-read session: %w", id, err)
 	}
 	if !ok {
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "not_found")

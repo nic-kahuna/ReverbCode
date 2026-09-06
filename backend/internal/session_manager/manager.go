@@ -103,6 +103,13 @@ type runtimeController interface {
 	IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool, error)
 }
 
+// retainedStopVerifier is intentionally narrower than runtimeController. A
+// runtime opts into the new strict operation only when IsAlive is an external
+// existence probe that can verify Destroy removed the recorded runtime.
+type retainedStopVerifier interface {
+	SupportsVerifiedRetainedStop() bool
+}
+
 // Store is the persistence surface needed by the internal session Manager.
 type Store interface {
 	// GetProject loads a project row so spawn can resolve its per-project agent
@@ -269,11 +276,12 @@ func New(d Deps) *Manager {
 // materialization fails the still-seed row is deleted outright; a later failure
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error) {
-	unlock, err := m.lockAdmission(ctx, cfg.ProjectID)
+	opCtx, unlock, err := m.enterAdmission(ctx, cfg.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, err
 	}
 	defer unlock()
+	ctx = opCtx
 	var project domain.ProjectRecord
 	cfg, project, err = m.resolveSpawnAgentPolicy(ctx, cfg)
 	if err != nil {
@@ -866,6 +874,9 @@ const (
 	// RuntimeTerminationUnknown means the stop could not be proved; callers
 	// must retain the hold and avoid claiming termination.
 	RuntimeTerminationUnknown = "unknown"
+	// RuntimeTerminationUnsupported means the runtime adapter does not expose
+	// a strict external absence probe for this operation. No destroy is tried.
+	RuntimeTerminationUnsupported = "unsupported"
 )
 
 // WorkerHold returns the durable hold state for one worker.
@@ -971,12 +982,37 @@ func (m *Manager) StopWorkerRetainingWorktree(ctx context.Context, id domain.Ses
 	if err != nil {
 		return result, err
 	}
-	rec, ok, err := m.store.GetSession(ctx, id)
+	initial, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return result, fmt.Errorf("stop worker retained %s: %w", id, err)
 	}
 	if !ok {
 		return result, ErrNotFound
+	}
+	// Checkpoint writes share this lane. A checkpoint admitted before stop is
+	// allowed to finish; once this section begins no later write can race the
+	// runtime teardown and terminal lifecycle transition.
+	unlock, err := m.admission.Lock(ctx, initial.ProjectID)
+	if err != nil {
+		return result, fmt.Errorf("stop worker retained %s: acquire project lane: %w", id, err)
+	}
+	laneHeld := true
+	defer func() {
+		if laneHeld {
+			unlock()
+		}
+	}()
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return result, fmt.Errorf("stop worker retained %s: re-read session: %w", id, err)
+	}
+	if !ok {
+		return result, ErrNotFound
+	}
+	verifier, supported := m.runtime.(retainedStopVerifier)
+	if !supported || !verifier.SupportsVerifiedRetainedStop() {
+		result.RuntimeTermination = RuntimeTerminationUnsupported
+		return result, nil
 	}
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID == "" {
@@ -990,6 +1026,12 @@ func (m *Manager) StopWorkerRetainingWorktree(ctx context.Context, id domain.Ses
 		return result, nil //nolint:nilerr // unknown is the explicit operation result, not success confirmation
 	}
 	result.RuntimeTermination = RuntimeTerminationStopped
+	// Release before entering lifecycle's own mutex. A reaction nudge may hold
+	// its dedup mutex while waiting for the project lane; keeping both here
+	// would invert that lock order. The durable hold still suppresses any nudge
+	// that acquires the lane between this probe and MarkTerminated.
+	unlock()
+	laneHeld = false
 	if rec.IsTerminated {
 		return result, nil
 	}
@@ -1110,11 +1152,12 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if !ok {
 		return domain.SessionRecord{}, ErrNotFound
 	}
-	unlock, err := m.lockAdmission(ctx, initial.ProjectID)
+	opCtx, unlock, err := m.enterAdmission(ctx, initial.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, err
 	}
 	defer unlock()
+	ctx = opCtx
 
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
@@ -1610,13 +1653,14 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 		return fmt.Errorf("restore-all: list sessions: %w", err)
 	}
 	for _, rec := range recs {
-		func() {
-			unlock, gateErr := m.lockAdmission(ctx, rec.ProjectID)
+		func(ctx context.Context) {
+			opCtx, unlock, gateErr := m.enterAdmission(ctx, rec.ProjectID)
 			if gateErr != nil {
 				m.logger.Info("restore-all: admission unavailable", "sessionID", rec.ID, "error", gateErr)
 				return
 			}
 			defer unlock()
+			ctx = opCtx
 			fresh, ok, readErr := m.store.GetSession(ctx, rec.ID)
 			if readErr != nil || !ok {
 				m.logger.Warn("restore-all: session read failed", "sessionID", rec.ID, "error", readErr)
@@ -1748,7 +1792,7 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 					m.logger.Warn("restore-all: delete restore marker failed", "sessionID", rec.ID, "error", err)
 				}
 			}
-		}()
+		}(ctx)
 	}
 
 	return nil
@@ -2906,6 +2950,28 @@ func (m *Manager) lockAdmission(ctx context.Context, id domain.ProjectID) (func(
 	}
 	return unlock, nil
 }
+
+// enterAdmission is lockAdmission plus a context marker for nested guarded
+// pane writes in one composite operation. The marker makes Gate.Lock
+// re-entrant only while this exact lane ownership remains active.
+func (m *Manager) enterAdmission(ctx context.Context, id domain.ProjectID) (context.Context, func(), error) {
+	heldCtx, unlock, err := m.admission.Enter(ctx, id)
+	if err != nil {
+		return ctx, nil, err
+	}
+	row, ok, err := m.store.GetProject(heldCtx, string(id))
+	if err == nil && !ok {
+		err = fmt.Errorf("%w: project %s missing", admission.ErrUncertain, id)
+	}
+	if err == nil {
+		err = admission.Check(row)
+	}
+	if err != nil {
+		unlock()
+		return ctx, nil, err
+	}
+	return heldCtx, unlock, nil
+}
 func (m *Manager) reconcileWithAdmission(ctx context.Context, rec domain.SessionRecord, fn func(context.Context, domain.SessionRecord) error) error {
 	unlock, err := m.lockAdmission(ctx, rec.ProjectID)
 	if err != nil {
@@ -2951,10 +3017,10 @@ func (m *Manager) SendAdmitted(ctx context.Context, id domain.SessionID, message
 	if !ok {
 		return ErrNotFound
 	}
-	unlock, err := m.lockAdmission(ctx, rec.ProjectID)
+	opCtx, unlock, err := m.enterAdmission(ctx, rec.ProjectID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	return m.Send(ctx, id, message)
+	return m.Send(opCtx, id, message)
 }

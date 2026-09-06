@@ -263,6 +263,11 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 	return nil
 }
 
+// SupportsVerifiedRetainedStop reports that IsAlive queries tmux itself rather
+// than local adapter bookkeeping, so Destroy followed by an absent probe can
+// support the strict stop-with-worktree-retained operation.
+func (r *Runtime) SupportsVerifiedRetainedStop() bool { return true }
+
 // IsAlive reports whether the handle's session still exists via `tmux
 // has-session`. Exit 0 means alive. A non-zero exit with output indicating the
 // session or server is missing is a definitive false, nil. Any other non-zero

@@ -649,6 +649,10 @@ func (c *commandContext) stopWorkerRetained(ctx context.Context, cmd *cobra.Comm
 		if _, err := fmt.Fprintf(out, "worker %s managed runtime stopped\n", res.SessionID); err != nil {
 			return err
 		}
+	} else if res.RuntimeTermination == "unsupported" {
+		if _, err := fmt.Fprintf(out, "worker %s managed runtime retained stop is unsupported by this runtime; stop is not confirmed\n", res.SessionID); err != nil {
+			return err
+		}
 	} else if _, err := fmt.Fprintf(out, "worker %s managed runtime termination unknown; stop is not confirmed\n", res.SessionID); err != nil {
 		return err
 	}

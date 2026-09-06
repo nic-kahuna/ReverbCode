@@ -1212,7 +1212,7 @@ export interface components {
             heldAt: string;
             reconciliationRequired: boolean;
             /** @enum {string} */
-            runtimeTermination: "stopped" | "unknown";
+            runtimeTermination: "stopped" | "unknown" | "unsupported";
             scope: string;
             sessionId: string;
             worktreeRetained: boolean;

@@ -95,7 +95,7 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/checkpoint":
 			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-1"}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/stop-retained":
-			_, _ = io.WriteString(w, `{"sessionId":"demo-1","held":true,"heldAt":"2026-09-06T02:00:00Z","runtimeTermination":"unknown","worktreeRetained":true,"reconciliationRequired":true,"scope":"named managed runtime only; detached or external jobs are not verified"}`)
+			_, _ = io.WriteString(w, `{"sessionId":"demo-1","held":true,"heldAt":"2026-09-06T02:00:00Z","runtimeTermination":"unsupported","worktreeRetained":true,"reconciliationRequired":true,"scope":"named managed runtime only; detached or external jobs are not verified"}`)
 		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/sessions/demo-1":
 			var req sessionRenameRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -323,7 +323,7 @@ func TestSessionWorkerHoldCheckpointAndRetainedStop(t *testing.T) {
 		{[]string{"session", "hold", "demo-1"}, "worker demo-1 held since 2026-09-06T02:00:00Z"},
 		{[]string{"session", "hold-status", "demo-1"}, "worker demo-1 held since 2026-09-06T02:00:00Z"},
 		{[]string{"session", "checkpoint", "demo-1"}, "checkpoint requested from held worker demo-1"},
-		{[]string{"session", "stop-retained", "demo-1"}, "managed runtime termination unknown; stop is not confirmed"},
+		{[]string{"session", "stop-retained", "demo-1"}, "managed runtime retained stop is unsupported by this runtime; stop is not confirmed"},
 	} {
 		out, errOut, err := executeCLI(t, deps, tc.args...)
 		if err != nil {

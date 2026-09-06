@@ -231,3 +231,40 @@ func TestRequiredAdmissionSendSerializesWithPause(t *testing.T) {
 		t.Fatal("ordinary user send unexpectedly gated")
 	}
 }
+
+func TestWorkerHoldWaitsForAdmittedPaneWrite(t *testing.T) {
+	m, st, _, _ := newManager()
+	worker := mkLive("mer-1")
+	worker.Kind = domain.KindWorker
+	st.sessions[worker.ID] = worker
+	raw := &blockedAdmissionMessenger{entered: make(chan struct{}), release: make(chan struct{})}
+	m.messenger = sessionguard.New(st, raw, nil)
+
+	sent := make(chan error, 1)
+	go func() { sent <- m.Send(ctx, worker.ID, "already admitted") }()
+	<-raw.entered
+	held := make(chan error, 1)
+	go func() {
+		_, err := m.HoldWorker(ctx, worker.ID)
+		held <- err
+	}()
+	select {
+	case err := <-held:
+		t.Fatalf("hold returned before pane write finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(raw.release)
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Send(ctx, worker.ID, "after hold"); !errors.Is(err, ErrWorkerHeld) {
+		t.Fatalf("post-hold send error = %v, want ErrWorkerHeld", err)
+	}
+	if raw.calls != 1 {
+		t.Fatalf("pane writes = %d, want 1", raw.calls)
+	}
+}

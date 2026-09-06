@@ -62,6 +62,13 @@ func TestNewDefaultsToPortableShell(t *testing.T) {
 	}
 }
 
+func TestRuntimeSupportsVerifiedRetainedStop(t *testing.T) {
+	r, _ := newTestRuntime(1024)
+	if !r.SupportsVerifiedRetainedStop() {
+		t.Fatal("tmux must opt into verified retained stop")
+	}
+}
+
 func TestNewPicksUpShellFromEnv(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	r := New(Options{})

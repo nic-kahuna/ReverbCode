@@ -3284,6 +3284,7 @@ components:
           enum:
           - stopped
           - unknown
+          - unsupported
           type: string
         scope:
           type: string

@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
@@ -30,6 +32,68 @@ func (s *fakeStore) GetSession(_ context.Context, _ domain.SessionID) (domain.Se
 type fakeMessenger struct {
 	sent []string
 	err  error
+}
+
+type barrierStore struct {
+	mu   sync.RWMutex
+	rec  domain.SessionRecord
+	hold domain.WorkerSchedulingHold
+	held bool
+	gate *admission.Gate
+}
+
+func newBarrierStore() *barrierStore {
+	return &barrierStore{
+		rec:  domain.SessionRecord{ID: "s1", ProjectID: "p1", Activity: domain.Activity{State: domain.ActivityActive}},
+		gate: admission.New(),
+	}
+}
+
+func (s *barrierStore) AdmissionGate() *admission.Gate { return s.gate }
+
+func (s *barrierStore) GetSession(_ context.Context, _ domain.SessionID) (domain.SessionRecord, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rec, true, nil
+}
+
+func (s *barrierStore) GetWorkerSchedulingHold(_ context.Context, _ domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hold, s.held, nil
+}
+
+func (s *barrierStore) setHeld() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hold = domain.WorkerSchedulingHold{SessionID: s.rec.ID, HeldAt: time.Now()}
+	s.held = true
+}
+
+type blockingMessenger struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	sent    int
+}
+
+func (m *blockingMessenger) Send(ctx context.Context, _ domain.SessionID, _ string) error {
+	close(m.entered)
+	select {
+	case <-m.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	m.mu.Lock()
+	m.sent++
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *blockingMessenger) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sent
 }
 
 func (m *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) error {
@@ -215,5 +279,80 @@ func TestGuard_MessengerErrorIsSentPlusError(t *testing.T) {
 	}
 	if got != Sent {
 		t.Errorf("outcome = %v, want Sent (the write was attempted)", got)
+	}
+}
+
+func TestGuard_HoldCommitCannotOvertakeAdmittedPaneWrite(t *testing.T) {
+	store := newBarrierStore()
+	messenger := &blockingMessenger{entered: make(chan struct{}), release: make(chan struct{})}
+	guard := New(store, messenger, nil)
+	delivered := make(chan struct{})
+	go func() {
+		defer close(delivered)
+		outcome, err := guard.Deliver(context.Background(), "s1", "before hold")
+		if err != nil || outcome != Sent {
+			t.Errorf("delivery outcome = %v, err=%v; want Sent, nil", outcome, err)
+		}
+	}()
+	<-messenger.entered
+
+	holdStarted := make(chan struct{})
+	holdCommitted := make(chan struct{})
+	go func() {
+		defer close(holdCommitted)
+		close(holdStarted)
+		unlock, err := store.gate.Lock(context.Background(), "p1")
+		if err != nil {
+			t.Errorf("acquire hold lane: %v", err)
+			return
+		}
+		defer unlock()
+		store.setHeld()
+	}()
+	<-holdStarted
+	select {
+	case <-holdCommitted:
+		t.Fatal("hold committed before the admitted pane write finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(messenger.release)
+	<-delivered
+	<-holdCommitted
+	if got := messenger.count(); got != 1 {
+		t.Fatalf("messenger sends = %d, want 1", got)
+	}
+	outcome, err := guard.Deliver(context.Background(), "s1", "after hold")
+	if err != nil || outcome != SuppressedHeld {
+		t.Fatalf("post-hold delivery outcome = %v, err=%v; want SuppressedHeld, nil", outcome, err)
+	}
+	if got := messenger.count(); got != 1 {
+		t.Fatalf("post-hold messenger sends = %d, want 1", got)
+	}
+}
+
+func TestGuard_WaitingPaneWriteObservesCommittedHold(t *testing.T) {
+	store := newBarrierStore()
+	messenger := &fakeMessenger{}
+	guard := New(store, messenger, nil)
+	unlock, err := store.gate.Lock(context.Background(), "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var outcome Outcome
+	var sendErr error
+	go func() {
+		defer close(done)
+		outcome, sendErr = guard.Deliver(context.Background(), "s1", "racing hold")
+	}()
+	store.setHeld()
+	unlock()
+	<-done
+	if sendErr != nil || outcome != SuppressedHeld {
+		t.Fatalf("delivery outcome = %v, err=%v; want SuppressedHeld, nil", outcome, sendErr)
+	}
+	if len(messenger.sent) != 0 {
+		t.Fatalf("messenger sends = %d, want 0", len(messenger.sent))
 	}
 }

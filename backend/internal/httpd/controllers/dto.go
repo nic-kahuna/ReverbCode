@@ -230,12 +230,12 @@ type WorkerCheckpointResponse struct {
 }
 
 // StopWorkerRetainedResponse distinguishes a verified stopped runtime from an
-// unknown termination result while stating the preservation boundary.
+// unknown or adapter-unsupported result while stating the preservation boundary.
 type StopWorkerRetainedResponse struct {
 	SessionID              domain.SessionID `json:"sessionId"`
 	Held                   bool             `json:"held"`
 	HeldAt                 time.Time        `json:"heldAt"`
-	RuntimeTermination     string           `json:"runtimeTermination" enum:"stopped,unknown"`
+	RuntimeTermination     string           `json:"runtimeTermination" enum:"stopped,unknown,unsupported"`
 	WorktreeRetained       bool             `json:"worktreeRetained"`
 	ReconciliationRequired bool             `json:"reconciliationRequired"`
 	Scope                  string           `json:"scope"`
