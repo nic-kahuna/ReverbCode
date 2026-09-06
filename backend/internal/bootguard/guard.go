@@ -18,10 +18,10 @@ import (
 const (
 	MarkerSchema = "ao-data-compatibility/v1"
 	MarkerName   = "compatibility.json"
-	// Protocol 2 means durable worker scheduling holds may exist. Binaries that
-	// only understand protocol 1 must refuse the data directory rather than
-	// restore or write to a worker whose hold they cannot observe.
-	SupportedProtocol = 2
+	// Protocol 2 means durable worker scheduling holds may exist. Protocol 3
+	// means desktop-projects scoped worker admission may be enabled. Older
+	// binaries must refuse state carrying a safety control they cannot enforce.
+	SupportedProtocol = 3
 )
 
 // Stable errors allow offline tooling to distinguish refusal from uncertainty.
@@ -182,6 +182,17 @@ func (g *Guard) DataDir() string {
 // state is written. Errors, including fsync uncertainty, forbid that later write.
 // Raising requires a binary that actually understands the requested protocol.
 func (g *Guard) Ratchet(required int) error {
+	return g.ratchet(required, false)
+}
+
+// RatchetMinimum durably re-publishes at least required. Unlike Ratchet, a
+// higher current floor is not a downgrade error: it is re-written and fsynced
+// so a later lower-floor feature write never relies on a prior uncertain fsync.
+func (g *Guard) RatchetMinimum(required int) error {
+	return g.ratchet(required, true)
+}
+
+func (g *Guard) ratchet(required int, minimum bool) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.lock == nil {
@@ -197,12 +208,14 @@ func (g *Guard) Ratchet(required int) error {
 	if m.RequiredProtocol > g.supported || required > g.supported {
 		return ErrUnsupported
 	}
-	if required < m.RequiredProtocol {
+	if required < m.RequiredProtocol && !minimum {
 		return ErrDowngrade
 	}
 	// Re-publish even on an equal requirement so retrying a prior uncertain
 	// fsync must establish durability before it can authorize a later write.
-	m.RequiredProtocol = required
+	if required > m.RequiredProtocol {
+		m.RequiredProtocol = required
+	}
 	return write(g.lock.DataDir(), m)
 }
 

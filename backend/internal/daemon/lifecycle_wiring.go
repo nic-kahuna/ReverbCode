@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/admissioncapacity"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/activitydispatch"
 	agentregistry "github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/registry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reviewer"
@@ -108,6 +109,7 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 		Policy:    policy,
 		Workspace: ws,
 		Store:     store,
+		Admitter:  admissioncapacity.New(cfg.DataDir),
 		Messenger: messenger,
 		Lifecycle: lcm,
 		DataDir:   cfg.DataDir,

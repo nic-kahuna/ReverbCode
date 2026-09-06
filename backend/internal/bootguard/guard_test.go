@@ -26,7 +26,7 @@ func TestGuardRejectsInvalidEvidenceWithoutChangingBytes(t *testing.T) {
 		name, data string
 		want       error
 	}{
-		{"future", string(encode(Marker{MarkerSchema, 3})), ErrUnsupported},
+		{"future", string(encode(Marker{MarkerSchema, 4})), ErrUnsupported},
 		{"zero", `{"schema":"ao-data-compatibility/v1","requiredProtocol":0}` + "\n", ErrMalformed},
 		{"bool", `{"schema":"ao-data-compatibility/v1","requiredProtocol":true}` + "\n", ErrMalformed},
 		{"duplicate", `{"schema":"ao-data-compatibility/v1","requiredProtocol":2,"requiredProtocol":1}` + "\n", ErrMalformed},
@@ -86,6 +86,25 @@ func TestGuardRatchetIsMonotonicAndRequiresLiveOwnership(t *testing.T) {
 	}
 	if g, err := open(dir, 1); g != nil || !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("older supported build accepted newer state: %v,%v", g, err)
+	}
+}
+
+func TestGuardRatchetMinimumRepublishesHigherFloor(t *testing.T) {
+	dir := t.TempDir()
+	g, err := open(dir, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = g.Close() }()
+	if err := g.Ratchet(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.RatchetMinimum(2); err != nil {
+		t.Fatalf("minimum ratchet: %v", err)
+	}
+	marker, exists, err := read(dir)
+	if err != nil || !exists || marker.RequiredProtocol != 3 {
+		t.Fatalf("marker = %+v exists=%v err=%v", marker, exists, err)
 	}
 }
 

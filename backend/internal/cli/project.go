@@ -104,17 +104,18 @@ type reviewerConfig struct {
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
 type projectConfig struct {
-	AdmissionPaused *bool               `json:"admissionPaused,omitempty"`
-	DefaultBranch   string              `json:"defaultBranch,omitempty"`
-	SessionPrefix   string              `json:"sessionPrefix,omitempty"`
-	Env             map[string]string   `json:"env,omitempty"`
-	Symlinks        []string            `json:"symlinks,omitempty"`
-	PostCreate      []string            `json:"postCreate,omitempty"`
-	AgentConfig     agentConfig         `json:"agentConfig,omitempty"`
-	Worker          roleOverride        `json:"worker,omitempty"`
-	Orchestrator    roleOverride        `json:"orchestrator,omitempty"`
-	Reviewers       []reviewerConfig    `json:"reviewers,omitempty"`
-	TrackerIntake   trackerIntakeConfig `json:"trackerIntake,omitempty"`
+	AdmissionPaused          *bool               `json:"admissionPaused,omitempty"`
+	DesktopProjectsAdmission *bool               `json:"desktopProjectsAdmission,omitempty"`
+	DefaultBranch            string              `json:"defaultBranch,omitempty"`
+	SessionPrefix            string              `json:"sessionPrefix,omitempty"`
+	Env                      map[string]string   `json:"env,omitempty"`
+	Symlinks                 []string            `json:"symlinks,omitempty"`
+	PostCreate               []string            `json:"postCreate,omitempty"`
+	AgentConfig              agentConfig         `json:"agentConfig,omitempty"`
+	Worker                   roleOverride        `json:"worker,omitempty"`
+	Orchestrator             roleOverride        `json:"orchestrator,omitempty"`
+	Reviewers                []reviewerConfig    `json:"reviewers,omitempty"`
+	TrackerIntake            trackerIntakeConfig `json:"trackerIntake,omitempty"`
 }
 
 // setConfigRequest mirrors the daemon's SetConfigInput body for
@@ -410,6 +411,9 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 		}
 		if value, ok := fields["admissionPaused"]; ok && string(value) == "null" {
 			return projectConfig{}, usageError{errors.New("--config-json admissionPaused must be a boolean")}
+		}
+		if value, ok := fields["desktopProjectsAdmission"]; ok && string(value) == "null" {
+			return projectConfig{}, usageError{errors.New("--config-json desktopProjectsAdmission must be a boolean")}
 		}
 		var cfg projectConfig
 		if err := json.Unmarshal([]byte(opts.configJSON), &cfg); err != nil {

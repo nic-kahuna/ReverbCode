@@ -2647,6 +2647,8 @@ components:
           $ref: '#/components/schemas/AgentConfig'
         defaultBranch:
           type: string
+        desktopProjectsAdmission:
+          type: boolean
         env:
           additionalProperties:
             type: string

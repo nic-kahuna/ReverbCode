@@ -25,8 +25,24 @@ func newManager(t *testing.T) project.Manager {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	store.AttachCompatibilityRatchet(testCompatibilityRatchet{})
 	t.Cleanup(func() { _ = store.Close() })
 	return project.New(store)
+}
+
+type testCompatibilityRatchet struct{}
+
+func (testCompatibilityRatchet) RatchetMinimum(int) error { return nil }
+
+type ratchetProjectStore struct {
+	*sqlite.Store
+	calls []int
+	err   error
+}
+
+func (s *ratchetProjectStore) RatchetCompatibility(required int) error {
+	s.calls = append(s.calls, required)
+	return s.err
 }
 
 // gitRepo creates a real git repository in a fresh temp dir and returns its
@@ -442,6 +458,72 @@ func TestManager_SetConfig(t *testing.T) {
 	// Setting on an unknown project is a clean not-found.
 	_, err = m.SetConfig(ctx, "ghost", project.SetConfigInput{Config: cfg})
 	wantCode(t, err, "PROJECT_NOT_FOUND")
+}
+
+func TestManager_SetConfigPreservesDesktopProjectsAdmissionWhenOmitted(t *testing.T) {
+	ctx := context.Background()
+	m := newManager(t)
+	repo := gitRepo(t)
+
+	enabled := domain.ProjectConfig{
+		DesktopProjectsAdmission:    true,
+		DesktopProjectsAdmissionSet: true,
+		DefaultBranch:               "main",
+	}
+	if _, err := m.Add(ctx, project.AddInput{Path: repo, ProjectID: ptr("ao"), Config: &enabled}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	updated, err := m.SetConfig(ctx, "ao", project.SetConfigInput{Config: domain.ProjectConfig{DefaultBranch: "develop"}})
+	if err != nil {
+		t.Fatalf("SetConfig omitted setting: %v", err)
+	}
+	if updated.Config == nil || !updated.Config.DesktopProjectsAdmission {
+		t.Fatalf("omitted setting disabled admission: %#v", updated.Config)
+	}
+
+	disabled, err := m.SetConfig(ctx, "ao", project.SetConfigInput{Config: domain.ProjectConfig{
+		DesktopProjectsAdmissionSet: true,
+		DefaultBranch:               "develop",
+	}})
+	if err != nil {
+		t.Fatalf("SetConfig explicit false: %v", err)
+	}
+	if disabled.Config == nil || disabled.Config.DesktopProjectsAdmission {
+		t.Fatalf("explicit false was not persisted: %#v", disabled.Config)
+	}
+}
+
+func TestManager_SetConfigRatchetsBeforeEnablingDesktopProjectsAdmission(t *testing.T) {
+	ctx := context.Background()
+	base, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	store := &ratchetProjectStore{Store: base}
+	m := project.New(store)
+	repo := gitRepo(t)
+	if _, err := m.Add(ctx, project.AddInput{Path: repo, ProjectID: ptr("ao")}); err != nil {
+		t.Fatal(err)
+	}
+
+	store.err = errors.New("ratchet unavailable")
+	_, err = m.SetConfig(ctx, "ao", project.SetConfigInput{Config: domain.ProjectConfig{
+		DesktopProjectsAdmission:    true,
+		DesktopProjectsAdmissionSet: true,
+	}})
+	wantCode(t, err, "PROJECT_CONFIG_COMPATIBILITY_FAILED")
+	got, getErr := m.Get(ctx, "ao")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if got.Project.Config != nil && got.Project.Config.DesktopProjectsAdmission {
+		t.Fatal("failed ratchet persisted enabled config")
+	}
+	if len(store.calls) != 1 || store.calls[0] != 3 {
+		t.Fatalf("ratchet calls = %v", store.calls)
+	}
 }
 
 func TestManager_ListIncludesOnlySummarySafeProjectConfig(t *testing.T) {

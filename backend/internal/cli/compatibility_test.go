@@ -31,7 +31,7 @@ func TestCompatibilityCommandIsReadOnlyAndTyped(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.Schema != "ao-compatibility/v1" || status.State != "missing_legacy" || !status.InspectionOnly || !status.StartPausedSupported || status.SupportedProtocol != 2 {
+	if status.Schema != "ao-compatibility/v1" || status.State != "missing_legacy" || !status.InspectionOnly || !status.StartPausedSupported || status.SupportedProtocol != 3 {
 		t.Fatalf("wire %s", out)
 	}
 	if _, err := os.Stat(cfg.DataDir); !errors.Is(err, os.ErrNotExist) {
@@ -40,7 +40,7 @@ func TestCompatibilityCommandIsReadOnlyAndTyped(t *testing.T) {
 	if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
 		t.Fatal(err)
 	}
-	future := []byte("{\"schema\":\"ao-data-compatibility/v1\",\"requiredProtocol\":3}\n")
+	future := []byte("{\"schema\":\"ao-data-compatibility/v1\",\"requiredProtocol\":4}\n")
 	if err := os.WriteFile(filepath.Join(cfg.DataDir, bootguard.MarkerName), future, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestCompatibilityCommandIsReadOnlyAndTyped(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.State != "unsupported" || status.RequiredProtocol != 3 {
+	if status.State != "unsupported" || status.RequiredProtocol != 4 {
 		t.Fatalf("future wire %s", out)
 	}
 }

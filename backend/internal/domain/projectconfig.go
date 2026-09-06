@@ -23,6 +23,12 @@ type ProjectConfig struct {
 	AdmissionPaused bool `json:"admissionPaused,omitempty"`
 	// AdmissionPausedSet records explicit JSON presence for config replacement.
 	AdmissionPausedSet bool `json:"-"`
+	// DesktopProjectsAdmission requires native workers to acquire or verify
+	// scoped ownership through the installed desktop-projects capacity helper.
+	DesktopProjectsAdmission bool `json:"desktopProjectsAdmission,omitempty"`
+	// DesktopProjectsAdmissionSet records explicit JSON presence for config
+	// replacement so older writers cannot implicitly disable the safety gate.
+	DesktopProjectsAdmissionSet bool `json:"-"`
 	// DefaultBranch is the base branch new session worktrees are created from.
 	DefaultBranch string `json:"defaultBranch,omitempty"`
 	// SessionPrefix overrides the displayed session-id prefix.
@@ -111,6 +117,7 @@ func (c ProjectConfig) WithDefaults() ProjectConfig {
 // SQL NULL and resolution can skip an empty config.
 func (c ProjectConfig) IsZero() bool {
 	c.AdmissionPausedSet = false
+	c.DesktopProjectsAdmissionSet = false
 	return reflect.DeepEqual(c, ProjectConfig{})
 }
 
@@ -214,6 +221,12 @@ func (c *ProjectConfig) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("admissionPaused must be a boolean")
 		}
 		value.AdmissionPausedSet = true
+	}
+	if raw, ok := fields["desktopProjectsAdmission"]; ok {
+		if string(bytes.TrimSpace(raw)) == "null" {
+			return fmt.Errorf("desktopProjectsAdmission must be a boolean")
+		}
+		value.DesktopProjectsAdmissionSet = true
 	}
 	*c = ProjectConfig(value)
 	return nil

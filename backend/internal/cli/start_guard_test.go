@@ -67,7 +67,7 @@ func TestStartRefusalBeforeAnyOpenOrFetch(t *testing.T) {
 		name, marker, data string
 		managed            bool
 	}{
-		{name: "future", marker: "{\"schema\":\"ao-data-compatibility/v1\",\"requiredProtocol\":3}\n", managed: true},
+		{name: "future", marker: "{\"schema\":\"ao-data-compatibility/v1\",\"requiredProtocol\":4}\n", managed: true},
 		{name: "malformed", marker: "{}", managed: true},
 		{name: "legacy database", data: "ao.db"},
 		{name: "other durable entry", data: "ao.lock"},

@@ -973,6 +973,7 @@ export interface components {
             admissionPaused?: boolean;
             agentConfig?: components["schemas"]["AgentConfig"];
             defaultBranch?: string;
+            desktopProjectsAdmission?: boolean;
             env?: {
                 [key: string]: string;
             };

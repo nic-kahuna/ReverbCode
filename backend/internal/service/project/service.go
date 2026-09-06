@@ -20,6 +20,8 @@ import (
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
+const desktopProjectsAdmissionProtocol = 3
+
 // Manager is the controller-facing contract for the /api/v1/projects surface.
 type Manager interface {
 	GetAdmission(ctx context.Context, id domain.ProjectID) (AdmissionState, error)
@@ -233,6 +235,9 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 		}
 		row.Kind = domain.ProjectKindWorkspace
 		row.RepoOriginURL = resolveGitOriginURL(path)
+		if err := m.ratchetDesktopProjectsAdmission(row.Config); err != nil {
+			return Project{}, err
+		}
 		if err := m.store.UpsertWorkspaceProject(ctx, row, repos); err != nil {
 			return Project{}, apierr.Internal("PROJECT_ADD_FAILED", "Failed to register workspace project")
 		}
@@ -261,6 +266,9 @@ func (m *Service) Add(ctx context.Context, in AddInput) (Project, error) {
 		}
 	}
 	row.RepoOriginURL = resolveGitOriginURL(path)
+	if err := m.ratchetDesktopProjectsAdmission(row.Config); err != nil {
+		return Project{}, err
+	}
 	if err := m.store.UpsertProject(ctx, row); err != nil {
 		return Project{}, apierr.Internal("PROJECT_ADD_FAILED", "Failed to register project")
 	}
@@ -552,12 +560,32 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 		}
 		in.Config.AdmissionPaused = row.Config.AdmissionPaused
 	}
+	if !in.Config.DesktopProjectsAdmissionSet && !in.Config.DesktopProjectsAdmission {
+		if row.ConfigDecodeError != "" {
+			return Project{}, apierr.Conflict("PROJECT_ADMISSION_UNKNOWN", "Config repair requires explicit desktopProjectsAdmission", nil)
+		}
+		in.Config.DesktopProjectsAdmission = row.Config.DesktopProjectsAdmission
+	}
 	in.Config.AdmissionPausedSet = false
+	in.Config.DesktopProjectsAdmissionSet = false
 	row.Config = in.Config
+	if err := m.ratchetDesktopProjectsAdmission(row.Config); err != nil {
+		return Project{}, err
+	}
 	if err := m.store.UpsertProject(ctx, row); err != nil {
 		return Project{}, apierr.Internal("PROJECT_CONFIG_UPDATE_FAILED", "Failed to update project config")
 	}
 	return m.projectFromRow(row), nil
+}
+
+func (m *Service) ratchetDesktopProjectsAdmission(cfg domain.ProjectConfig) error {
+	if !cfg.DesktopProjectsAdmission {
+		return nil
+	}
+	if err := m.store.RatchetCompatibility(desktopProjectsAdmissionProtocol); err != nil {
+		return apierr.Internal("PROJECT_CONFIG_COMPATIBILITY_FAILED", "Failed to establish project config compatibility")
+	}
+	return nil
 }
 
 // resolveGitOriginURL returns the project's `origin` remote URL via

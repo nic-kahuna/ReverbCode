@@ -71,6 +71,9 @@ var (
 	// ErrCheckpointRequiresHold prevents the typed checkpoint path from
 	// becoming a general send bypass.
 	ErrCheckpointRequiresHold = errors.New("session: checkpoint requires an active worker hold")
+	// ErrWorkerAdmission means an enabled managed worker could not prove its
+	// exact scoped owner and route before workspace or runtime effects.
+	ErrWorkerAdmission = errors.New("session: scoped worker admission failed")
 )
 
 // Env vars a spawned process reads to learn who it is.
@@ -153,6 +156,7 @@ type Manager struct {
 	policy    domain.AgentPolicy
 	workspace ports.Workspace
 	store     Store
+	admitter  ports.WorkerAdmitter
 	// messenger is a sessionguard.Guard wrapping the raw messenger, so every
 	// pane write is guarded (re-read state, refuse a blocked session) without
 	// each call site re-deriving the check. Send/confirmActive use Deliver for
@@ -209,6 +213,7 @@ type Deps struct {
 	Policy    domain.AgentPolicy
 	Workspace ports.Workspace
 	Store     Store
+	Admitter  ports.WorkerAdmitter
 	Messenger ports.AgentMessenger
 	Lifecycle lifecycleRecorder
 	// DataDir is exported to spawned agents as AO_DATA_DIR so their hook
@@ -238,6 +243,7 @@ func New(d Deps) *Manager {
 		policy:     d.Policy,
 		workspace:  d.Workspace,
 		store:      d.Store,
+		admitter:   d.Admitter,
 		lcm:        d.Lifecycle,
 		dataDir:    d.DataDir,
 		clock:      d.Clock,
@@ -333,6 +339,19 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: create: %w", err)
 	}
 	id := rec.ID
+	scopedAdmission := false
+	if project.Config.DesktopProjectsAdmission && cfg.Kind == domain.KindWorker {
+		admitted, admitErr := m.admitManagedWorker(ctx, project, rec, ports.WorkerAdmissionSpawn)
+		if admitErr != nil {
+			// The helper may have committed before an acknowledgment was lost.
+			// Retain the exact seed identity for replay/reconciliation; never infer
+			// release authority from the absence of workspace or runtime state.
+			m.markSpawnFailedTerminated(ctx, id)
+			return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, admitErr)
+		}
+		scopedAdmission = true
+		prompt = admitted.IssueBody
+	}
 
 	branch := cfg.Branch
 	if branch == "" {
@@ -343,7 +362,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		// Nothing observable exists yet — no worktree, no runtime — so the seed
 		// row is deleted outright instead of accumulating as a terminated orphan
 		// in session lists (e.g. when gitworktree refuses the branch).
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: workspace: %w", id, err)
 	}
 
@@ -351,13 +370,13 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// post-create commands (e.g. `pnpm install`) before the agent launches.
 	if err := m.provisionWorkspace(ctx, project, ws.Path); err != nil {
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: provision: %w", id, err)
 	}
 
 	if err := m.prepareWorkspace(ctx, agent, id, ws.Path, systemPrompt, agentConfig); err != nil {
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
 	}
 	launchCfg := ports.LaunchConfig{
@@ -374,7 +393,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	delivery, err := agent.GetPromptDeliveryStrategy(ctx, launchCfg)
 	if err != nil {
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: prompt delivery: %w", id, err)
 	}
 	if delivery == ports.PromptDeliveryAfterStart {
@@ -383,7 +402,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	argv, err := agent.GetLaunchCommand(ctx, launchCfg)
 	if err != nil {
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: launch command: %w", id, err)
 	}
 	// Pre-flight: confirm argv[0] actually exists on PATH (or as an absolute
@@ -392,7 +411,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// unresolved binary would leak through as a "live" session that never ran.
 	if err := m.validateAgentBinary(argv); err != nil {
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
 	}
 	runtimeCfg := ports.RuntimeConfig{
@@ -404,7 +423,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	expectedHandle, err := m.runtime.HandleFor(runtimeCfg)
 	if err != nil {
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime handle: %w", id, err)
 	}
 	metadata := domain.SessionMetadata{Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: expectedHandle.ID, Prompt: prompt}
@@ -419,7 +438,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime: %w", id, failure)
 		}
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
+		m.finishFailedSpawnSeed(ctx, id, scopedAdmission)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime: %w", id, err)
 	}
 	if handle.ID != expectedHandle.ID {
@@ -757,6 +776,38 @@ func (m *Manager) rollbackSpawnSeedRow(ctx context.Context, id domain.SessionID)
 		return
 	}
 	m.markSpawnFailedTerminated(ctx, id)
+}
+
+func (m *Manager) finishFailedSpawnSeed(ctx context.Context, id domain.SessionID, scopedAdmission bool) {
+	if scopedAdmission {
+		m.markSpawnFailedTerminated(ctx, id)
+		return
+	}
+	m.rollbackSpawnSeedRow(ctx, id)
+}
+
+func (m *Manager) admitManagedWorker(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord, operation ports.WorkerAdmissionOperation) (ports.WorkerAdmissionResult, error) {
+	if !project.Config.DesktopProjectsAdmission || rec.Kind != domain.KindWorker {
+		return ports.WorkerAdmissionResult{}, nil
+	}
+	if m.admitter == nil {
+		return ports.WorkerAdmissionResult{}, fmt.Errorf("%w: admission helper is unavailable", ErrWorkerAdmission)
+	}
+	if rec.Metadata.RequestedRoute == nil {
+		return ports.WorkerAdmissionResult{}, fmt.Errorf("%w: complete requested route is required", ErrWorkerAdmission)
+	}
+	result, err := m.admitter.AdmitWorker(ctx, ports.WorkerAdmissionRequest{
+		ProjectID:  rec.ProjectID,
+		Repository: project.RepoOriginURL,
+		SessionID:  rec.ID,
+		IssueID:    rec.IssueID,
+		Operation:  operation,
+		Route:      *rec.Metadata.RequestedRoute,
+	})
+	if err != nil {
+		return ports.WorkerAdmissionResult{}, fmt.Errorf("%w: %v", ErrWorkerAdmission, err)
+	}
+	return result, nil
 }
 
 // rollbackSpawn deletes a session row when it is still in seed state — used
@@ -1194,6 +1245,11 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	project, err := m.loadProject(ctx, rec.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
+	}
+	if admitted, admitErr := m.admitManagedWorker(ctx, project, rec, ports.WorkerAdmissionRestore); admitErr != nil {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, admitErr)
+	} else if project.Config.DesktopProjectsAdmission && rec.Kind == domain.KindWorker && admitted.IssueBody != rec.Metadata.Prompt {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: admitted issue body differs from persisted launch", id, ErrWorkerAdmission)
 	}
 	ws, err := m.restoreSessionWorkspace(ctx, project, rec)
 	if err != nil {
@@ -1702,6 +1758,13 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 			project, err := m.loadProject(ctx, rec.ProjectID)
 			if err != nil {
 				m.logger.Error("restore-all: load project failed", "sessionID", rec.ID, "error", err)
+				return
+			}
+			if admitted, admitErr := m.admitManagedWorker(ctx, project, rec, ports.WorkerAdmissionRestore); admitErr != nil {
+				m.logger.Error("restore-all: scoped worker admission failed; preserving session", "sessionID", rec.ID, "error", admitErr)
+				return
+			} else if project.Config.DesktopProjectsAdmission && rec.Kind == domain.KindWorker && admitted.IssueBody != rec.Metadata.Prompt {
+				m.logger.Error("restore-all: scoped worker admission identity changed; preserving session", "sessionID", rec.ID)
 				return
 			}
 			var ws ports.WorkspaceInfo

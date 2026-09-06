@@ -19,7 +19,7 @@ type recordingRatchet struct {
 	err   error
 }
 
-func (r *recordingRatchet) Ratchet(required int) error {
+func (r *recordingRatchet) RatchetMinimum(required int) error {
 	r.calls = append(r.calls, required)
 	return r.err
 }
@@ -40,6 +40,21 @@ func seedProject(t *testing.T, s *sqlite.Store, id string) {
 		ID: id, Path: "/tmp/" + id, RegisteredAt: time.Now().UTC().Truncate(time.Second),
 	}); err != nil {
 		t.Fatalf("seed project %s: %v", id, err)
+	}
+}
+
+func TestRatchetCompatibilityReconfirmsLowerMinimum(t *testing.T) {
+	s := newTestStore(t)
+	ratchet := &recordingRatchet{}
+	s.AttachCompatibilityRatchet(ratchet)
+	if err := s.RatchetCompatibility(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RatchetCompatibility(2); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ratchet.calls, []int{3, 2}) {
+		t.Fatalf("minimum ratchet calls = %v", ratchet.calls)
 	}
 }
 

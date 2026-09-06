@@ -59,6 +59,134 @@ type heldRuntime struct {
 	release chan struct{}
 }
 
+type fakeWorkerAdmitter struct {
+	calls  []ports.WorkerAdmissionRequest
+	result ports.WorkerAdmissionResult
+	err    error
+}
+
+func (a *fakeWorkerAdmitter) AdmitWorker(_ context.Context, req ports.WorkerAdmissionRequest) (ports.WorkerAdmissionResult, error) {
+	a.calls = append(a.calls, req)
+	return a.result, a.err
+}
+
+func managedWorkerProject(st *fakeStore) domain.AgentRoute {
+	project := st.projects["mer"]
+	project.RepoOriginURL = "https://github.com/owner/repo.git"
+	project.Config.DesktopProjectsAdmission = true
+	st.projects["mer"] = project
+	return domain.AgentRoute{Harness: domain.HarnessClaudeCode, Model: "claude-test", ReasoningEffort: domain.ReasoningEffortMedium}
+}
+
+func TestScopedWorkerAdmissionGuardsSpawnBeforeWorkspaceEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		admitErr    error
+		wantSuccess bool
+	}{
+		{name: "accepted", wantSuccess: true},
+		{name: "refused", admitErr: errors.New("scope conflict")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			route := managedWorkerProject(st)
+			admitter := &fakeWorkerAdmitter{result: ports.WorkerAdmissionResult{IssueBody: "authoritative body"}, err: tc.admitErr}
+			m.admitter = admitter
+			got, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", IssueID: "github:owner/repo#18", Kind: domain.KindWorker, Route: &route, Prompt: "stale body"})
+			if tc.wantSuccess {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Metadata.Prompt != "authoritative body" || rt.created != 1 || ws.lastCfg.SessionID != got.ID {
+					t.Fatalf("spawn = %#v runtime=%d workspace=%#v", got, rt.created, ws.lastCfg)
+				}
+			} else {
+				if !errors.Is(err, ErrWorkerAdmission) {
+					t.Fatalf("error = %v", err)
+				}
+				if rt.created != 0 || ws.lastCfg.SessionID != "" {
+					t.Fatalf("refused admission reached worker effects: runtime=%d workspace=%#v", rt.created, ws.lastCfg)
+				}
+				seed := st.sessions["mer-1"]
+				if !seed.IsTerminated {
+					t.Fatalf("uncertain reservation seed was not retained terminal: %#v", seed)
+				}
+			}
+			if len(admitter.calls) != 1 {
+				t.Fatalf("admission calls = %d", len(admitter.calls))
+			}
+			req := admitter.calls[0]
+			if req.ProjectID != "mer" || req.Repository != "https://github.com/owner/repo.git" || req.SessionID != "mer-1" || req.IssueID != "github:owner/repo#18" || req.Operation != ports.WorkerAdmissionSpawn || req.Route != route {
+				t.Fatalf("admission request = %#v", req)
+			}
+		})
+	}
+}
+
+func TestScopedWorkerAdmissionOptOutAndControllerCompatibility(t *testing.T) {
+	for _, kind := range []domain.SessionKind{domain.KindWorker, domain.KindOrchestrator} {
+		m, st, rt, _ := newManager()
+		if kind == domain.KindOrchestrator {
+			managedWorkerProject(st)
+		}
+		admitter := &fakeWorkerAdmitter{err: errors.New("must not be called")}
+		m.admitter = admitter
+		if _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: kind}); err != nil {
+			t.Fatalf("kind %s: %v", kind, err)
+		}
+		if len(admitter.calls) != 0 || rt.created != 1 {
+			t.Fatalf("kind %s calls=%d runtime=%d", kind, len(admitter.calls), rt.created)
+		}
+	}
+}
+
+func TestScopedWorkerAdmissionGuardsRestorePathsBeforeWorkspaceEffects(t *testing.T) {
+	for _, op := range []string{"restore", "restore-all"} {
+		t.Run(op, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			route := managedWorkerProject(st)
+			admitter := &fakeWorkerAdmitter{err: errors.New("existing owner mismatch")}
+			m.admitter = admitter
+			rec := domain.SessionRecord{
+				ID: "mer-1", ProjectID: "mer", IssueID: "github:owner/repo#18", Kind: domain.KindWorker,
+				Harness: domain.HarnessClaudeCode, IsTerminated: true,
+				Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", Prompt: "authoritative body", RequestedRoute: &route, LaunchRoute: &domain.AgentLaunchRoute{Harness: route.Harness, Model: route.Model, ReasoningEffort: route.ReasoningEffort}},
+			}
+			st.sessions[rec.ID] = rec
+			if op == "restore-all" {
+				st.worktrees[rec.ID] = []domain.SessionWorktreeRecord{{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, WorktreePath: rec.Metadata.WorkspacePath, Branch: rec.Metadata.Branch, State: "removed"}}
+				if err := m.RestoreAll(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := m.Restore(ctx, rec.ID); !errors.Is(err, ErrWorkerAdmission) {
+				t.Fatalf("error = %v", err)
+			}
+			if len(admitter.calls) != 1 || admitter.calls[0].Operation != ports.WorkerAdmissionRestore {
+				t.Fatalf("admission calls = %#v", admitter.calls)
+			}
+			if rt.created != 0 || ws.lastCfg.SessionID != "" || !st.sessions[rec.ID].IsTerminated {
+				t.Fatalf("refused restore mutated worker: runtime=%d workspace=%#v session=%#v", rt.created, ws.lastCfg, st.sessions[rec.ID])
+			}
+		})
+	}
+}
+
+func TestHeldManagedWorkerBlocksRestoreBeforeScopedAdmission(t *testing.T) {
+	m, st, rt, ws := newManager()
+	route := managedWorkerProject(st)
+	admitter := &fakeWorkerAdmitter{}
+	m.admitter = admitter
+	rec := domain.SessionRecord{ID: "mer-1", ProjectID: "mer", IssueID: "github:owner/repo#18", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, IsTerminated: true, Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", Prompt: "body", RequestedRoute: &route}}
+	st.sessions[rec.ID] = rec
+	st.holds[rec.ID] = domain.WorkerSchedulingHold{SessionID: rec.ID, HeldAt: time.Now()}
+	if _, err := m.Restore(ctx, rec.ID); !errors.Is(err, ErrWorkerHeld) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(admitter.calls) != 0 || rt.created != 0 || ws.lastCfg.SessionID != "" {
+		t.Fatal("held restore reached admission or worker effects")
+	}
+}
+
 func (r *heldRuntime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	close(r.entered)
 	select {

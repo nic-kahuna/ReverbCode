@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/admission"
-	"github.com/aoagents/agent-orchestrator/backend/internal/bootguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -37,7 +36,7 @@ type Store struct {
 // Store write methods consume it internally; service callers never attest
 // compatibility on behalf of a write.
 type CompatibilityRatchet interface {
-	Ratchet(required int) error
+	RatchetMinimum(required int) error
 }
 
 // ErrCompatibilityRatchetUnavailable fails closed when a new durable feature
@@ -91,8 +90,7 @@ func (s *Store) AttachCompatibilityRatchet(r CompatibilityRatchet) {
 }
 
 // RatchetCompatibility durably establishes at least required before a newer
-// state write. bootguard.ErrDowngrade means a higher supported floor is
-// already durable, which satisfies this minimum requirement.
+// state write, re-publishing a higher current floor so durability is confirmed.
 func (s *Store) RatchetCompatibility(required int) error {
 	s.compatibilityMu.RLock()
 	ratchet := s.compatibility
@@ -100,8 +98,5 @@ func (s *Store) RatchetCompatibility(required int) error {
 	if ratchet == nil {
 		return ErrCompatibilityRatchetUnavailable
 	}
-	if err := ratchet.Ratchet(required); err != nil && !errors.Is(err, bootguard.ErrDowngrade) {
-		return err
-	}
-	return nil
+	return ratchet.RatchetMinimum(required)
 }

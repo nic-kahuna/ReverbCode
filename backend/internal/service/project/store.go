@@ -9,6 +9,7 @@ import (
 
 // Store is the durable project persistence surface required by Service.
 type Store interface {
+	RatchetCompatibility(required int) error
 	ListProjects(ctx context.Context) ([]domain.ProjectRecord, error)
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 	FindProjectByPath(ctx context.Context, path string) (domain.ProjectRecord, bool, error)
