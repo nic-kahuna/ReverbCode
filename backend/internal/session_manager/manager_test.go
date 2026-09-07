@@ -160,9 +160,11 @@ func (f *fakeStore) DeleteSessionWorktrees(_ context.Context, id domain.SessionI
 }
 
 type fakeLCM struct {
-	store     *fakeStore
-	completed int
-	spawnErr  error
+	store               *fakeStore
+	completed           int
+	spawnErr            error
+	admissionFailureErr error
+	clearStageErr       error
 	// terminated counts MarkTerminated calls per session id.
 	terminated map[domain.SessionID]int
 }
@@ -174,6 +176,7 @@ func (l *fakeLCM) MarkSpawned(_ context.Context, id domain.SessionID, metadata d
 	l.completed++
 	rec := l.store.sessions[id]
 	rec.IsTerminated = false
+	rec.LaunchFailureStage = ""
 	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now()}
 	if metadata.RequestedRoute == nil {
 		metadata.RequestedRoute = rec.Metadata.RequestedRoute
@@ -193,6 +196,29 @@ func (l *fakeLCM) MarkTerminated(_ context.Context, id domain.SessionID) error {
 	rec := l.store.sessions[id]
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	l.store.sessions[id] = rec
+	return nil
+}
+
+func (l *fakeLCM) MarkAdmissionFailedBeforeWorkspace(ctx context.Context, id domain.SessionID) error {
+	if l.admissionFailureErr != nil {
+		return l.admissionFailureErr
+	}
+	if err := l.MarkTerminated(ctx, id); err != nil {
+		return err
+	}
+	rec := l.store.sessions[id]
+	rec.LaunchFailureStage = domain.LaunchFailureAdmissionBeforeWorkspace
+	l.store.sessions[id] = rec
+	return nil
+}
+
+func (l *fakeLCM) ClearLaunchFailureStage(_ context.Context, id domain.SessionID) error {
+	if l.clearStageErr != nil {
+		return l.clearStageErr
+	}
+	rec := l.store.sessions[id]
+	rec.LaunchFailureStage = ""
 	l.store.sessions[id] = rec
 	return nil
 }
@@ -394,6 +420,7 @@ type missingAgents struct{}
 func (missingAgents) Agent(domain.AgentHarness) (ports.Agent, bool) { return nil, false }
 
 type fakeWorkspace struct {
+	beforeRestore     func()
 	createErr         error
 	destroyErr        error
 	destroyed         int
@@ -486,6 +513,9 @@ func (w *fakeWorkspace) DestroyWorkspaceProject(context.Context, ports.Workspace
 	return w.destroyErr
 }
 func (w *fakeWorkspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	if w.beforeRestore != nil {
+		w.beforeRestore()
+	}
 	if cfg.RepoPath != "" {
 		entry := "Restore:" + fakeWorkspaceRepoName(ports.WorkspaceInfo{
 			Path:      cfg.Path,
@@ -564,6 +594,123 @@ func testRoleAgents() domain.ProjectConfig {
 	return domain.ProjectConfig{
 		Worker:       domain.RoleOverride{Harness: domain.HarnessClaudeCode},
 		Orchestrator: domain.RoleOverride{Harness: domain.HarnessClaudeCode},
+	}
+}
+
+func TestSpawnAdmissionFailureStageAndPersistenceFailure(t *testing.T) {
+	for _, failWrite := range []bool{false, true} {
+		t.Run(fmt.Sprint(failWrite), func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			route := managedWorkerProject(st)
+			admitErr := errors.New("admission acknowledgment unavailable")
+			m.admitter = &fakeWorkerAdmitter{err: admitErr}
+			lcm := m.lcm.(*fakeLCM)
+			if failWrite {
+				lcm.admissionFailureErr = errors.New("database unavailable")
+			}
+			_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", IssueID: "github:owner/repo#18", Kind: domain.KindWorker, Route: &route})
+			if !errors.Is(err, ErrWorkerAdmission) || !errors.Is(err, admitErr) {
+				t.Fatalf("error = %v", err)
+			}
+			if rt.created != 0 || ws.lastCfg.SessionID != "" {
+				t.Fatal("admission refusal created effects")
+			}
+			rec := st.sessions["mer-1"]
+			if failWrite {
+				if !errors.Is(err, lcm.admissionFailureErr) || !strings.Contains(err.Error(), "persist admission failure stage") {
+					t.Fatalf("persistence failure hidden: %v", err)
+				}
+				if rec.LaunchFailureStage != "" {
+					t.Fatal("failed persistence claimed evidence")
+				}
+			} else if rec.LaunchFailureStage != domain.LaunchFailureAdmissionBeforeWorkspace || !rec.IsTerminated || rec.Activity.State != domain.ActivityExited {
+				t.Fatalf("missing terminal stage: %#v", rec)
+			}
+			if rec.Metadata.Branch != "" || rec.Metadata.WorkspacePath != "" || len(st.worktrees[rec.ID]) != 0 {
+				t.Fatal("failed seed acquired workspace identity")
+			}
+		})
+	}
+}
+
+func TestManagedSpawnLaterFailuresNeverRecordAdmissionStage(t *testing.T) {
+	for _, failure := range []string{"workspace", "provision", "runtime", "completed"} {
+		t.Run(failure, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			route := managedWorkerProject(st)
+			m.admitter = &fakeWorkerAdmitter{result: ports.WorkerAdmissionResult{IssueBody: "body"}}
+			switch failure {
+			case "workspace":
+				ws.createErr = errors.New("workspace refused")
+			case "provision":
+				project := st.projects["mer"]
+				project.Config.PostCreate = []string{"exit 1"}
+				st.projects["mer"] = project
+				ws.path = t.TempDir()
+			case "runtime":
+				rt.createErr = errors.New("runtime failed")
+			case "completed":
+				m.lcm.(*fakeLCM).spawnErr = errors.New("mark spawned failed")
+			}
+			if _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", IssueID: "github:owner/repo#18", Kind: domain.KindWorker, Route: &route}); err == nil {
+				t.Fatal("expected later failure")
+			}
+			if rec := st.sessions["mer-1"]; !rec.IsTerminated || rec.LaunchFailureStage != "" {
+				t.Fatalf("later failure classified: %#v", rec)
+			}
+		})
+	}
+}
+
+func TestRestorePathsInvalidateLaunchStageBeforeAnyWorkspaceEffect(t *testing.T) {
+	for _, all := range []bool{false, true} {
+		for _, failWrite := range []bool{false, true} {
+			t.Run(fmt.Sprintf("all=%t/fail=%t", all, failWrite), func(t *testing.T) {
+				m, st, rt, ws := newManager()
+				seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "branch", AgentSessionID: "native-history", Prompt: "body"})
+				rec := st.sessions["mer-1"]
+				rec.Harness = domain.HarnessClaudeCode
+				rec.Kind = domain.KindWorker
+				// Defensive reuse fixture: should metadata ever become restorable,
+				// stale stage evidence must be invalidated before the first effect.
+				rec.LaunchFailureStage = domain.LaunchFailureAdmissionBeforeWorkspace
+				st.sessions[rec.ID] = rec
+				st.worktrees[rec.ID] = []domain.SessionWorktreeRecord{{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, State: "removed"}}
+				lcm := m.lcm.(*fakeLCM)
+				if failWrite {
+					lcm.clearStageErr = errors.New("clear failed")
+				}
+				workspaceCalls := 0
+				ws.beforeRestore = func() {
+					workspaceCalls++
+					if st.sessions[rec.ID].LaunchFailureStage != "" {
+						t.Fatal("workspace reached before durable invalidation")
+					}
+				}
+				var logs bytes.Buffer
+				m.logger = slog.New(slog.NewTextHandler(&logs, nil))
+				if all {
+					if err := m.RestoreAll(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if failWrite && !strings.Contains(logs.String(), "clear launch failure stage failed") {
+						t.Fatalf("persistence error not reported: %s", logs.String())
+					}
+				} else {
+					_, err := m.Restore(ctx, rec.ID)
+					if failWrite && !errors.Is(err, lcm.clearStageErr) || !failWrite && err != nil {
+						t.Fatalf("restore error = %v", err)
+					}
+				}
+				if failWrite {
+					if workspaceCalls != 0 || rt.created != 0 || st.sessions[rec.ID].LaunchFailureStage == "" {
+						t.Fatal("failed invalidation reached effects or lost evidence")
+					}
+				} else if workspaceCalls != 1 || rt.created != 1 || st.sessions[rec.ID].LaunchFailureStage != "" {
+					t.Fatalf("restored state: workspace=%d runtime=%d record=%#v", workspaceCalls, rt.created, st.sessions[rec.ID])
+				}
+			})
+		}
 	}
 }
 func seedTerminal(st *fakeStore, id domain.SessionID, meta domain.SessionMetadata) {
@@ -1326,6 +1473,9 @@ func TestSpawn_AfterStartPromptFailureCleansUpSpawn(t *testing.T) {
 	}
 	if rows := st.worktrees["mer-1"]; len(rows) != 0 {
 		t.Fatalf("failed prompt delivery kept recovery markers after successful cleanup: %#v", rows)
+	}
+	if st.sessions["mer-1"].LaunchFailureStage != "" {
+		t.Fatal("post-runtime empty handles are not admission-stage evidence")
 	}
 }
 

@@ -40,6 +40,33 @@ func (s *Store) UpdateSession(ctx context.Context, rec domain.SessionRecord) err
 	return s.qw.UpdateSession(ctx, recordToUpdate(rec))
 }
 
+// RecordAdmissionFailureBeforeWorkspace atomically records the native Spawn
+// admission observation only while the exact row remains an unused worker seed.
+// The write lock also serializes seed deletion; zero matched rows is not proof.
+func (s *Store) RecordAdmissionFailureBeforeWorkspace(ctx context.Context, id domain.SessionID, at time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.RecordAdmissionFailureBeforeWorkspace(ctx, gen.RecordAdmissionFailureBeforeWorkspaceParams{
+		ID: id, ActivityLastAt: at, UpdatedAt: at,
+	})
+	if err != nil {
+		return false, fmt.Errorf("record admission failure for %s: %w", id, err)
+	}
+	return rows == 1, nil
+}
+
+// ClearSessionLaunchFailureStage invalidates only launch evidence, with a
+// checked matched row count. It never rewrites concurrently changed metadata.
+func (s *Store) ClearSessionLaunchFailureStage(ctx context.Context, id domain.SessionID, at time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ClearSessionLaunchFailureStage(ctx, gen.ClearSessionLaunchFailureStageParams{ID: id, ObservedAt: at})
+	if err != nil {
+		return false, fmt.Errorf("clear launch failure for %s: %w", id, err)
+	}
+	return rows == 1, nil
+}
+
 // RenameSession updates only the user-facing display name for an existing
 // session. It returns ok=false when the session id does not exist.
 func (s *Store) RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error) {
@@ -245,8 +272,9 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 			State:          row.ActivityState,
 			LastActivityAt: row.ActivityLastAt,
 		},
-		FirstSignalAt: nullTimeToTime(row.FirstSignalAt),
-		IsTerminated:  row.IsTerminated,
+		FirstSignalAt:      nullTimeToTime(row.FirstSignalAt),
+		IsTerminated:       row.IsTerminated,
+		LaunchFailureStage: row.LaunchFailureStage,
 		Metadata: domain.SessionMetadata{
 			Branch:          row.Branch,
 			WorkspacePath:   row.WorkspacePath,
@@ -292,6 +320,7 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		LaunchModel:              launchModel,
 		LaunchReasoningEffort:    launchEffort,
 		LaunchRouteRecorded:      launchRecorded,
+		LaunchFailureStage:       rec.LaunchFailureStage,
 		CreatedAt:                rec.CreatedAt,
 		UpdatedAt:                rec.UpdatedAt,
 	}
@@ -324,6 +353,7 @@ func recordToUpdate(rec domain.SessionRecord) gen.UpdateSessionParams {
 		LaunchModel:              launchModel,
 		LaunchReasoningEffort:    launchEffort,
 		LaunchRouteRecorded:      launchRecorded,
+		LaunchFailureStage:       rec.LaunchFailureStage,
 		UpdatedAt:                rec.UpdatedAt,
 	}
 }

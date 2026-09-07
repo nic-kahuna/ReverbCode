@@ -20,6 +20,8 @@ type sessionStore interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	GetWorkerSchedulingHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error)
 	UpdateSession(ctx context.Context, rec domain.SessionRecord) error
+	RecordAdmissionFailureBeforeWorkspace(ctx context.Context, id domain.SessionID, at time.Time) (bool, error)
+	ClearSessionLaunchFailureStage(ctx context.Context, id domain.SessionID, at time.Time) (bool, error)
 	// ListPRsBySession returns every PR row tracked for the session. The
 	// reducer reads it to apply the multi-PR completion rule (terminate only
 	// when no open PR remains and at least one merged) and to suppress
@@ -427,6 +429,7 @@ func (m *Manager) MarkSpawned(ctx context.Context, id domain.SessionID, metadata
 	}
 	now := m.clock()
 	rec.IsTerminated = false
+	rec.LaunchFailureStage = ""
 	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}
 	// Each spawn/restore must re-prove its hook pipeline: clear the receipt so
 	// a relaunch with broken hooks degrades to no_signal instead of inheriting
@@ -448,6 +451,38 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 		delete(m.flights, id) // runs under m.mu (mutate holds it)
 		return cur, true
 	})
+}
+
+// MarkAdmissionFailedBeforeWorkspace records only the managed Spawn admission
+// branch's positive observation. Terminal state and stage share one durable
+// write; missing or already-used rows cannot be retrospectively classified.
+func (m *Manager) MarkAdmissionFailedBeforeWorkspace(ctx context.Context, id domain.SessionID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ok, err := m.store.RecordAdmissionFailureBeforeWorkspace(ctx, id, m.clock())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("lifecycle: admission failure requires an existing unused worker seed %q", id)
+	}
+	delete(m.flights, id)
+	return nil
+}
+
+// ClearLaunchFailureStage invalidates prior launch evidence before a supported
+// reuse can create workspace/runtime effects. Failure must prevent that reuse.
+func (m *Manager) ClearLaunchFailureStage(ctx context.Context, id domain.SessionID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ok, err := m.store.ClearSessionLaunchFailureStage(ctx, id, m.clock())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("lifecycle: clear launch failure for unknown session %q", id)
+	}
+	return nil
 }
 
 // sameActivity reports whether two activity signals describe the same state.

@@ -798,6 +798,8 @@ export interface components {
             isTerminated: boolean;
             issueId?: string;
             kind: string;
+            /** @enum {string} */
+            launchFailureStage?: "admission_before_workspace";
             launchRoute?: components["schemas"]["DomainAgentLaunchRoute"];
             /** Format: int64 */
             previewRevision?: number;

@@ -133,10 +133,13 @@ type CleanupSessionsQuery struct {
 // serialize.
 type SessionView struct {
 	domain.Session
-	Branch         string                   `json:"branch,omitempty"`
-	WorkspacePath  string                   `json:"workspacePath,omitempty"`
-	RequestedRoute *domain.AgentRoute       `json:"requestedRoute,omitempty"`
-	LaunchRoute    *domain.AgentLaunchRoute `json:"launchRoute,omitempty"`
+	// LaunchFailureStage describes only a positively recorded native stage,
+	// not capacity commit/release authority. Legacy and unknown stages omit it.
+	LaunchFailureStage string                   `json:"launchFailureStage,omitempty" enum:"admission_before_workspace"`
+	Branch             string                   `json:"branch,omitempty"`
+	WorkspacePath      string                   `json:"workspacePath,omitempty"`
+	RequestedRoute     *domain.AgentRoute       `json:"requestedRoute,omitempty"`
+	LaunchRoute        *domain.AgentLaunchRoute `json:"launchRoute,omitempty"`
 	// PreviewURL is the browser preview target the desktop app opens for this
 	// session, set via POST /sessions/{sessionId}/preview. Empty (omitted) when
 	// no preview has been requested. Pulled from the json:"-" domain Metadata.
