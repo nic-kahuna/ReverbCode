@@ -94,6 +94,8 @@ const hookBinaryName = "ao"
 type lifecycleRecorder interface {
 	MarkSpawned(ctx context.Context, id domain.SessionID, metadata domain.SessionMetadata) error
 	MarkTerminated(ctx context.Context, id domain.SessionID) error
+	MarkAdmissionFailedBeforeWorkspace(ctx context.Context, id domain.SessionID) error
+	ClearLaunchFailureStage(ctx context.Context, id domain.SessionID) error
 }
 
 type runtimeController interface {
@@ -346,7 +348,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			// The helper may have committed before an acknowledgment was lost.
 			// Retain the exact seed identity for replay/reconciliation; never infer
 			// release authority from the absence of workspace or runtime state.
-			m.markSpawnFailedTerminated(ctx, id)
+			if recordErr := m.lcm.MarkAdmissionFailedBeforeWorkspace(ctx, id); recordErr != nil {
+				admitErr = errors.Join(admitErr, fmt.Errorf("persist admission failure stage: %w", recordErr))
+			}
 			return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, admitErr)
 		}
 		scopedAdmission = true
@@ -1251,6 +1255,10 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	} else if project.Config.DesktopProjectsAdmission && rec.Kind == domain.KindWorker && admitted.IssueBody != rec.Metadata.Prompt {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: admitted issue body differs from persisted launch", id, ErrWorkerAdmission)
 	}
+	if err := m.lcm.ClearLaunchFailureStage(ctx, rec.ID); err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("restore %s: clear launch failure stage: %w", id, err)
+	}
+	rec.LaunchFailureStage = ""
 	ws, err := m.restoreSessionWorkspace(ctx, project, rec)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: workspace: %w", id, err)
@@ -1767,6 +1775,11 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 				m.logger.Error("restore-all: scoped worker admission identity changed; preserving session", "sessionID", rec.ID)
 				return
 			}
+			if err := m.lcm.ClearLaunchFailureStage(ctx, rec.ID); err != nil {
+				m.logger.Error("restore-all: clear launch failure stage failed; preserving session", "sessionID", rec.ID, "error", err)
+				return
+			}
+			rec.LaunchFailureStage = ""
 			var ws ports.WorkspaceInfo
 			restoredWorkspaceProject := project.Kind.WithDefault() == domain.ProjectKindWorkspace
 			var projectRows []ports.WorkspaceRepoInfo

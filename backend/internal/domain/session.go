@@ -22,6 +22,11 @@ const (
 	KindOrchestrator SessionKind = "orchestrator"
 )
 
+// LaunchFailureAdmissionBeforeWorkspace records a native admission failure
+// before workspace creation was attempted. It says nothing about capacity
+// commit, release authority, or the absence of external work.
+const LaunchFailureAdmissionBeforeWorkspace = "admission_before_workspace"
+
 // SessionMetadata is the typed, off-status metadata for a session: operational
 // handles and seed inputs used by Session Manager and reaper.
 type SessionMetadata struct {
@@ -61,11 +66,14 @@ type SessionRecord struct {
 	// activity state. Zero means no hook has ever reported, which deriveStatus
 	// surfaces as StatusNoSignal after a grace period. Internal fact, not part
 	// of the API read model.
-	FirstSignalAt time.Time       `json:"-"`
-	IsTerminated  bool            `json:"isTerminated"`
-	Metadata      SessionMetadata `json:"-"`
-	CreatedAt     time.Time       `json:"createdAt"`
-	UpdatedAt     time.Time       `json:"updatedAt"`
+	FirstSignalAt time.Time `json:"-"`
+	IsTerminated  bool      `json:"isTerminated"`
+	// LaunchFailureStage is empty for legacy, later, and unknown failures.
+	// The curated HTTP read model exposes this positive native launch fact.
+	LaunchFailureStage string          `json:"-"`
+	Metadata           SessionMetadata `json:"-"`
+	CreatedAt          time.Time       `json:"createdAt"`
+	UpdatedAt          time.Time       `json:"updatedAt"`
 }
 
 // Session is the read-model returned across the API boundary: a SessionRecord

@@ -8,8 +8,8 @@ INSERT INTO sessions (
     branch, workspace_path, runtime_handle_id, agent_session_id, prompt,
     preview_url, preview_revision, requested_harness, requested_model,
     requested_reasoning_effort, launch_model, launch_reasoning_effort,
-    launch_route_recorded, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    launch_route_recorded, launch_failure_stage, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: UpdateSession :exec
 UPDATE sessions SET
@@ -18,28 +18,50 @@ UPDATE sessions SET
     branch = ?, workspace_path = ?, runtime_handle_id = ?, agent_session_id = ?, prompt = ?,
     preview_url = ?, preview_revision = ?, requested_harness = ?, requested_model = ?,
     requested_reasoning_effort = ?, launch_model = ?, launch_reasoning_effort = ?,
-    launch_route_recorded = ?, updated_at = ?
+    launch_route_recorded = ?, launch_failure_stage = ?, updated_at = ?
 WHERE id = ?;
+
+-- name: RecordAdmissionFailureBeforeWorkspace :execrows
+-- The native Spawn admission branch supplies the observation; these seed
+-- predicates prevent a concurrent delete/reuse from recording stale evidence.
+UPDATE sessions SET
+    activity_state = 'exited', activity_last_at = ?, is_terminated = 1,
+    launch_failure_stage = 'admission_before_workspace', updated_at = ?
+WHERE id = ?
+    AND kind = 'worker'
+    AND activity_state = 'idle'
+    AND first_signal_at IS NULL
+    AND branch = '' AND workspace_path = '' AND runtime_handle_id = ''
+    AND agent_session_id = '' AND prompt = '' AND launch_failure_stage = ''
+    AND is_terminated = 0;
+
+-- name: ClearSessionLaunchFailureStage :execrows
+-- Confirm existence while invalidating only the stage. Already-empty records
+-- preserve their timestamp and generate no CDC event.
+UPDATE sessions SET
+    updated_at = CASE WHEN launch_failure_stage <> '' THEN sqlc.arg(observed_at) ELSE updated_at END,
+    launch_failure_stage = ''
+WHERE id = sqlc.arg(id);
 
 -- name: GetSession :one
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded
+    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded, launch_failure_stage
 FROM sessions WHERE id = ?;
 
 -- name: ListSessionsByProject :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded
+    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded, launch_failure_stage
 FROM sessions WHERE project_id = ? ORDER BY num;
 
 -- name: ListAllSessions :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded
+    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded, launch_failure_stage
 FROM sessions ORDER BY project_id, num;
 
 

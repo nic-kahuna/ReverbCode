@@ -2177,6 +2177,10 @@ components:
           type: string
         kind:
           type: string
+        launchFailureStage:
+          enum:
+          - admission_before_workspace
+          type: string
         launchRoute:
           $ref: '#/components/schemas/DomainAgentLaunchRoute'
         previewRevision:

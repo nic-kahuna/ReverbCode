@@ -40,21 +40,22 @@ type sessionRenameRequest struct {
 }
 
 type sessionDTO struct {
-	ID             string           `json:"id"`
-	ProjectID      string           `json:"projectId"`
-	IssueID        string           `json:"issueId,omitempty"`
-	Kind           string           `json:"kind"`
-	Harness        string           `json:"harness,omitempty"`
-	DisplayName    string           `json:"displayName,omitempty"`
-	Activity       sessionActivity  `json:"activity"`
-	IsTerminated   bool             `json:"isTerminated"`
-	CreatedAt      time.Time        `json:"createdAt"`
-	UpdatedAt      time.Time        `json:"updatedAt"`
-	Status         string           `json:"status"`
-	Branch         string           `json:"branch,omitempty"`
-	WorkspacePath  string           `json:"workspacePath,omitempty"`
-	RequestedRoute *sessionRouteDTO `json:"requestedRoute,omitempty"`
-	LaunchRoute    *sessionRouteDTO `json:"launchRoute,omitempty"`
+	ID                 string           `json:"id"`
+	ProjectID          string           `json:"projectId"`
+	IssueID            string           `json:"issueId,omitempty"`
+	Kind               string           `json:"kind"`
+	Harness            string           `json:"harness,omitempty"`
+	DisplayName        string           `json:"displayName,omitempty"`
+	Activity           sessionActivity  `json:"activity"`
+	IsTerminated       bool             `json:"isTerminated"`
+	LaunchFailureStage string           `json:"launchFailureStage,omitempty"`
+	CreatedAt          time.Time        `json:"createdAt"`
+	UpdatedAt          time.Time        `json:"updatedAt"`
+	Status             string           `json:"status"`
+	Branch             string           `json:"branch,omitempty"`
+	WorkspacePath      string           `json:"workspacePath,omitempty"`
+	RequestedRoute     *sessionRouteDTO `json:"requestedRoute,omitempty"`
+	LaunchRoute        *sessionRouteDTO `json:"launchRoute,omitempty"`
 }
 
 type sessionRouteDTO struct {
@@ -142,18 +143,19 @@ type claimPRResponse struct {
 }
 
 type sessionListEntry struct {
-	ID             string     `json:"id"`
-	ProjectID      string     `json:"projectId"`
-	Role           string     `json:"role"`
-	Status         string     `json:"status,omitempty"`
-	IssueID        string     `json:"issueId,omitempty"`
-	Harness        string     `json:"harness,omitempty"`
-	Branch         string     `json:"branch,omitempty"`
-	WorkspacePath  string     `json:"workspacePath,omitempty"`
-	IsTerminated   bool       `json:"isTerminated"`
-	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	UpdatedAt      time.Time  `json:"updatedAt"`
+	ID                 string     `json:"id"`
+	ProjectID          string     `json:"projectId"`
+	Role               string     `json:"role"`
+	Status             string     `json:"status,omitempty"`
+	IssueID            string     `json:"issueId,omitempty"`
+	Harness            string     `json:"harness,omitempty"`
+	Branch             string     `json:"branch,omitempty"`
+	WorkspacePath      string     `json:"workspacePath,omitempty"`
+	IsTerminated       bool       `json:"isTerminated"`
+	LaunchFailureStage string     `json:"launchFailureStage,omitempty"`
+	LastActivityAt     *time.Time `json:"lastActivityAt,omitempty"`
+	CreatedAt          time.Time  `json:"createdAt"`
+	UpdatedAt          time.Time  `json:"updatedAt"`
 }
 
 type sessionListOutput struct {
@@ -806,18 +808,19 @@ func sessionListEntries(sessions []sessionDTO) []sessionListEntry {
 			last = &activity
 		}
 		entries = append(entries, sessionListEntry{
-			ID:             sess.ID,
-			ProjectID:      sess.ProjectID,
-			Role:           sessionRole(sess),
-			Status:         sess.Status,
-			IssueID:        sess.IssueID,
-			Harness:        sess.Harness,
-			Branch:         sess.Branch,
-			WorkspacePath:  sess.WorkspacePath,
-			IsTerminated:   sess.IsTerminated,
-			LastActivityAt: last,
-			CreatedAt:      sess.CreatedAt,
-			UpdatedAt:      sess.UpdatedAt,
+			ID:                 sess.ID,
+			ProjectID:          sess.ProjectID,
+			Role:               sessionRole(sess),
+			Status:             sess.Status,
+			IssueID:            sess.IssueID,
+			Harness:            sess.Harness,
+			Branch:             sess.Branch,
+			WorkspacePath:      sess.WorkspacePath,
+			IsTerminated:       sess.IsTerminated,
+			LaunchFailureStage: sess.LaunchFailureStage,
+			LastActivityAt:     last,
+			CreatedAt:          sess.CreatedAt,
+			UpdatedAt:          sess.UpdatedAt,
 		})
 	}
 	return entries
@@ -916,6 +919,7 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 		{"harness", sess.Harness},
 		{"issue", sess.IssueID},
 		{"terminated", fmt.Sprintf("%t", sess.IsTerminated)},
+		{"launch failure stage", sess.LaunchFailureStage},
 	}
 	for _, field := range fields {
 		if field[1] == "" {

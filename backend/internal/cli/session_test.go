@@ -243,6 +243,63 @@ func TestSessionGet_JSONOutputDecodes(t *testing.T) {
 	}
 }
 
+func TestSessionLaunchFailureStageListGetJSONAndLegacyOmission(t *testing.T) {
+	for _, stage := range []string{"", "admission_before_workspace"} {
+		t.Run(stage, func(t *testing.T) {
+			cfg := setConfigEnv(t)
+			row := map[string]any{"id": "demo-665", "projectId": "demo", "kind": "worker", "status": "terminated", "isTerminated": true,
+				"issueId": "github:owner/demo#369", "activity": map[string]any{"state": "exited"}, "updatedAt": "2026-09-06T22:46:16.482584123Z"}
+			if stage != "" {
+				row["launchFailureStage"] = stage
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/api/v1/sessions":
+					_ = json.NewEncoder(w).Encode(map[string]any{"sessions": []any{row}})
+				case "/api/v1/sessions/demo-665":
+					_ = json.NewEncoder(w).Encode(map[string]any{"session": row})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			writeRunFileFor(t, cfg, srv)
+			for _, args := range [][]string{{"session", "ls", "--project", "demo", "--all", "--include-terminated", "--json"}, {"session", "get", "demo-665", "--json"}} {
+				out, stderr, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, args...)
+				if err != nil {
+					t.Fatalf("%v: %v %s", args, err, stderr)
+				}
+				var payload struct {
+					Session map[string]any   `json:"session"`
+					Data    []map[string]any `json:"data"`
+				}
+				if err := json.Unmarshal([]byte(out), &payload); err != nil {
+					t.Fatal(err)
+				}
+				actual := payload.Session
+				if actual == nil {
+					if len(payload.Data) != 1 {
+						t.Fatalf("list: %s", out)
+					}
+					actual = payload.Data[0]
+				}
+				value, present := actual["launchFailureStage"]
+				if stage == "" && present || stage != "" && (!present || value != stage) {
+					t.Fatalf("%v stage mismatch: %s", args, out)
+				}
+				if actual["updatedAt"] != row["updatedAt"] {
+					t.Fatalf("timestamp precision lost: %s", out)
+				}
+			}
+			out, stderr, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "session", "get", "demo-665")
+			if err != nil || strings.Contains(out, "launch failure stage:") != (stage != "") {
+				t.Fatalf("text detail = %s, err=%v %s", out, err, stderr)
+			}
+		})
+	}
+}
+
 func TestSessionKill_SuccessWithProjectScope(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv, log := sessionCommandServer(t)

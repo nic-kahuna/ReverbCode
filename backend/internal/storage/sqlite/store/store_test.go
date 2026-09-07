@@ -2,12 +2,17 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pressly/goose/v3"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -330,6 +335,174 @@ func TestSessionFirstSignalRoundTrip(t *testing.T) {
 	final, _, _ := s.GetSession(ctx, r.ID)
 	if !final.FirstSignalAt.IsZero() {
 		t.Fatalf("receipt not cleared: %v", final.FirstSignalAt)
+	}
+}
+
+func TestLaunchFailureStageMigrationPersistenceAndLegacyDefaults(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db")+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	provider, err := goose.NewProvider(goose.DialectSQLite3, db, os.DirFS("../migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(ctx, 25); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO projects (id,path,registered_at) VALUES ('mer','/repo','2026-09-06T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	// This INSERT is the older binary's shape, with no launch-stage column.
+	legacyInsert := `INSERT INTO sessions (id,project_id,num,kind,harness,activity_state,activity_last_at,is_terminated,created_at,updated_at)
+		VALUES (?, 'mer', ?, 'worker', 'codex', 'exited', '2026-09-06T00:00:00Z', 1, '2026-09-06T00:00:00Z', '2026-09-06T00:00:00Z')`
+	if _, err := db.Exec(legacyInsert, "mer-1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	legacy, ok, err := s.GetSession(ctx, "mer-1")
+	if err != nil || !ok || !legacy.IsTerminated || legacy.LaunchFailureStage != "" {
+		t.Fatalf("legacy record changed: %#v ok=%t err=%v", legacy, ok, err)
+	}
+	// Additive migration also permits a pre-feature binary's later INSERT.
+	db, err = sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(legacyInsert, "mer-2", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Date(2026, 9, 6, 22, 46, 16, 482584123, time.UTC)
+	rec := sampleRecord("mer")
+	rec.Metadata = domain.SessionMetadata{}
+	rec.CreatedAt = stamp.Add(-30 * time.Second)
+	rec.UpdatedAt = rec.CreatedAt
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: rec.CreatedAt}
+	rec, err = s.CreateSession(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.IsTerminated = true
+	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: stamp}
+	rec.LaunchFailureStage = domain.LaunchFailureAdmissionBeforeWorkspace
+	rec.UpdatedAt = stamp
+	if recorded, err := s.RecordAdmissionFailureBeforeWorkspace(ctx, rec.ID, stamp); err != nil || !recorded {
+		t.Fatalf("record stage: %t %v", recorded, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetSession(ctx, rec.ID)
+	if err != nil || !ok || got.LaunchFailureStage != rec.LaunchFailureStage || !got.IsTerminated || got.Activity.State != domain.ActivityExited || !got.UpdatedAt.Equal(stamp) {
+		t.Fatalf("reopened record = %#v, err=%v", got, err)
+	}
+	projectRows, err := s.ListSessions(ctx, "mer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allRows, err := s.ListAllSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(projectRows, allRows) || len(allRows) != 3 {
+		t.Fatalf("list mismatch: %#v %#v", projectRows, allRows)
+	}
+	if allRows[0].LaunchFailureStage != "" || allRows[1].LaunchFailureStage != "" || !reflect.DeepEqual(allRows[2], got) {
+		t.Fatalf("list/get stage mismatch or legacy backfill: %#v", allRows)
+	}
+	if cleared, err := s.ClearSessionLaunchFailureStage(ctx, rec.ID, stamp.Add(time.Second)); err != nil || !cleared {
+		t.Fatalf("clear stage: %t %v", cleared, err)
+	}
+	cleared, _, err := s.GetSession(ctx, rec.ID)
+	if err != nil || cleared.LaunchFailureStage != "" || !cleared.IsTerminated {
+		t.Fatalf("clear = %#v err=%v", cleared, err)
+	}
+	events, err := s.EventsAfter(ctx, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates := 0
+	for _, event := range events {
+		if event.SessionID == string(rec.ID) && string(event.Type) == "session_updated" {
+			updates++
+		}
+	}
+	if updates != 2 {
+		t.Fatalf("terminal/stage and stage-only clear must each emit one CDC update, got %d", updates)
+	}
+	if clearedAgain, err := s.ClearSessionLaunchFailureStage(ctx, rec.ID, stamp.Add(2*time.Second)); err != nil || !clearedAgain {
+		t.Fatalf("idempotent clear: %t %v", clearedAgain, err)
+	}
+	again, _, err := s.GetSession(ctx, rec.ID)
+	if err != nil || !reflect.DeepEqual(cleared, again) {
+		t.Fatalf("empty clear changed facts: %#v %#v %v", cleared, again, err)
+	}
+	if clearedMissing, err := s.ClearSessionLaunchFailureStage(ctx, "missing", stamp); err != nil || clearedMissing {
+		t.Fatalf("missing row clear: %t %v", clearedMissing, err)
+	}
+}
+
+func TestAdmissionFailureRecordingSerializesWithSeedDeletionAndRejectsUsedActivity(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	for i := 0; i < 16; i++ {
+		rec, err := s.CreateSession(ctx, domain.SessionRecord{ProjectID: "mer", Kind: domain.KindWorker, Activity: domain.Activity{State: domain.ActivityIdle}, CreatedAt: time.Now()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var recorded, deleted bool
+		var recordErr, deleteErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			recorded, recordErr = s.RecordAdmissionFailureBeforeWorkspace(ctx, rec.ID, time.Now())
+		}()
+		go func() { defer wg.Done(); <-start; deleted, deleteErr = s.DeleteSession(ctx, rec.ID) }()
+		close(start)
+		wg.Wait()
+		if recordErr != nil || deleteErr != nil || recorded == deleted {
+			t.Fatalf("recorded=%t deleted=%t errors=%v/%v", recorded, deleted, recordErr, deleteErr)
+		}
+		got, exists, err := s.GetSession(ctx, rec.ID)
+		if err != nil || exists != recorded {
+			t.Fatalf("existence differs from recording: %t %v", exists, err)
+		}
+		if recorded && (!got.IsTerminated || got.Activity.State != domain.ActivityExited || got.LaunchFailureStage != domain.LaunchFailureAdmissionBeforeWorkspace) {
+			t.Fatalf("incomplete fact: %#v", got)
+		}
+		if recordedAgain, err := s.RecordAdmissionFailureBeforeWorkspace(ctx, rec.ID, time.Now()); err != nil || recordedAgain {
+			t.Fatalf("deleted/terminal row reclassified: %t %v", recordedAgain, err)
+		}
+	}
+	for _, state := range []domain.ActivityState{domain.ActivityActive, domain.ActivityWaitingInput, domain.ActivityBlocked, domain.ActivityExited} {
+		rec, err := s.CreateSession(ctx, domain.SessionRecord{ProjectID: "mer", Kind: domain.KindWorker, Activity: domain.Activity{State: state}, CreatedAt: time.Now()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if recorded, err := s.RecordAdmissionFailureBeforeWorkspace(ctx, rec.ID, time.Now()); err != nil || recorded {
+			t.Fatalf("used activity %s accepted: %t %v", state, recorded, err)
+		}
 	}
 }
 

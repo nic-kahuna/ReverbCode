@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,8 @@ type fakeStore struct {
 
 	signatureWriteErr error
 	signatureWrites   int
+	updateErr         error
+	updates           []domain.SessionRecord
 }
 
 func newFakeStore() *fakeStore {
@@ -42,8 +45,45 @@ func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]
 }
 
 func (f *fakeStore) UpdateSession(_ context.Context, rec domain.SessionRecord) error {
+	f.updates = append(f.updates, rec)
+	if f.updateErr != nil {
+		return f.updateErr
+	}
 	f.sessions[rec.ID] = rec
 	return nil
+}
+
+func (f *fakeStore) RecordAdmissionFailureBeforeWorkspace(ctx context.Context, id domain.SessionID, at time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	meta := rec.Metadata
+	if !ok || rec.Kind != domain.KindWorker || rec.IsTerminated || rec.Activity.State != domain.ActivityIdle || !rec.FirstSignalAt.IsZero() ||
+		meta.Branch != "" || meta.WorkspacePath != "" || meta.RuntimeHandleID != "" || meta.AgentSessionID != "" || meta.Prompt != "" || rec.LaunchFailureStage != "" {
+		return false, nil
+	}
+	rec.IsTerminated = true
+	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: at}
+	rec.LaunchFailureStage = domain.LaunchFailureAdmissionBeforeWorkspace
+	rec.UpdatedAt = at
+	if err := f.UpdateSession(ctx, rec); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (f *fakeStore) ClearSessionLaunchFailureStage(ctx context.Context, id domain.SessionID, at time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok {
+		return false, nil
+	}
+	if rec.LaunchFailureStage == "" {
+		return true, nil
+	}
+	rec.LaunchFailureStage = ""
+	rec.UpdatedAt = at
+	if err := f.UpdateSession(ctx, rec); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (f *fakeStore) GetPRLastNudgeSignature(_ context.Context, prURL string) (string, error) {
@@ -150,6 +190,102 @@ func TestMarkTerminated(t *testing.T) {
 	got := st.sessions["mer-1"]
 	if !got.IsTerminated || got.Activity.State != domain.ActivityExited {
 		t.Fatalf("want terminated/exited, got %+v", got)
+	}
+}
+
+func TestAdmissionFailureStageIsAtomicAndPersistenceErrorsRemainVisible(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			m, st, _ := newManager()
+			now := time.Date(2026, 9, 6, 22, 46, 16, 482584123, time.UTC)
+			m.clock = func() time.Time { return now }
+			st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", Kind: domain.KindWorker, CreatedAt: now.Add(-30 * time.Second), Activity: domain.Activity{State: domain.ActivityIdle}}
+			if fail {
+				st.updateErr = errors.New("write failed")
+			}
+			err := m.MarkAdmissionFailedBeforeWorkspace(ctx, "mer-1")
+			if fail && !errors.Is(err, st.updateErr) || !fail && err != nil {
+				t.Fatalf("error = %v", err)
+			}
+			if len(st.updates) != 1 {
+				t.Fatalf("writes = %d", len(st.updates))
+			}
+			write := st.updates[0]
+			if write.Activity.LastActivityAt.Before(write.CreatedAt) || write.UpdatedAt.Before(write.Activity.LastActivityAt) {
+				t.Fatalf("invalid terminal chronology: %#v", write)
+			}
+			if !write.IsTerminated || write.Activity.State != domain.ActivityExited || write.LaunchFailureStage != domain.LaunchFailureAdmissionBeforeWorkspace || !write.UpdatedAt.Equal(now) || !write.Activity.LastActivityAt.Equal(now) {
+				t.Fatalf("non-atomic terminal/stage write: %#v", write)
+			}
+			got := st.sessions["mer-1"]
+			if fail {
+				if got.IsTerminated || got.LaunchFailureStage != "" {
+					t.Fatalf("failed write changed evidence: %#v", got)
+				}
+			} else if got != write {
+				t.Fatalf("persisted record differs: %#v", got)
+			}
+		})
+	}
+}
+
+func TestAdmissionFailureStageNeverBackfillsLegacyOrUsedRows(t *testing.T) {
+	for _, name := range []string{"missing", "legacy", "orchestrator", "workspace", "runtime", "signal", "prompt", "activity"} {
+		t.Run(name, func(t *testing.T) {
+			m, st, _ := newManager()
+			rec := domain.SessionRecord{ID: "mer-1", Kind: domain.KindWorker, Activity: domain.Activity{State: domain.ActivityIdle}}
+			switch name {
+			case "legacy":
+				rec.IsTerminated = true
+			case "orchestrator":
+				rec.Kind = domain.KindOrchestrator
+			case "workspace":
+				rec.Metadata.WorkspacePath = "/ws"
+			case "runtime":
+				rec.Metadata.RuntimeHandleID = "mer-1"
+			case "signal":
+				rec.FirstSignalAt = time.Now()
+			case "prompt":
+				rec.Metadata.Prompt = "work"
+			case "activity":
+				rec.Activity.State = domain.ActivityActive
+			}
+			if name != "missing" {
+				st.sessions[rec.ID] = rec
+			}
+			if err := m.MarkAdmissionFailedBeforeWorkspace(ctx, rec.ID); err == nil {
+				t.Fatal("invalid source accepted")
+			}
+			if len(st.updates) != 0 {
+				t.Fatal("invalid source mutated")
+			}
+		})
+	}
+}
+
+func TestClearLaunchFailureStageRequiresSuccessfulPersistence(t *testing.T) {
+	m, st, _ := newManager()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", IsTerminated: true, LaunchFailureStage: domain.LaunchFailureAdmissionBeforeWorkspace}
+	st.updateErr = errors.New("write failed")
+	if err := m.ClearLaunchFailureStage(ctx, "mer-1"); !errors.Is(err, st.updateErr) {
+		t.Fatalf("error = %v", err)
+	}
+	if st.sessions["mer-1"].LaunchFailureStage == "" {
+		t.Fatal("failed clear erased evidence")
+	}
+	st.updateErr = nil
+	if err := m.ClearLaunchFailureStage(ctx, "mer-1"); err != nil {
+		t.Fatal(err)
+	}
+	if st.sessions["mer-1"].LaunchFailureStage != "" || !st.sessions["mer-1"].IsTerminated {
+		t.Fatal("clear changed terminal state or retained evidence")
+	}
+	writes := len(st.updates)
+	if err := m.ClearLaunchFailureStage(ctx, "mer-1"); err != nil || len(st.updates) != writes {
+		t.Fatal("empty clear must be idempotent")
+	}
+	if err := m.ClearLaunchFailureStage(ctx, "missing"); err == nil {
+		t.Fatal("missing row accepted")
 	}
 }
 
@@ -1000,11 +1136,12 @@ func TestMarkSpawnedClearsFirstSignal(t *testing.T) {
 	m, st, _ := newManager()
 	rec := working("mer-1")
 	rec.FirstSignalAt = time.Now().Add(-time.Hour)
+	rec.LaunchFailureStage = domain.LaunchFailureAdmissionBeforeWorkspace
 	st.sessions["mer-1"] = rec
 	if err := m.MarkSpawned(ctx, "mer-1", domain.SessionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := st.sessions["mer-1"]; !got.FirstSignalAt.IsZero() {
+	if got := st.sessions["mer-1"]; !got.FirstSignalAt.IsZero() || got.LaunchFailureStage != "" {
 		t.Fatalf("spawn/restore must clear the receipt, got %+v", got)
 	}
 }

@@ -13,11 +13,33 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
+const clearSessionLaunchFailureStage = `-- name: ClearSessionLaunchFailureStage :execrows
+UPDATE sessions SET
+    updated_at = CASE WHEN launch_failure_stage <> '' THEN ?1 ELSE updated_at END,
+    launch_failure_stage = ''
+WHERE id = ?2
+`
+
+type ClearSessionLaunchFailureStageParams struct {
+	ObservedAt time.Time
+	ID         domain.SessionID
+}
+
+// Confirm existence while invalidating only the stage. Already-empty records
+// preserve their timestamp and generate no CDC event.
+func (q *Queries) ClearSessionLaunchFailureStage(ctx context.Context, arg ClearSessionLaunchFailureStageParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, clearSessionLaunchFailureStage, arg.ObservedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const getSession = `-- name: GetSession :one
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded
+    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded, launch_failure_stage
 FROM sessions WHERE id = ?
 `
 
@@ -51,6 +73,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (Session,
 		&i.LaunchModel,
 		&i.LaunchReasoningEffort,
 		&i.LaunchRouteRecorded,
+		&i.LaunchFailureStage,
 	)
 	return i, err
 }
@@ -75,8 +98,8 @@ INSERT INTO sessions (
     branch, workspace_path, runtime_handle_id, agent_session_id, prompt,
     preview_url, preview_revision, requested_harness, requested_model,
     requested_reasoning_effort, launch_model, launch_reasoning_effort,
-    launch_route_recorded, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    launch_route_recorded, launch_failure_stage, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertSessionParams struct {
@@ -104,6 +127,7 @@ type InsertSessionParams struct {
 	LaunchModel              string
 	LaunchReasoningEffort    string
 	LaunchRouteRecorded      bool
+	LaunchFailureStage       string
 	CreatedAt                time.Time
 	UpdatedAt                time.Time
 }
@@ -134,6 +158,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.LaunchModel,
 		arg.LaunchReasoningEffort,
 		arg.LaunchRouteRecorded,
+		arg.LaunchFailureStage,
 		arg.CreatedAt,
 		arg.UpdatedAt,
 	)
@@ -144,7 +169,7 @@ const listAllSessions = `-- name: ListAllSessions :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded
+    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded, launch_failure_stage
 FROM sessions ORDER BY project_id, num
 `
 
@@ -184,6 +209,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]Session, error) {
 			&i.LaunchModel,
 			&i.LaunchReasoningEffort,
 			&i.LaunchRouteRecorded,
+			&i.LaunchFailureStage,
 		); err != nil {
 			return nil, err
 		}
@@ -202,7 +228,7 @@ const listSessionsByProject = `-- name: ListSessionsByProject :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded
+    requested_harness, requested_model, requested_reasoning_effort, launch_model, launch_reasoning_effort, launch_route_recorded, launch_failure_stage
 FROM sessions WHERE project_id = ? ORDER BY num
 `
 
@@ -242,6 +268,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID domain.Pr
 			&i.LaunchModel,
 			&i.LaunchReasoningEffort,
 			&i.LaunchRouteRecorded,
+			&i.LaunchFailureStage,
 		); err != nil {
 			return nil, err
 		}
@@ -265,6 +292,35 @@ func (q *Queries) NextSessionNum(ctx context.Context, projectID domain.ProjectID
 	var next int64
 	err := row.Scan(&next)
 	return next, err
+}
+
+const recordAdmissionFailureBeforeWorkspace = `-- name: RecordAdmissionFailureBeforeWorkspace :execrows
+UPDATE sessions SET
+    activity_state = 'exited', activity_last_at = ?, is_terminated = 1,
+    launch_failure_stage = 'admission_before_workspace', updated_at = ?
+WHERE id = ?
+    AND kind = 'worker'
+    AND activity_state = 'idle'
+    AND first_signal_at IS NULL
+    AND branch = '' AND workspace_path = '' AND runtime_handle_id = ''
+    AND agent_session_id = '' AND prompt = '' AND launch_failure_stage = ''
+    AND is_terminated = 0
+`
+
+type RecordAdmissionFailureBeforeWorkspaceParams struct {
+	ActivityLastAt time.Time
+	UpdatedAt      time.Time
+	ID             domain.SessionID
+}
+
+// The native Spawn admission branch supplies the observation; these seed
+// predicates prevent a concurrent delete/reuse from recording stale evidence.
+func (q *Queries) RecordAdmissionFailureBeforeWorkspace(ctx context.Context, arg RecordAdmissionFailureBeforeWorkspaceParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, recordAdmissionFailureBeforeWorkspace, arg.ActivityLastAt, arg.UpdatedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const renameSession = `-- name: RenameSession :execrows
@@ -357,7 +413,7 @@ UPDATE sessions SET
     branch = ?, workspace_path = ?, runtime_handle_id = ?, agent_session_id = ?, prompt = ?,
     preview_url = ?, preview_revision = ?, requested_harness = ?, requested_model = ?,
     requested_reasoning_effort = ?, launch_model = ?, launch_reasoning_effort = ?,
-    launch_route_recorded = ?, updated_at = ?
+    launch_route_recorded = ?, launch_failure_stage = ?, updated_at = ?
 WHERE id = ?
 `
 
@@ -383,6 +439,7 @@ type UpdateSessionParams struct {
 	LaunchModel              string
 	LaunchReasoningEffort    string
 	LaunchRouteRecorded      bool
+	LaunchFailureStage       string
 	UpdatedAt                time.Time
 	ID                       domain.SessionID
 }
@@ -410,6 +467,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) er
 		arg.LaunchModel,
 		arg.LaunchReasoningEffort,
 		arg.LaunchRouteRecorded,
+		arg.LaunchFailureStage,
 		arg.UpdatedAt,
 		arg.ID,
 	)

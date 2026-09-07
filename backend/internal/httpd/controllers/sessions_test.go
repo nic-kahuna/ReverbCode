@@ -490,6 +490,49 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	}
 }
 
+func TestSessionsAPI_LaunchFailureStageListGetAgreeAndLegacyOmits(t *testing.T) {
+	for _, stage := range []string{"", domain.LaunchFailureAdmissionBeforeWorkspace} {
+		t.Run(stage, func(t *testing.T) {
+			svc := newFakeSessionService()
+			s := svc.sessions["ao-1"]
+			s.LaunchFailureStage = stage
+			s.IsTerminated = true
+			s.Status = domain.StatusTerminated
+			s.Activity.State = domain.ActivityExited
+			svc.sessions[s.ID] = s
+			srv := newSessionTestServer(t, svc)
+			for _, path := range []string{"/api/v1/sessions?project=ao", "/api/v1/sessions/ao-1"} {
+				body, status, _ := doRequest(t, srv, "GET", path, "")
+				if status != http.StatusOK {
+					t.Fatalf("GET %s: %d %s", path, status, body)
+				}
+				var payload struct {
+					Session  map[string]any   `json:"session"`
+					Sessions []map[string]any `json:"sessions"`
+				}
+				mustJSON(t, body, &payload)
+				row := payload.Session
+				if row == nil {
+					if len(payload.Sessions) != 1 {
+						t.Fatalf("list: %s", body)
+					}
+					row = payload.Sessions[0]
+				}
+				value, present := row["launchFailureStage"]
+				if stage == "" && present || stage != "" && (!present || value != stage) {
+					t.Fatalf("GET %s stage: %s", path, body)
+				}
+				if _, ok := row["branch"]; ok {
+					t.Fatalf("failed seed acquired branch: %s", body)
+				}
+				if _, ok := row["workspacePath"]; ok {
+					t.Fatalf("failed seed acquired workspace: %s", body)
+				}
+			}
+		})
+	}
+}
+
 func TestSessionsAPI_PreviewDiscoversAndServesStaticIndex(t *testing.T) {
 	svc := newFakeSessionService()
 	workspace := t.TempDir()

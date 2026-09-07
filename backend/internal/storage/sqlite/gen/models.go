@@ -187,6 +187,7 @@ type Session struct {
 	LaunchModel              string
 	LaunchReasoningEffort    string
 	LaunchRouteRecorded      bool
+	LaunchFailureStage       string
 }
 
 type SessionWorktree struct {
