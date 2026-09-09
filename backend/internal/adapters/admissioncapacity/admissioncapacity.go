@@ -25,7 +25,10 @@ const (
 	executableName = "ao-execution-capacity"
 	requestSchema  = "ao-worker-admission/v1"
 	commandName    = "admit-worker"
-	defaultTimeout = 30 * time.Second
+	// Fresh ownership and retained-worker checks can span several repositories
+	// and histories. Bound their aggregate work without truncating normal
+	// multi-history admission; an earlier caller deadline still takes precedence.
+	defaultTimeout = 90 * time.Second
 )
 
 var componentPattern = regexp.MustCompile(`^[a-z0-9_.-]+$`)

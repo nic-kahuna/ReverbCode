@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -161,5 +164,91 @@ func TestAdmitWorkerRejectsInvalidNativeRequest(t *testing.T) {
 				t.Fatal("accepted invalid request")
 			}
 		})
+	}
+}
+
+func TestAdmitWorkerDefaultBudgetAllowsFreshMultiHistoryChecks(t *testing.T) {
+	for _, useFallback := range []bool{false, true} {
+		t.Run(map[bool]string{false: "new client", true: "unset timeout"}[useFallback], func(t *testing.T) {
+			in := admissionRequest()
+			response, err := json.Marshal(admittedResponse(t, in))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := New(t.TempDir())
+			if useFallback {
+				c.timeout = 0
+			}
+			c.run = func(ctx context.Context, _ string) ([]byte, []byte, int, error) {
+				deadline, bounded := ctx.Deadline()
+				remaining := time.Until(deadline)
+				// The real six-history admission checks took 41s. Inspect the
+				// actual command context instead of waiting that long in a test.
+				if !bounded || remaining <= 41*time.Second || remaining > 90*time.Second {
+					t.Fatalf("fresh-check budget = %s, bounded=%v", remaining, bounded)
+				}
+				return response, nil, 0, nil
+			}
+			out, err := c.AdmitWorker(context.Background(), in)
+			if err != nil || out.IssueBody != "authoritative issue body" {
+				t.Fatalf("admission = %+v, %v", out, err)
+			}
+		})
+	}
+}
+
+func TestAdmitWorkerPreservesEarlierCallerDeadlineAndCancellation(t *testing.T) {
+	for _, cancelEarly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "deadline", true: "cancellation"}[cancelEarly], func(t *testing.T) {
+			parent, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			parentDeadline, _ := parent.Deadline()
+			c := New(t.TempDir())
+			c.run = func(ctx context.Context, _ string) ([]byte, []byte, int, error) {
+				if deadline, _ := ctx.Deadline(); !deadline.Equal(parentDeadline) {
+					t.Fatalf("caller deadline changed: %s -> %s", parentDeadline, deadline)
+				}
+				if cancelEarly {
+					cancel()
+				}
+				<-ctx.Done()
+				return nil, nil, -1, ctx.Err()
+			}
+			out, err := c.AdmitWorker(parent, admissionRequest())
+			want := context.DeadlineExceeded
+			if cancelEarly {
+				want = context.Canceled
+			}
+			if !errors.Is(err, want) || out.IssueBody != "" {
+				t.Fatalf("canceled admission = %+v, %v; want %v", out, err, want)
+			}
+		})
+	}
+}
+
+func TestAdmitWorkerDeadlineCancelsRealHelperProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("helper fixture uses a POSIX launcher")
+	}
+	bin := t.TempDir()
+	started := filepath.Join(t.TempDir(), "started")
+	script := "#!/bin/sh\nprintf started > \"$AO_TEST_ADMISSION_STARTED\"\nexec sleep 30\n"
+	if err := os.WriteFile(filepath.Join(bin, executableName), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AO_TEST_ADMISSION_STARTED", started)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	c := New(t.TempDir())
+	c.timeout = 500 * time.Millisecond
+	before := time.Now()
+	out, err := c.AdmitWorker(context.Background(), admissionRequest())
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "helper timed out") || out.IssueBody != "" {
+		t.Fatalf("timed-out subprocess admission = %+v, %v", out, err)
+	}
+	if elapsed := time.Since(before); elapsed > 3*time.Second {
+		t.Fatalf("helper did not exit promptly after its deadline: %s", elapsed)
+	}
+	if data, err := os.ReadFile(started); err != nil || string(data) != "started" {
+		t.Fatalf("real helper never started: %q, %v", data, err)
 	}
 }
