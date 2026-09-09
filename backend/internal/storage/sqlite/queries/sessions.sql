@@ -79,12 +79,18 @@ UPDATE sessions SET preview_url = ?, preview_revision = preview_revision + 1, up
 INSERT INTO worker_scheduling_holds (session_id, held_at)
 VALUES (?, ?)
 ON CONFLICT (session_id) DO UPDATE SET held_at = worker_scheduling_holds.held_at
-RETURNING session_id, held_at;
+RETURNING session_id, held_at, retirement_project_id, retirement_ticket, retirement_session_updated_at, retired_at;
 
 -- name: GetWorkerSchedulingHold :one
-SELECT session_id, held_at
+SELECT session_id, held_at, retirement_project_id, retirement_ticket, retirement_session_updated_at, retired_at
 FROM worker_scheduling_holds
 WHERE session_id = ?;
+
+-- name: SetWorkerRetirement :one
+UPDATE worker_scheduling_holds
+SET retirement_project_id = ?, retirement_ticket = ?, retirement_session_updated_at = ?, retired_at = ?
+WHERE session_id = ? AND retired_at IS NULL
+RETURNING session_id, held_at, retirement_project_id, retirement_ticket, retirement_session_updated_at, retired_at;
 
 -- name: SessionIsSeed :one
 -- SessionIsSeed reports whether the session id matches a row still in seed

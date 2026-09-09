@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -108,6 +109,27 @@ func (f *fakeStore) SetWorkerSchedulingHold(_ context.Context, id domain.Session
 func (f *fakeStore) GetWorkerSchedulingHold(_ context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error) {
 	hold, ok := f.holds[id]
 	return hold, ok, nil
+}
+func (f *fakeStore) ListPRFactsForSession(_ context.Context, id domain.SessionID) ([]domain.PRFacts, error) {
+	if pr, ok := f.pr[id]; ok {
+		return []domain.PRFacts{pr}, nil
+	}
+	return nil, nil
+}
+func (f *fakeStore) SetWorkerRetirement(_ context.Context, rec domain.SessionRecord, fact domain.WorkerRetirement) (domain.WorkerSchedulingHold, error) {
+	if !reflect.DeepEqual(f.sessions[rec.ID], rec) {
+		return domain.WorkerSchedulingHold{}, errors.New("changed session")
+	}
+	hold, ok := f.holds[rec.ID]
+	if !ok {
+		return hold, errors.New("missing hold")
+	}
+	if hold.Retirement != nil && !reflect.DeepEqual(*hold.Retirement, fact) {
+		return hold, errors.New("different retirement")
+	}
+	hold.Retirement = &fact
+	f.holds[rec.ID] = hold
+	return hold, nil
 }
 func (f *fakeStore) DeleteSession(_ context.Context, id domain.SessionID) (bool, error) {
 	if f.deleteErr != nil {

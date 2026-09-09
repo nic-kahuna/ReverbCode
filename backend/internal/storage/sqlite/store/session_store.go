@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -116,7 +117,7 @@ func (s *Store) SetWorkerSchedulingHold(ctx context.Context, id domain.SessionID
 	if err != nil {
 		return domain.WorkerSchedulingHold{}, fmt.Errorf("set worker scheduling hold for session %s: %w", id, err)
 	}
-	return domain.WorkerSchedulingHold{SessionID: domain.SessionID(row.SessionID), HeldAt: row.HeldAt}, nil
+	return workerHoldFromRow(row)
 }
 
 // GetWorkerSchedulingHold returns the durable hold for a session, or ok=false
@@ -129,7 +130,74 @@ func (s *Store) GetWorkerSchedulingHold(ctx context.Context, id domain.SessionID
 	if err != nil {
 		return domain.WorkerSchedulingHold{}, false, fmt.Errorf("get worker scheduling hold for session %s: %w", id, err)
 	}
-	return domain.WorkerSchedulingHold{SessionID: domain.SessionID(row.SessionID), HeldAt: row.HeldAt}, true, nil
+	hold, err := workerHoldFromRow(row)
+	return hold, err == nil, err
+}
+
+func workerHoldFromRow(row gen.WorkerSchedulingHold) (domain.WorkerSchedulingHold, error) {
+	hold := domain.WorkerSchedulingHold{SessionID: domain.SessionID(row.SessionID), HeldAt: row.HeldAt}
+	if !row.RetiredAt.Valid && !row.RetirementProjectID.Valid && !row.RetirementTicket.Valid && !row.RetirementSessionUpdatedAt.Valid {
+		return hold, nil
+	}
+	if !row.RetiredAt.Valid || !row.RetirementProjectID.Valid || !row.RetirementTicket.Valid || !row.RetirementSessionUpdatedAt.Valid || row.RetirementProjectID.String == "" || row.RetirementTicket.String == "" || row.RetiredAt.Time.IsZero() || row.RetirementSessionUpdatedAt.Time.IsZero() {
+		return hold, errors.New("worker retirement fact is incomplete")
+	}
+	hold.Retirement = &domain.WorkerRetirement{ProjectID: domain.ProjectID(row.RetirementProjectID.String), Ticket: domain.IssueID(row.RetirementTicket.String), SessionUpdatedAt: row.RetirementSessionUpdatedAt.Time, RetiredAt: row.RetiredAt.Time}
+	return hold, nil
+}
+
+// SetWorkerRetirement adds the immutable fact only while the exact session and
+// its PR obligations still match. The session row and all workspace rows remain
+// untouched. Existing protocol-2 holds already fence every older restore path.
+func (s *Store) SetWorkerRetirement(ctx context.Context, expected domain.SessionRecord, fact domain.WorkerRetirement) (domain.WorkerSchedulingHold, error) {
+	if err := s.RatchetCompatibility(2); err != nil {
+		return domain.WorkerSchedulingHold{}, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var hold domain.WorkerSchedulingHold
+	err := s.inTx(ctx, "record worker retirement", func(q *gen.Queries) error {
+		row, err := q.GetSession(ctx, expected.ID)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(rowToRecord(row), expected) || !expected.IsTerminated || expected.Kind != domain.KindWorker || expected.Activity.State != domain.ActivityExited || fact.ProjectID != expected.ProjectID || !fact.SessionUpdatedAt.Equal(expected.UpdatedAt) || fact.Ticket == "" || fact.RetiredAt.Before(expected.UpdatedAt) {
+			return errors.New("worker retirement session changed")
+		}
+		prs, err := q.ListPRFactsBySession(ctx, expected.ID)
+		if err != nil {
+			return err
+		}
+		for _, pr := range prs {
+			if pr.PRState != domain.PRStateClosed || pr.ReviewComments {
+				return errors.New("worker retirement has PR duty")
+			}
+		}
+		held, err := q.GetWorkerSchedulingHold(ctx, string(expected.ID))
+		if err != nil {
+			return err
+		}
+		hold, err = workerHoldFromRow(held)
+		if err != nil {
+			return err
+		}
+		if fact.RetiredAt.Before(hold.HeldAt) {
+			return errors.New("worker retirement predates hold")
+		}
+		if hold.Retirement != nil {
+			if !reflect.DeepEqual(*hold.Retirement, fact) {
+				return errors.New("worker retirement already has another immutable fact")
+			}
+			return nil
+		}
+		held, err = q.SetWorkerRetirement(ctx, gen.SetWorkerRetirementParams{SessionID: string(expected.ID), RetirementProjectID: sql.NullString{String: string(fact.ProjectID), Valid: true}, RetirementTicket: sql.NullString{String: string(fact.Ticket), Valid: true}, RetirementSessionUpdatedAt: sql.NullTime{Time: fact.SessionUpdatedAt, Valid: true}, RetiredAt: sql.NullTime{Time: fact.RetiredAt, Valid: true}})
+		if err != nil {
+			return err
+		}
+		hold, err = workerHoldFromRow(held)
+		return err
+	})
+	return hold, err
 }
 
 // DeleteSession removes a session row, but only if it is still in seed state

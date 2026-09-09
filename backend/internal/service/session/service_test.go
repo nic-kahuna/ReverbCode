@@ -263,6 +263,12 @@ func (f *fakeCommander) CheckpointHeldWorker(context.Context, domain.SessionID) 
 func (f *fakeCommander) StopWorkerRetainingWorktree(_ context.Context, id domain.SessionID) (sessionmanager.StopWorkerRetainedResult, error) {
 	return sessionmanager.StopWorkerRetainedResult{SessionID: id, RuntimeTermination: sessionmanager.RuntimeTerminationStopped, WorktreeRetained: true, ReconciliationRequired: true}, nil
 }
+func (f *fakeCommander) RetireWorkerForRetry(ctx context.Context, id domain.SessionID, _ WorkerRetirementExpectation) (StopWorkerRetainedResult, error) {
+	return f.StopWorkerRetainingWorktree(ctx, id)
+}
+func (f *fakeCommander) VerifyWorkerRetirement(context.Context, domain.SessionID, WorkerRetirementExpectation) (WorkerRetirementStatus, error) {
+	return WorkerRetirementStatus{}, nil
+}
 func (f *fakeCommander) RetireForReplacement(_ context.Context, id domain.SessionID) error {
 	if f.retireErr != nil {
 		return f.retireErr

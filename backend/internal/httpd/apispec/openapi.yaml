@@ -1218,6 +1218,22 @@ paths:
         schema:
           description: Session identifier, e.g. project-1.
           type: string
+      - in: query
+        name: verifyRetirement
+        schema:
+          type: boolean
+      - in: query
+        name: expectedProjectId
+        schema:
+          type: string
+      - in: query
+        name: expectedTicket
+        schema:
+          type: string
+      - in: query
+        name: expectedUpdatedAt
+        schema:
+          type: string
       responses:
         "200":
           content:
@@ -1237,13 +1253,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
         "500":
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Internal Server Error
-      summary: Get a worker scheduling hold
+      summary: Get a worker scheduling hold; optionally verify current retirement
       tags:
       - sessions
     post:
@@ -1952,6 +1974,11 @@ paths:
         schema:
           description: Session identifier, e.g. project-1.
           type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StopWorkerRetainedRequest'
       responses:
         "200":
           content:
@@ -1971,6 +1998,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
         "500":
           content:
             application/json:
@@ -3277,6 +3310,18 @@ components:
       required:
       - projectId
       type: object
+    StopWorkerRetainedRequest:
+      properties:
+        expectedProjectId:
+          type: string
+        expectedTicket:
+          type: string
+        expectedUpdatedAt:
+          format: date-time
+          type: string
+        retireForRetry:
+          type: boolean
+      type: object
     StopWorkerRetainedResponse:
       properties:
         held:
@@ -3286,6 +3331,8 @@ components:
           type: string
         reconciliationRequired:
           type: boolean
+        retirement:
+          $ref: '#/components/schemas/WorkerRetirement'
         runtimeTermination:
           enum:
           - stopped
@@ -3387,11 +3434,54 @@ components:
         heldAt:
           format: date-time
           type: string
+        retirement:
+          $ref: '#/components/schemas/WorkerRetirement'
+        retirementVerification:
+          $ref: '#/components/schemas/WorkerRetirementVerification'
         sessionId:
           type: string
       required:
       - sessionId
       - held
+      type: object
+    WorkerRetirement:
+      properties:
+        projectId:
+          type: string
+        retiredAt:
+          format: date-time
+          type: string
+        sessionUpdatedAt:
+          format: date-time
+          type: string
+        ticket:
+          type: string
+      required:
+      - projectId
+      - ticket
+      - sessionUpdatedAt
+      - retiredAt
+      type: object
+    WorkerRetirementVerification:
+      properties:
+        observedAt:
+          format: date-time
+          type: string
+        runtimeTermination:
+          enum:
+          - stopped
+          - unknown
+          - unsupported
+          type: string
+        scope:
+          type: string
+        verified:
+          type: boolean
+      required:
+      - verified
+      - observedAt
+      - runtimeTermination
+      - scope
       type: object
     WorkspaceRepo:
       properties:

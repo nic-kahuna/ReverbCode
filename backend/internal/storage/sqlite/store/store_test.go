@@ -1112,3 +1112,113 @@ func TestUpsertSessionWorktreeEmptyStateDefaultsToActive(t *testing.T) {
 		t.Fatalf("State = %q, want %q", got.State, "active")
 	}
 }
+
+func TestWorkerRetirementImmutablePersistenceAndExactSession(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	s.AttachCompatibilityRatchet(&recordingRatchet{})
+	seedProject(t, s, "mer")
+	rec := sampleRecord("mer")
+	rec.IsTerminated = true
+	rec.Activity.State = domain.ActivityExited
+	rec.IssueID = "326"
+	rec.UpdatedAt = rec.UpdatedAt.Add(123456789 * time.Nanosecond)
+	rec, err = s.CreateSession(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _, err = s.GetSession(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fact := domain.WorkerRetirement{ProjectID: rec.ProjectID, Ticket: "github:owner/repo#326", SessionUpdatedAt: rec.UpdatedAt, RetiredAt: rec.UpdatedAt.Add(time.Hour)}
+	if _, err = s.SetWorkerRetirement(ctx, rec, fact); err == nil {
+		t.Fatal("recorded retirement without hold")
+	}
+	if _, err = s.SetWorkerSchedulingHold(ctx, rec.ID, rec.UpdatedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	changed := rec
+	changed.Metadata.Branch = "changed"
+	if _, err = s.SetWorkerRetirement(ctx, changed, fact); err == nil {
+		t.Fatal("accepted changed session snapshot")
+	}
+	hold, err := s.SetWorkerRetirement(ctx, rec, fact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.SetWorkerRetirement(ctx, rec, fact)
+	if err != nil || !reflect.DeepEqual(hold, again) {
+		t.Fatalf("idempotence = %+v %v", again, err)
+	}
+	changedFact := fact
+	changedFact.RetiredAt = changedFact.RetiredAt.Add(time.Second)
+	if _, err = s.SetWorkerRetirement(ctx, rec, changedFact); err == nil {
+		t.Fatal("rewrote immutable retirement")
+	}
+	beforeClose, _, err := s.GetSession(ctx, rec.ID)
+	if err != nil || !reflect.DeepEqual(beforeClose, rec) {
+		t.Fatal("retirement changed session")
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	got, held, err := reopened.GetWorkerSchedulingHold(ctx, rec.ID)
+	if err != nil || !held || !reflect.DeepEqual(got, hold) {
+		t.Fatalf("reopen=%+v held=%v err=%v", got, held, err)
+	}
+	afterClose, _, err := reopened.GetSession(ctx, rec.ID)
+	if err != nil || !reflect.DeepEqual(afterClose, rec) {
+		t.Fatal("reopen changed historical session")
+	}
+}
+
+func TestWorkerRetirementStoreRejectsNativePRDuty(t *testing.T) {
+	for _, state := range []struct {
+		name string
+		pr   domain.PullRequest
+	}{{"open", domain.PullRequest{}}, {"merged", domain.PullRequest{Merged: true}}} {
+		t.Run(state.name, func(t *testing.T) {
+			s := newTestStore(t)
+			s.AttachCompatibilityRatchet(&recordingRatchet{})
+			ctx := context.Background()
+			seedProject(t, s, "mer")
+			rec := sampleRecord("mer")
+			rec.IsTerminated = true
+			rec.Activity.State = domain.ActivityExited
+			rec, err := s.CreateSession(ctx, rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = s.SetWorkerSchedulingHold(ctx, rec.ID, rec.UpdatedAt); err != nil {
+				t.Fatal(err)
+			}
+			pr := state.pr
+			pr.URL = "https://github.com/owner/repo/pull/1"
+			pr.SessionID = rec.ID
+			pr.Number = 1
+			pr.UpdatedAt = rec.UpdatedAt
+			if err = s.WritePR(ctx, pr, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			fact := domain.WorkerRetirement{ProjectID: rec.ProjectID, Ticket: "github:owner/repo#326", SessionUpdatedAt: rec.UpdatedAt, RetiredAt: rec.UpdatedAt.Add(time.Hour)}
+			if _, err = s.SetWorkerRetirement(ctx, rec, fact); err == nil {
+				t.Fatal("recorded retirement with PR duty")
+			}
+			hold, _, err := s.GetWorkerSchedulingHold(ctx, rec.ID)
+			if err != nil || hold.Retirement != nil {
+				t.Fatal("PR refusal changed retirement")
+			}
+		})
+	}
+}

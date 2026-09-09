@@ -220,9 +220,35 @@ type KillSessionResponse struct {
 
 // WorkerHoldResponse is the durable per-worker scheduling hold state.
 type WorkerHoldResponse struct {
-	SessionID domain.SessionID `json:"sessionId"`
-	Held      bool             `json:"held"`
-	HeldAt    time.Time        `json:"heldAt,omitempty"`
+	SessionID              domain.SessionID              `json:"sessionId"`
+	Held                   bool                          `json:"held"`
+	HeldAt                 time.Time                     `json:"heldAt,omitempty"`
+	Retirement             *domain.WorkerRetirement      `json:"retirement,omitempty"`
+	RetirementVerification *WorkerRetirementVerification `json:"retirementVerification,omitempty"`
+}
+
+// WorkerRetirementVerification reports a fresh read-only managed-runtime probe.
+type WorkerRetirementVerification struct {
+	Verified           bool      `json:"verified"`
+	ObservedAt         time.Time `json:"observedAt"`
+	RuntimeTermination string    `json:"runtimeTermination" enum:"stopped,unknown,unsupported"`
+	Scope              string    `json:"scope"`
+}
+
+// WorkerHoldQuery opts into exact current retirement verification.
+type WorkerHoldQuery struct {
+	VerifyRetirement  bool   `query:"verifyRetirement,omitempty" json:"verifyRetirement,omitempty"`
+	ExpectedProjectID string `query:"expectedProjectId,omitempty" json:"expectedProjectId,omitempty"`
+	ExpectedTicket    string `query:"expectedTicket,omitempty" json:"expectedTicket,omitempty"`
+	ExpectedUpdatedAt string `query:"expectedUpdatedAt,omitempty" json:"expectedUpdatedAt,omitempty"`
+}
+
+// StopWorkerRetainedRequest preserves ordinary stop unless retirement is explicit.
+type StopWorkerRetainedRequest struct {
+	RetireForRetry    bool             `json:"retireForRetry,omitempty"`
+	ExpectedProjectID domain.ProjectID `json:"expectedProjectId,omitempty"`
+	ExpectedTicket    domain.IssueID   `json:"expectedTicket,omitempty"`
+	ExpectedUpdatedAt time.Time        `json:"expectedUpdatedAt,omitempty"`
 }
 
 // WorkerCheckpointResponse acknowledges delivery of the fixed typed
@@ -235,13 +261,14 @@ type WorkerCheckpointResponse struct {
 // StopWorkerRetainedResponse distinguishes a verified stopped runtime from an
 // unknown or adapter-unsupported result while stating the preservation boundary.
 type StopWorkerRetainedResponse struct {
-	SessionID              domain.SessionID `json:"sessionId"`
-	Held                   bool             `json:"held"`
-	HeldAt                 time.Time        `json:"heldAt"`
-	RuntimeTermination     string           `json:"runtimeTermination" enum:"stopped,unknown,unsupported"`
-	WorktreeRetained       bool             `json:"worktreeRetained"`
-	ReconciliationRequired bool             `json:"reconciliationRequired"`
-	Scope                  string           `json:"scope"`
+	SessionID              domain.SessionID         `json:"sessionId"`
+	Held                   bool                     `json:"held"`
+	HeldAt                 time.Time                `json:"heldAt"`
+	RuntimeTermination     string                   `json:"runtimeTermination" enum:"stopped,unknown,unsupported"`
+	WorktreeRetained       bool                     `json:"worktreeRetained"`
+	ReconciliationRequired bool                     `json:"reconciliationRequired"`
+	Scope                  string                   `json:"scope"`
+	Retirement             *domain.WorkerRetirement `json:"retirement,omitempty"`
 }
 
 // RollbackSessionResponse is the body of POST /api/v1/sessions/{sessionId}/rollback.

@@ -128,6 +128,8 @@ type Store interface {
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
 	SetWorkerSchedulingHold(ctx context.Context, id domain.SessionID, heldAt time.Time) (domain.WorkerSchedulingHold, error)
 	GetWorkerSchedulingHold(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, bool, error)
+	SetWorkerRetirement(ctx context.Context, expected domain.SessionRecord, fact domain.WorkerRetirement) (domain.WorkerSchedulingHold, error)
+	ListPRFactsForSession(ctx context.Context, id domain.SessionID) ([]domain.PRFacts, error)
 	// DeleteSession removes a session row only if it is still in seed state
 	// (no workspace, runtime handle, agent session id, or prompt; not
 	// terminated). Returns deleted=true when removal happened; deleted=false

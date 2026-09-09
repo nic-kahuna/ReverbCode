@@ -87,10 +87,13 @@ func Build() ([]byte, error) {
 			oc.AddReqStructure(param)
 		}
 		if op.reqBody != nil {
-			// AddReqStructure leaves requestBody.required absent, which
-			// OpenAPI reads as optional. These bodies are mandatory, so force
-			// it — otherwise validators/generators treat the body as skippable.
-			oc.AddReqStructure(op.reqBody, openapi.WithCustomize(markRequestBodyRequired))
+			// Most request bodies are mandatory. Explicit optional bodies retain
+			// the existing bodyless operation for backward compatibility.
+			if op.reqBodyOptional {
+				oc.AddReqStructure(op.reqBody)
+			} else {
+				oc.AddReqStructure(op.reqBody, openapi.WithCustomize(markRequestBodyRequired))
+			}
 		}
 		for _, resp := range op.resps {
 			opts := []openapi.ContentOption{openapi.WithHTTPStatus(resp.status)}
@@ -148,6 +151,10 @@ var schemaNames = map[string]string{
 	"ControllersCleanupSessionsQuery":             "CleanupSessionsQuery",
 	"ControllersListSessionsResponse":             "ListSessionsResponse",
 	"ControllersSpawnSessionRequest":              "SpawnSessionRequest",
+	"DomainWorkerRetirement":                      "WorkerRetirement",
+	"ControllersWorkerRetirementVerification":     "WorkerRetirementVerification",
+	"ControllersWorkerHoldQuery":                  "WorkerHoldQuery",
+	"ControllersStopWorkerRetainedRequest":        "StopWorkerRetainedRequest",
 	"ControllersWorkerHoldResponse":               "WorkerHoldResponse",
 	"ControllersWorkerCheckpointResponse":         "WorkerCheckpointResponse",
 	"ControllersStopWorkerRetainedResponse":       "StopWorkerRetainedResponse",
@@ -291,6 +298,7 @@ type operation struct {
 	tag                       string
 	pathParams                []any // path/query param containers (e.g. ProjectIDParam)
 	reqBody                   any   // JSON request body struct, nil when the op takes none
+	reqBodyOptional           bool  // omitted body keeps the prior operation behavior
 	resps                     []respUnit
 	contentTypes              map[int]string // optional non-JSON response content types by status
 }
@@ -784,11 +792,12 @@ func sessionOperations() []operation {
 		},
 		{
 			method: http.MethodGet, path: "/api/v1/sessions/{sessionId}/hold", id: "getWorkerHold", tag: "sessions",
-			summary:    "Get a worker scheduling hold",
-			pathParams: []any{controllers.SessionIDParam{}},
+			summary:    "Get a worker scheduling hold; optionally verify current retirement",
+			pathParams: []any{controllers.SessionIDParam{}, controllers.WorkerHoldQuery{}},
 			resps: []respUnit{
 				{http.StatusOK, controllers.WorkerHoldResponse{}},
 				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},
@@ -818,11 +827,14 @@ func sessionOperations() []operation {
 		},
 		{
 			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/stop-retained", id: "stopWorkerRetained", tag: "sessions",
-			summary:    "Stop the known worker runtime while retaining its worktree",
-			pathParams: []any{controllers.SessionIDParam{}},
+			summary:         "Stop the known worker runtime while retaining its worktree",
+			reqBody:         controllers.StopWorkerRetainedRequest{},
+			reqBodyOptional: true,
+			pathParams:      []any{controllers.SessionIDParam{}},
 			resps: []respUnit{
 				{http.StatusOK, controllers.StopWorkerRetainedResponse{}},
 				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},

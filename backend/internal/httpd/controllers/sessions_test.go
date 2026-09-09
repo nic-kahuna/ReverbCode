@@ -171,6 +171,15 @@ func (f *fakeSessionService) CheckpointHeldWorker(_ context.Context, id domain.S
 	return nil
 }
 
+func (f *fakeSessionService) RetireWorkerForRetry(ctx context.Context, id domain.SessionID, expected sessionsvc.WorkerRetirementExpectation) (sessionsvc.StopWorkerRetainedResult, error) {
+	result, err := f.StopWorkerRetainingWorktree(ctx, id)
+	result.Hold.Retirement = &domain.WorkerRetirement{ProjectID: expected.ProjectID, Ticket: expected.Ticket, SessionUpdatedAt: expected.UpdatedAt, RetiredAt: expected.UpdatedAt.Add(time.Hour)}
+	return result, err
+}
+func (f *fakeSessionService) VerifyWorkerRetirement(_ context.Context, id domain.SessionID, expected sessionsvc.WorkerRetirementExpectation) (sessionsvc.WorkerRetirementStatus, error) {
+	return sessionsvc.WorkerRetirementStatus{Held: true, Hold: domain.WorkerSchedulingHold{SessionID: id, HeldAt: expected.UpdatedAt, Retirement: &domain.WorkerRetirement{ProjectID: expected.ProjectID, Ticket: expected.Ticket, SessionUpdatedAt: expected.UpdatedAt, RetiredAt: expected.UpdatedAt.Add(time.Hour)}}, Verification: sessionsvc.WorkerRetirementVerification{Verified: true, ObservedAt: expected.UpdatedAt.Add(2 * time.Hour), RuntimeTermination: "stopped", Scope: "named managed runtime only; detached or external jobs are not verified"}}, nil
+}
+
 func (f *fakeSessionService) StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (sessionsvc.StopWorkerRetainedResult, error) {
 	hold, err := f.HoldWorker(ctx, id)
 	if err != nil {
@@ -1136,5 +1145,32 @@ func TestSessionsAPI_ClaimPRErrors(t *testing.T) {
 			body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/pr/claim", tc.body)
 			assertErrorCode(t, body, status, tc.code, tc.want)
 		})
+	}
+}
+
+func TestSessionsAPI_RetirementUsesExplicitExistingSurfaces(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	expected := `{"retireForRetry":true,"expectedProjectId":"ao","expectedTicket":"github:owner/repo#326","expectedUpdatedAt":"2026-09-09T01:02:03.123456789Z"}`
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/stop-retained", expected)
+	for _, want := range []string{`"retirement":`, `"ticket":"github:owner/repo#326"`, `"sessionUpdatedAt":"2026-09-09T01:02:03.123456789Z"`} {
+		if status != http.StatusOK || !strings.Contains(string(body), want) {
+			t.Fatalf("status=%d body=%s missing=%s", status, body, want)
+		}
+	}
+	query := url.Values{"verifyRetirement": {"true"}, "expectedProjectId": {"ao"}, "expectedTicket": {"github:owner/repo#326"}, "expectedUpdatedAt": {"2026-09-09T01:02:03.123456789Z"}}.Encode()
+	body, status, _ = doRequest(t, srv, http.MethodGet, "/api/v1/sessions/ao-1/hold?"+query, "")
+	for _, want := range []string{`"retirementVerification":`, `"verified":true`, `"runtimeTermination":"stopped"`, `"observedAt":"2026-09-09T03:02:03.123456789Z"`} {
+		if status != http.StatusOK || !strings.Contains(string(body), want) {
+			t.Fatalf("status=%d body=%s missing=%s", status, body, want)
+		}
+	}
+	for _, invalid := range []string{`{"retireForRetry":true}`, `{"expectedTicket":"github:owner/repo#326"}`, `{"retireForRetry":true,"expectedProjectId":"ao","expectedTicket":"github:owner/repo#326","expectedUpdatedAt":"bad"}`, `{"unknown":true}`, `{"retireForRetry":false,"retireForRetry":true}`, `{} {}`, `{"retireForRetry":null}`} {
+		body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/stop-retained", invalid)
+		assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_RETIREMENT_REQUEST")
+	}
+	for _, invalid := range []string{"verifyRetirement=true", query + "&verifyRetirement=false", query + "&extra=1", "expectedTicket=x"} {
+		body, status, _ = doRequest(t, srv, http.MethodGet, "/api/v1/sessions/ao-1/hold?"+invalid, "")
+		assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_RETIREMENT_REQUEST")
 	}
 }

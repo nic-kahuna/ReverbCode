@@ -460,7 +460,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get a worker scheduling hold */
+        /** Get a worker scheduling hold; optionally verify current retirement */
         get: operations["getWorkerHold"];
         put?: never;
         /** Durably hold future worker turns and restores */
@@ -1209,11 +1209,19 @@ export interface components {
             /** @enum {string} */
             reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
         };
+        StopWorkerRetainedRequest: {
+            expectedProjectId?: string;
+            expectedTicket?: string;
+            /** Format: date-time */
+            expectedUpdatedAt?: string;
+            retireForRetry?: boolean;
+        };
         StopWorkerRetainedResponse: {
             held: boolean;
             /** Format: date-time */
             heldAt: string;
             reconciliationRequired: boolean;
+            retirement?: components["schemas"]["WorkerRetirement"];
             /** @enum {string} */
             runtimeTermination: "stopped" | "unknown" | "unsupported";
             scope: string;
@@ -1261,7 +1269,25 @@ export interface components {
             held: boolean;
             /** Format: date-time */
             heldAt?: string;
+            retirement?: components["schemas"]["WorkerRetirement"];
+            retirementVerification?: components["schemas"]["WorkerRetirementVerification"];
             sessionId: string;
+        };
+        WorkerRetirement: {
+            projectId: string;
+            /** Format: date-time */
+            retiredAt: string;
+            /** Format: date-time */
+            sessionUpdatedAt: string;
+            ticket: string;
+        };
+        WorkerRetirementVerification: {
+            /** Format: date-time */
+            observedAt: string;
+            /** @enum {string} */
+            runtimeTermination: "stopped" | "unknown" | "unsupported";
+            scope: string;
+            verified: boolean;
         };
         WorkspaceRepo: {
             name: string;
@@ -2847,7 +2873,12 @@ export interface operations {
     };
     getWorkerHold: {
         parameters: {
-            query?: never;
+            query?: {
+                verifyRetirement?: boolean;
+                expectedProjectId?: string;
+                expectedTicket?: string;
+                expectedUpdatedAt?: string;
+            };
             header?: never;
             path: {
                 /** @description Session identifier, e.g. project-1. */
@@ -2877,6 +2908,15 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3788,7 +3828,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["StopWorkerRetainedRequest"];
+            };
+        };
         responses: {
             /** @description OK */
             200: {
@@ -3810,6 +3854,15 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

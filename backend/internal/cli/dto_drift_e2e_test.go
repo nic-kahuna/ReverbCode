@@ -21,6 +21,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -90,6 +91,15 @@ func (f *fakeSessionService) HoldWorker(context.Context, domain.SessionID) (doma
 
 func (f *fakeSessionService) CheckpointHeldWorker(context.Context, domain.SessionID) error {
 	return nil
+}
+
+func (f *fakeSessionService) RetireWorkerForRetry(ctx context.Context, id domain.SessionID, expected sessionsvc.WorkerRetirementExpectation) (sessionsvc.StopWorkerRetainedResult, error) {
+	result, err := f.StopWorkerRetainingWorktree(ctx, id)
+	result.Hold.Retirement = &domain.WorkerRetirement{ProjectID: expected.ProjectID, Ticket: expected.Ticket, SessionUpdatedAt: expected.UpdatedAt, RetiredAt: expected.UpdatedAt.Add(time.Hour)}
+	return result, err
+}
+func (f *fakeSessionService) VerifyWorkerRetirement(_ context.Context, id domain.SessionID, expected sessionsvc.WorkerRetirementExpectation) (sessionsvc.WorkerRetirementStatus, error) {
+	return sessionsvc.WorkerRetirementStatus{Held: true, Hold: domain.WorkerSchedulingHold{SessionID: id, HeldAt: expected.UpdatedAt, Retirement: &domain.WorkerRetirement{ProjectID: expected.ProjectID, Ticket: expected.Ticket, SessionUpdatedAt: expected.UpdatedAt, RetiredAt: expected.UpdatedAt.Add(time.Hour)}}, Verification: sessionsvc.WorkerRetirementVerification{Verified: true, ObservedAt: expected.UpdatedAt.Add(2 * time.Hour), RuntimeTermination: "stopped", Scope: "named managed runtime only; detached or external jobs are not verified"}}, nil
 }
 
 func (f *fakeSessionService) StopWorkerRetainingWorktree(context.Context, domain.SessionID) (sessionsvc.StopWorkerRetainedResult, error) {
@@ -370,4 +380,34 @@ func TestE2E_SpawnAndProjectAddDTORoundTrip(t *testing.T) {
 			t.Errorf("output missing %q; got: %s", "registered project", out.String())
 		}
 	})
+}
+
+type retirementSessionService struct{ *fakeSessionService }
+
+func (f *retirementSessionService) Get(_ context.Context, id domain.SessionID) (domain.Session, error) {
+	return domain.Session{SessionRecord: domain.SessionRecord{ID: id, ProjectID: "demo"}}, nil
+}
+
+func TestE2E_WorkerRetirementExactDTORoundTrip(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "")
+	sessions := &retirementSessionService{&fakeSessionService{}}
+	startDriftTestDaemon(t, sessions, &fakeProjectManager{})
+	for _, op := range []struct{ command, flag string }{{"stop-retained", "--retire-for-retry"}, {"hold-status", "--verify-retirement"}} {
+		var out bytes.Buffer
+		root := NewRootCommand(Deps{Out: &out, Err: &out, HTTPClient: &http.Client{}, ProcessAlive: func(int) bool { return true }})
+		root.SetArgs([]string{"session", op.command, "demo-1", "--project", "demo", op.flag, "--expected-ticket", "github:owner/repo#326", "--expected-updated-at", "2026-09-09T01:02:03.123456789Z", "--json"})
+		if err := root.Execute(); err != nil {
+			t.Fatalf("%s: %v output=%s", op.command, err, out.String())
+		}
+		var response workerHoldResponse
+		if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Retirement == nil || response.Retirement.ProjectID != "demo" || response.Retirement.Ticket != "github:owner/repo#326" || response.Retirement.SessionUpdatedAt.Format(time.RFC3339Nano) != "2026-09-09T01:02:03.123456789Z" {
+			t.Fatalf("wire drift: %s", out.String())
+		}
+		if op.command == "hold-status" && (response.RetirementVerification == nil || !response.RetirementVerification.Verified || response.RetirementVerification.RuntimeTermination != "stopped") {
+			t.Fatalf("verification drift: %s", out.String())
+		}
+	}
 }

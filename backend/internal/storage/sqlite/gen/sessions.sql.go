@@ -79,7 +79,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (Session,
 }
 
 const getWorkerSchedulingHold = `-- name: GetWorkerSchedulingHold :one
-SELECT session_id, held_at
+SELECT session_id, held_at, retirement_project_id, retirement_ticket, retirement_session_updated_at, retired_at
 FROM worker_scheduling_holds
 WHERE session_id = ?
 `
@@ -87,7 +87,14 @@ WHERE session_id = ?
 func (q *Queries) GetWorkerSchedulingHold(ctx context.Context, sessionID string) (WorkerSchedulingHold, error) {
 	row := q.db.QueryRowContext(ctx, getWorkerSchedulingHold, sessionID)
 	var i WorkerSchedulingHold
-	err := row.Scan(&i.SessionID, &i.HeldAt)
+	err := row.Scan(
+		&i.SessionID,
+		&i.HeldAt,
+		&i.RetirementProjectID,
+		&i.RetirementTicket,
+		&i.RetirementSessionUpdatedAt,
+		&i.RetiredAt,
+	)
 	return i, err
 }
 
@@ -386,11 +393,46 @@ func (q *Queries) SetSessionPreviewURL(ctx context.Context, arg SetSessionPrevie
 	return result.RowsAffected()
 }
 
+const setWorkerRetirement = `-- name: SetWorkerRetirement :one
+UPDATE worker_scheduling_holds
+SET retirement_project_id = ?, retirement_ticket = ?, retirement_session_updated_at = ?, retired_at = ?
+WHERE session_id = ? AND retired_at IS NULL
+RETURNING session_id, held_at, retirement_project_id, retirement_ticket, retirement_session_updated_at, retired_at
+`
+
+type SetWorkerRetirementParams struct {
+	RetirementProjectID        sql.NullString
+	RetirementTicket           sql.NullString
+	RetirementSessionUpdatedAt sql.NullTime
+	RetiredAt                  sql.NullTime
+	SessionID                  string
+}
+
+func (q *Queries) SetWorkerRetirement(ctx context.Context, arg SetWorkerRetirementParams) (WorkerSchedulingHold, error) {
+	row := q.db.QueryRowContext(ctx, setWorkerRetirement,
+		arg.RetirementProjectID,
+		arg.RetirementTicket,
+		arg.RetirementSessionUpdatedAt,
+		arg.RetiredAt,
+		arg.SessionID,
+	)
+	var i WorkerSchedulingHold
+	err := row.Scan(
+		&i.SessionID,
+		&i.HeldAt,
+		&i.RetirementProjectID,
+		&i.RetirementTicket,
+		&i.RetirementSessionUpdatedAt,
+		&i.RetiredAt,
+	)
+	return i, err
+}
+
 const setWorkerSchedulingHold = `-- name: SetWorkerSchedulingHold :one
 INSERT INTO worker_scheduling_holds (session_id, held_at)
 VALUES (?, ?)
 ON CONFLICT (session_id) DO UPDATE SET held_at = worker_scheduling_holds.held_at
-RETURNING session_id, held_at
+RETURNING session_id, held_at, retirement_project_id, retirement_ticket, retirement_session_updated_at, retired_at
 `
 
 type SetWorkerSchedulingHoldParams struct {
@@ -402,7 +444,14 @@ type SetWorkerSchedulingHoldParams struct {
 func (q *Queries) SetWorkerSchedulingHold(ctx context.Context, arg SetWorkerSchedulingHoldParams) (WorkerSchedulingHold, error) {
 	row := q.db.QueryRowContext(ctx, setWorkerSchedulingHold, arg.SessionID, arg.HeldAt)
 	var i WorkerSchedulingHold
-	err := row.Scan(&i.SessionID, &i.HeldAt)
+	err := row.Scan(
+		&i.SessionID,
+		&i.HeldAt,
+		&i.RetirementProjectID,
+		&i.RetirementTicket,
+		&i.RetirementSessionUpdatedAt,
+		&i.RetiredAt,
+	)
 	return i, err
 }
 

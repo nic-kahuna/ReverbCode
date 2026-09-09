@@ -14,8 +14,12 @@ import (
 )
 
 type sessionOptions struct {
-	project string
-	json    bool
+	verifyRetirement  bool
+	retireForRetry    bool
+	expectedTicket    string
+	expectedUpdatedAt string
+	project           string
+	json              bool
 }
 
 type sessionListOptions struct {
@@ -87,20 +91,37 @@ type restoreSessionResponse struct {
 	Session   sessionDTO `json:"session"`
 }
 
+type workerRetirement struct {
+	ProjectID        string    `json:"projectId"`
+	Ticket           string    `json:"ticket"`
+	SessionUpdatedAt time.Time `json:"sessionUpdatedAt"`
+	RetiredAt        time.Time `json:"retiredAt"`
+}
+
+type workerRetirementVerification struct {
+	Verified           bool      `json:"verified"`
+	ObservedAt         time.Time `json:"observedAt"`
+	RuntimeTermination string    `json:"runtimeTermination"`
+	Scope              string    `json:"scope"`
+}
+
 type workerHoldResponse struct {
-	SessionID string    `json:"sessionId"`
-	Held      bool      `json:"held"`
-	HeldAt    time.Time `json:"heldAt,omitempty"`
+	Retirement             *workerRetirement             `json:"retirement,omitempty"`
+	RetirementVerification *workerRetirementVerification `json:"retirementVerification,omitempty"`
+	SessionID              string                        `json:"sessionId"`
+	Held                   bool                          `json:"held"`
+	HeldAt                 time.Time                     `json:"heldAt,omitempty"`
 }
 
 type stopWorkerRetainedResponse struct {
-	SessionID              string    `json:"sessionId"`
-	Held                   bool      `json:"held"`
-	HeldAt                 time.Time `json:"heldAt"`
-	RuntimeTermination     string    `json:"runtimeTermination"`
-	WorktreeRetained       bool      `json:"worktreeRetained"`
-	ReconciliationRequired bool      `json:"reconciliationRequired"`
-	Scope                  string    `json:"scope"`
+	Retirement             *workerRetirement `json:"retirement,omitempty"`
+	SessionID              string            `json:"sessionId"`
+	Held                   bool              `json:"held"`
+	HeldAt                 time.Time         `json:"heldAt"`
+	RuntimeTermination     string            `json:"runtimeTermination"`
+	WorktreeRetained       bool              `json:"worktreeRetained"`
+	ReconciliationRequired bool              `json:"reconciliationRequired"`
+	Scope                  string            `json:"scope"`
 }
 
 type renameSessionResponse struct {
@@ -293,6 +314,7 @@ func newSessionHoldStatusCommand(ctx *commandContext) *cobra.Command {
 	}
 	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
 	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
+	addWorkerRetirementFlags(cmd, &opts, &opts.verifyRetirement, "verify-retirement")
 	return cmd
 }
 
@@ -330,7 +352,14 @@ func newSessionStopRetainedCommand(ctx *commandContext) *cobra.Command {
 	}
 	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
 	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
+	addWorkerRetirementFlags(cmd, &opts, &opts.retireForRetry, "retire-for-retry")
 	return cmd
+}
+
+func addWorkerRetirementFlags(cmd *cobra.Command, opts *sessionOptions, enabled *bool, flag string) {
+	cmd.Flags().BoolVar(enabled, flag, false, "Verify exact version-bound managed-runtime retirement")
+	cmd.Flags().StringVar(&opts.expectedTicket, "expected-ticket", "", "Exact canonical GitHub ticket for retirement")
+	cmd.Flags().StringVar(&opts.expectedUpdatedAt, "expected-updated-at", "", "Exact session updatedAt for retirement")
 }
 
 func newSessionRenameCommand(ctx *commandContext) *cobra.Command {
@@ -593,21 +622,48 @@ func (c *commandContext) holdWorker(ctx context.Context, cmd *cobra.Command, id 
 }
 
 func (c *commandContext) workerHoldStatus(ctx context.Context, cmd *cobra.Command, id string, opts sessionOptions) error {
+	if err := validateRetirementOptions(opts, opts.verifyRetirement); err != nil {
+		return err
+	}
 	if opts.project != "" {
 		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
 			return err
 		}
 	}
 	var res workerHoldResponse
-	if err := c.getJSON(ctx, "sessions/"+url.PathEscape(id)+"/hold", &res); err != nil {
+	endpoint := "sessions/" + url.PathEscape(id) + "/hold"
+	if opts.verifyRetirement {
+		endpoint += "?" + url.Values{"verifyRetirement": {"true"}, "expectedProjectId": {opts.project}, "expectedTicket": {opts.expectedTicket}, "expectedUpdatedAt": {opts.expectedUpdatedAt}}.Encode()
+	}
+	if err := c.getJSON(ctx, endpoint, &res); err != nil {
 		return err
 	}
 	return writeWorkerHold(cmd, res, opts.json)
 }
 
+func validateRetirementOptions(opts sessionOptions, enabled bool) error {
+	if !enabled {
+		if opts.expectedTicket != "" || opts.expectedUpdatedAt != "" {
+			return usageError{errors.New("expected identity requires the explicit retirement option")}
+		}
+		return nil
+	}
+	if opts.project == "" || opts.expectedTicket == "" {
+		return usageError{errors.New("retirement requires --project, --expected-ticket and --expected-updated-at")}
+	}
+	if _, err := time.Parse(time.RFC3339Nano, opts.expectedUpdatedAt); err != nil {
+		return usageError{errors.New("retirement requires an exact RFC3339 updatedAt")}
+	}
+	return nil
+}
+
 func writeWorkerHold(cmd *cobra.Command, res workerHoldResponse, jsonOutput bool) error {
 	if jsonOutput {
 		return writeJSON(cmd.OutOrStdout(), res)
+	}
+	if res.RetirementVerification != nil {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "worker %s retirement verified: %t (%s)\n", res.SessionID, res.RetirementVerification.Verified, res.RetirementVerification.RuntimeTermination)
+		return err
 	}
 	if !res.Held {
 		_, err := fmt.Fprintf(cmd.OutOrStdout(), "worker %s is not held\n", res.SessionID)
@@ -634,13 +690,20 @@ func (c *commandContext) checkpointHeldWorker(ctx context.Context, cmd *cobra.Co
 }
 
 func (c *commandContext) stopWorkerRetained(ctx context.Context, cmd *cobra.Command, id string, opts sessionOptions) error {
+	if err := validateRetirementOptions(opts, opts.retireForRetry); err != nil {
+		return err
+	}
 	if opts.project != "" {
 		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
 			return err
 		}
 	}
 	var res stopWorkerRetainedResponse
-	if err := c.postJSON(ctx, "sessions/"+url.PathEscape(id)+"/stop-retained", struct{}{}, &res); err != nil {
+	var request any = struct{}{}
+	if opts.retireForRetry {
+		request = map[string]any{"retireForRetry": true, "expectedProjectId": opts.project, "expectedTicket": opts.expectedTicket, "expectedUpdatedAt": opts.expectedUpdatedAt}
+	}
+	if err := c.postJSON(ctx, "sessions/"+url.PathEscape(id)+"/stop-retained", request, &res); err != nil {
 		return err
 	}
 	if opts.json {

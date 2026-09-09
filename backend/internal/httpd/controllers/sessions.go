@@ -2,7 +2,9 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -10,11 +12,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -42,6 +46,8 @@ type SessionService interface {
 	HoldWorker(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error)
 	CheckpointHeldWorker(ctx context.Context, id domain.SessionID) error
 	StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (sessionsvc.StopWorkerRetainedResult, error)
+	RetireWorkerForRetry(ctx context.Context, id domain.SessionID, expected sessionsvc.WorkerRetirementExpectation) (sessionsvc.StopWorkerRetainedResult, error)
+	VerifyWorkerRetirement(ctx context.Context, id domain.SessionID, expected sessionsvc.WorkerRetirementExpectation) (sessionsvc.WorkerRetirementStatus, error)
 	RollbackSpawn(ctx context.Context, id domain.SessionID) (sessionsvc.RollbackOutcome, error)
 	Cleanup(ctx context.Context, project domain.ProjectID) (sessionsvc.CleanupOutcome, error)
 	Rename(ctx context.Context, id domain.SessionID, displayName string) error
@@ -406,6 +412,29 @@ func (c *SessionsController) workerHold(w http.ResponseWriter, r *http.Request) 
 		apispec.NotImplemented(w, r, "GET", "/api/v1/sessions/{sessionId}/hold")
 		return
 	}
+	if len(r.URL.Query()) > 0 {
+		query := r.URL.Query()
+		for key, values := range query {
+			if len(values) != 1 || (key != "verifyRetirement" && key != "expectedProjectId" && key != "expectedTicket" && key != "expectedUpdatedAt") {
+				envelope.WriteError(w, r, apierr.Invalid("INVALID_RETIREMENT_REQUEST", "Invalid retirement query", nil))
+				return
+			}
+		}
+		at, err := time.Parse(time.RFC3339Nano, query.Get("expectedUpdatedAt"))
+		if query.Get("verifyRetirement") != "true" || query.Get("expectedProjectId") == "" || query.Get("expectedTicket") == "" || err != nil {
+			envelope.WriteError(w, r, apierr.Invalid("INVALID_RETIREMENT_REQUEST", "Retirement verification requires exact project, ticket and version", nil))
+			return
+		}
+		status, err := c.Svc.VerifyWorkerRetirement(r.Context(), sessionID(r), sessionsvc.WorkerRetirementExpectation{ProjectID: domain.ProjectID(query.Get("expectedProjectId")), Ticket: domain.IssueID(query.Get("expectedTicket")), UpdatedAt: at})
+		if err != nil {
+			envelope.WriteError(w, r, err)
+			return
+		}
+		response := workerHoldResponse(sessionID(r), status.Hold, status.Held)
+		response.RetirementVerification = &WorkerRetirementVerification{Verified: status.Verification.Verified, ObservedAt: status.Verification.ObservedAt, RuntimeTermination: status.Verification.RuntimeTermination, Scope: status.Verification.Scope}
+		envelope.WriteJSON(w, http.StatusOK, response)
+		return
+	}
 	hold, held, err := c.Svc.WorkerHold(r.Context(), sessionID(r))
 	if err != nil {
 		envelope.WriteError(w, r, err)
@@ -444,7 +473,26 @@ func (c *SessionsController) stopWorkerRetained(w http.ResponseWriter, r *http.R
 		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/stop-retained")
 		return
 	}
-	result, err := c.Svc.StopWorkerRetainingWorktree(r.Context(), sessionID(r))
+	var in StopWorkerRetainedRequest
+	if err := decodeRetainedStop(r, &in); err != nil {
+		envelope.WriteError(w, r, apierr.Invalid("INVALID_RETIREMENT_REQUEST", "Invalid retained-stop body", nil))
+		return
+	}
+	var result sessionsvc.StopWorkerRetainedResult
+	var err error
+	if in.RetireForRetry {
+		if in.ExpectedProjectID == "" || in.ExpectedTicket == "" || in.ExpectedUpdatedAt.IsZero() {
+			envelope.WriteError(w, r, apierr.Invalid("INVALID_RETIREMENT_REQUEST", "Retirement requires exact project, ticket and version", nil))
+			return
+		}
+		result, err = c.Svc.RetireWorkerForRetry(r.Context(), sessionID(r), sessionsvc.WorkerRetirementExpectation{ProjectID: in.ExpectedProjectID, Ticket: in.ExpectedTicket, UpdatedAt: in.ExpectedUpdatedAt})
+	} else {
+		if in.ExpectedProjectID != "" || in.ExpectedTicket != "" || !in.ExpectedUpdatedAt.IsZero() {
+			envelope.WriteError(w, r, apierr.Invalid("INVALID_RETIREMENT_REQUEST", "Expected identity requires retireForRetry", nil))
+			return
+		}
+		result, err = c.Svc.StopWorkerRetainingWorktree(r.Context(), sessionID(r))
+	}
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
@@ -457,11 +505,58 @@ func (c *SessionsController) stopWorkerRetained(w http.ResponseWriter, r *http.R
 		WorktreeRetained:       result.WorktreeRetained,
 		ReconciliationRequired: result.ReconciliationRequired,
 		Scope:                  "named managed runtime only; detached or external jobs are not verified",
+		Retirement:             result.Hold.Retirement,
 	})
 }
 
+// Retirement is an explicit opt-in. Duplicate keys or trailing JSON must not
+// silently select a different operation or expected identity.
+func decodeRetainedStop(r *http.Request, out *StopWorkerRetainedRequest) error {
+	dec := json.NewDecoder(r.Body)
+	first, err := dec.Token()
+	if errors.Is(err, io.EOF) {
+		return nil
+	} // existing bodyless retained stop
+	if err != nil || first != json.Delim('{') {
+		return errors.New("expected object")
+	}
+	fields := map[string]json.RawMessage{}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok || (name != "retireForRetry" && name != "expectedProjectId" && name != "expectedTicket" && name != "expectedUpdatedAt") {
+			return errors.New("unknown retained-stop field")
+		}
+		if _, exists := fields[name]; exists {
+			return errors.New("duplicate retained-stop field")
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+		if string(value) == "null" {
+			return errors.New("null retained-stop field")
+		}
+		fields[name] = value
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("trailing retained-stop JSON")
+	}
+	data, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, out)
+}
+
 func workerHoldResponse(id domain.SessionID, hold domain.WorkerSchedulingHold, held bool) WorkerHoldResponse {
-	return WorkerHoldResponse{SessionID: id, Held: held, HeldAt: hold.HeldAt}
+	return WorkerHoldResponse{SessionID: id, Held: held, HeldAt: hold.HeldAt, Retirement: hold.Retirement}
 }
 
 // rollback undoes a partially-completed spawn: if the session row is still in

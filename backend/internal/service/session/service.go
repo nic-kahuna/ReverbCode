@@ -52,6 +52,8 @@ type commander interface {
 	HoldWorker(ctx context.Context, id domain.SessionID) (domain.WorkerSchedulingHold, error)
 	CheckpointHeldWorker(ctx context.Context, id domain.SessionID) error
 	StopWorkerRetainingWorktree(ctx context.Context, id domain.SessionID) (sessionmanager.StopWorkerRetainedResult, error)
+	RetireWorkerForRetry(ctx context.Context, id domain.SessionID, expected sessionmanager.WorkerRetirementExpectation) (sessionmanager.StopWorkerRetainedResult, error)
+	VerifyWorkerRetirement(ctx context.Context, id domain.SessionID, expected sessionmanager.WorkerRetirementExpectation) (sessionmanager.WorkerRetirementStatus, error)
 	RetireForReplacement(ctx context.Context, id domain.SessionID) error
 	Send(ctx context.Context, id domain.SessionID, message string) error
 	SendAdmitted(ctx context.Context, id domain.SessionID, message string) error
@@ -457,6 +459,27 @@ func (s *Service) StopWorkerRetainingWorktree(ctx context.Context, id domain.Ses
 	return result, toAPIError(err)
 }
 
+// WorkerRetirementExpectation binds an exact current worker generation.
+type WorkerRetirementExpectation = sessionmanager.WorkerRetirementExpectation
+
+// WorkerRetirementStatus contains the hold and current verification.
+type WorkerRetirementStatus = sessionmanager.WorkerRetirementStatus
+
+// WorkerRetirementVerification reports managed-runtime absence only.
+type WorkerRetirementVerification = sessionmanager.WorkerRetirementVerification
+
+// RetireWorkerForRetry records cessation for an explicitly selected terminal worker.
+func (s *Service) RetireWorkerForRetry(ctx context.Context, id domain.SessionID, expected WorkerRetirementExpectation) (StopWorkerRetainedResult, error) {
+	result, err := s.manager.RetireWorkerForRetry(ctx, id, expected)
+	return result, toAPIError(err)
+}
+
+// VerifyWorkerRetirement reads current cessation without runtime mutations.
+func (s *Service) VerifyWorkerRetirement(ctx context.Context, id domain.SessionID, expected WorkerRetirementExpectation) (WorkerRetirementStatus, error) {
+	result, err := s.manager.VerifyWorkerRetirement(ctx, id, expected)
+	return result, toAPIError(err)
+}
+
 // RollbackSpawn deletes a seed-state session row, or falls back to a Kill if
 // the session has spawn output. Used by the CLI to undo a `spawn --claim-pr`
 // when the claim step fails, avoiding the orphan terminated row that a plain
@@ -631,6 +654,8 @@ func toAPIError(err error) error {
 			"Session is paused on a permission decision; answer it in the session terminal first", nil)
 	case errors.Is(err, sessionmanager.ErrWorkerHeld):
 		return apierr.Conflict("WORKER_SCHEDULING_HELD", "Worker scheduling hold blocks new turns and restores", nil)
+	case errors.Is(err, sessionmanager.ErrWorkerRetirementMismatch):
+		return apierr.Conflict("WORKER_RETIREMENT_MISMATCH", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrWorkerOnly):
 		return apierr.Invalid("WORKER_REQUIRED", "Operation is available only for worker sessions", nil)
 	case errors.Is(err, sessionmanager.ErrCheckpointRequiresHold):

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -661,5 +662,21 @@ func TestSessionClaimPR_GHFallbackWhenProjectRepoMissing(t *testing.T) {
 	}
 	if ghDir != "/repo/demo" || !strings.Contains(out, "claimed PR #142") {
 		t.Fatalf("ghDir=%q out=%s", ghDir, out)
+	}
+}
+
+func TestWorkerRetirementRequiresExplicitExactIdentity(t *testing.T) {
+	setConfigEnv(t)
+	for _, args := range [][]string{
+		{"session", "stop-retained", "demo-1", "--retire-for-retry"},
+		{"session", "hold-status", "demo-1", "--verify-retirement", "--project", "demo", "--expected-ticket", "github:owner/repo#326", "--expected-updated-at", "bad"},
+		{"session", "hold-status", "demo-1", "--expected-ticket", "github:owner/repo#326"},
+		{"session", "stop-retained", "demo-1", "--expected-updated-at", "2026-09-09T00:00:00Z"},
+	} {
+		_, _, err := executeCLI(t, Deps{}, args...)
+		var usage usageError
+		if !errors.As(err, &usage) {
+			t.Fatalf("%v error=%v, want usage", args, err)
+		}
 	}
 }

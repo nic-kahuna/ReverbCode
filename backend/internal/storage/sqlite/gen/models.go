@@ -213,8 +213,12 @@ type TelemetryEvent struct {
 }
 
 type WorkerSchedulingHold struct {
-	SessionID string
-	HeldAt    time.Time
+	SessionID                  string
+	HeldAt                     time.Time
+	RetirementProjectID        sql.NullString
+	RetirementTicket           sql.NullString
+	RetirementSessionUpdatedAt sql.NullTime
+	RetiredAt                  sql.NullTime
 }
 
 type WorkspaceRepo struct {
