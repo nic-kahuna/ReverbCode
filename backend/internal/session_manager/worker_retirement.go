@@ -117,15 +117,12 @@ func (m *Manager) RetireWorkerForRetry(ctx context.Context, id domain.SessionID,
 }
 
 // VerifyWorkerRetirement performs a read-only, current runtime absence probe.
-// It deliberately shares the existing project lane with restore and hold.
+// The durable hold already fences restore and new turns. Do not enter the
+// project lane here: admission invokes this reader through a helper's HTTP
+// callback while Spawn or Restore owns that lane. Instead, bind the observation
+// to unchanged session, hold, retirement, duty, and runtime identity reads.
 func (m *Manager) VerifyWorkerRetirement(ctx context.Context, id domain.SessionID, expected WorkerRetirementExpectation) (WorkerRetirementStatus, error) {
 	result := WorkerRetirementStatus{Verification: WorkerRetirementVerification{RuntimeTermination: RuntimeTerminationUnknown, Scope: WorkerRetirementScope}}
-	opCtx, unlock, err := m.admission.Enter(ctx, expected.ProjectID)
-	if err != nil {
-		return result, err
-	}
-	defer unlock()
-	ctx = opCtx
 	rec, err := m.retirementTarget(ctx, id, expected)
 	if err != nil {
 		return result, err
@@ -153,7 +150,7 @@ func (m *Manager) VerifyWorkerRetirement(ctx context.Context, id domain.SessionI
 	alive, err := m.runtime.IsAlive(ctx, handle)
 	result.Verification.ObservedAt = m.clock().UTC()
 	if err != nil || alive {
-		return result, nil
+		return result, nil //nolint:nilerr // Probe uncertainty is an explicit unverified/unknown observation, never absence.
 	}
 	current, err := m.retirementTarget(ctx, id, expected)
 	if err != nil {
@@ -164,6 +161,13 @@ func (m *Manager) VerifyWorkerRetirement(ctx context.Context, id domain.SessionI
 		return result, err
 	}
 	if !reflect.DeepEqual(rec, current) || !held || !reflect.DeepEqual(hold, result.Hold) {
+		return result, ErrWorkerRetirementMismatch
+	}
+	currentHandle, stillSupported, err := m.retirementHandle(ctx, current)
+	if err != nil {
+		return result, err
+	}
+	if !stillSupported || currentHandle != handle {
 		return result, ErrWorkerRetirementMismatch
 	}
 	result.Verification.ObservedAt = m.clock().UTC()

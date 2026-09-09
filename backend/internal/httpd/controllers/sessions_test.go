@@ -2,6 +2,8 @@ package controllers_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,17 +11,25 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/admissioncapacity"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
+	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
+	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
 type fakeSessionService struct {
@@ -380,6 +390,198 @@ func newSessionTestServer(t *testing.T, svc *fakeSessionService) *httptest.Serve
 	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, httpd.APIDeps{Sessions: svc}, httpd.ControlDeps{}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+type retirementAdmissionRuntime struct {
+	ports.Runtime
+	alive  atomic.Bool
+	probes atomic.Int32
+}
+
+func (*retirementAdmissionRuntime) SupportsVerifiedRetainedStop() bool { return true }
+func (*retirementAdmissionRuntime) HandleFor(cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
+	return ports.RuntimeHandle{ID: string(cfg.SessionID)}, nil
+}
+func (r *retirementAdmissionRuntime) IsAlive(context.Context, ports.RuntimeHandle) (bool, error) {
+	r.probes.Add(1)
+	return r.alive.Load(), nil
+}
+
+type retirementAdmissionWorkspace struct {
+	ports.Workspace
+	calls int
+	err   error
+}
+
+func (w *retirementAdmissionWorkspace) Create(context.Context, ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	w.calls++
+	return ports.WorkspaceInfo{}, w.err
+}
+func (w *retirementAdmissionWorkspace) Restore(context.Context, ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	w.calls++
+	return ports.WorkspaceInfo{}, w.err
+}
+
+type retirementAdmissionRatchet struct{}
+
+func (retirementAdmissionRatchet) RatchetMinimum(int) error { return nil }
+
+type retirementAdmissionAgents map[domain.AgentHarness]ports.Agent
+
+func (a retirementAdmissionAgents) Agent(h domain.AgentHarness) (ports.Agent, bool) {
+	agent, ok := a[h]
+	return agent, ok
+}
+
+// This is a real same-project Spawn/Restore -> admission subprocess -> HTTP
+// controller/service/manager callback. A separate HTTP context cannot inherit
+// the outer manager's lane token. Only the external capacity policy is a fixture;
+// it must consume a current native proof before returning an admission response.
+func TestSessionsAPI_RetirementVerificationInsideNativeAdmission(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("helper fixture uses a POSIX launcher")
+	}
+	for _, operation := range []string{"spawn", "restore"} {
+		for _, revived := range []bool{false, true} {
+			t.Run(operation+"/revived="+strconv.FormatBool(revived), func(t *testing.T) {
+				ctx := context.Background()
+				dataDir := t.TempDir()
+				st, err := sqlite.Open(dataDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = st.Close() })
+				st.AttachCompatibilityRatchet(retirementAdmissionRatchet{})
+				at := time.Now().UTC().Add(-time.Hour)
+				project := domain.ProjectRecord{ID: "ao", Path: t.TempDir(), RepoOriginURL: "https://github.com/owner/repo.git", RegisteredAt: at, Config: domain.ProjectConfig{DesktopProjectsAdmission: true}}
+				if err := st.UpsertProject(ctx, project); err != nil {
+					t.Fatal(err)
+				}
+				route := domain.AgentRoute{Harness: domain.HarnessCodex, Model: "gpt-6-astra", ReasoningEffort: domain.ReasoningEffortHigh}
+				old, err := st.CreateSession(ctx, domain.SessionRecord{ProjectID: "ao", IssueID: "github:owner/repo#326", Kind: domain.KindWorker, Harness: route.Harness, IsTerminated: true, CreatedAt: at, UpdatedAt: at, Activity: domain.Activity{State: domain.ActivityExited, LastActivityAt: at}, Metadata: domain.SessionMetadata{Branch: "ao/legacy/root", WorkspacePath: "/preserved/legacy", Prompt: "historical task"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				agents := retirementAdmissionAgents{domain.HarnessCodex: codex.New()}
+				rt := &retirementAdmissionRuntime{}
+				ws := &retirementAdmissionWorkspace{err: errors.New("test reached workspace after admission")}
+				manager := sessionmanager.New(sessionmanager.Deps{Store: st, Runtime: rt, Workspace: ws, Agents: agents, Lifecycle: lifecycle.New(st, nil), Admitter: admissioncapacity.New(dataDir), DataDir: dataDir, LookPath: func(name string) (string, error) { return name, nil }})
+				expected := sessionmanager.WorkerRetirementExpectation{ProjectID: old.ProjectID, Ticket: old.IssueID, UpdatedAt: old.UpdatedAt}
+				retired, err := manager.RetireWorkerForRetry(ctx, old.ID, expected)
+				if err != nil || retired.Hold.Retirement == nil {
+					t.Fatalf("retire fixture: %+v, %v", retired, err)
+				}
+				probesBefore := rt.probes.Load()
+				rt.alive.Store(revived)
+				log := slog.New(slog.NewTextHandler(io.Discard, nil))
+				srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, httpd.APIDeps{Sessions: sessionsvc.New(manager, st)}, httpd.ControlDeps{}))
+				t.Cleanup(srv.Close)
+				query := url.Values{"verifyRetirement": {"true"}, "expectedProjectId": {string(old.ProjectID)}, "expectedTicket": {string(old.IssueID)}, "expectedUpdatedAt": {old.UpdatedAt.Format(time.RFC3339Nano)}}
+				t.Setenv("AO_RETIREMENT_TEST_CALLBACK", srv.URL+"/api/v1/sessions/"+string(old.ID)+"/hold?"+query.Encode())
+				exe, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("AO_RETIREMENT_TEST_BINARY", exe)
+				binDir := t.TempDir()
+				launcher := "#!/bin/sh\nexec \"$AO_RETIREMENT_TEST_BINARY\" -test.run=^TestRetirementAdmissionHelperProcess$ -- \"$@\"\n"
+				if err := os.WriteFile(filepath.Join(binDir, "ao-execution-capacity"), []byte(launcher), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+				// Bound the outer call below the adapter's 30s helper timeout. With
+				// lane reacquisition the callback never probes and this call expires.
+				callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				if operation == "spawn" {
+					_, err = manager.Spawn(callCtx, ports.SpawnConfig{ProjectID: old.ProjectID, IssueID: old.IssueID, Kind: domain.KindWorker, Harness: route.Harness, Route: &route, Prompt: "current task"})
+				} else {
+					restore := old
+					restore.Metadata = domain.SessionMetadata{Branch: "ao/current/root", WorkspacePath: "/preserved/current", Prompt: "current task", RequestedRoute: &route}
+					restore, err = st.CreateSession(ctx, restore)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, err = manager.Restore(callCtx, restore.ID)
+				}
+				if callCtx.Err() != nil || rt.probes.Load() != probesBefore+1 {
+					t.Fatalf("nested callback failed or deadlocked: err=%v context=%v probes=%d", err, callCtx.Err(), rt.probes.Load()-probesBefore)
+				}
+				if revived {
+					if !errors.Is(err, sessionmanager.ErrWorkerAdmission) || !strings.Contains(err.Error(), "retirement_not_verified") || ws.calls != 0 {
+						t.Fatalf("unverified runtime crossed admission: err=%v workspace calls=%d", err, ws.calls)
+					}
+				} else if !errors.Is(err, ws.err) || ws.calls != 1 {
+					t.Fatalf("verified callback did not reach workspace: err=%v calls=%d", err, ws.calls)
+				}
+				current, ok, err := st.GetSession(ctx, old.ID)
+				if err != nil || !ok || !reflect.DeepEqual(current, old) {
+					t.Fatalf("admission changed legacy session: %+v %v", current, err)
+				}
+				hold, held, err := st.GetWorkerSchedulingHold(ctx, old.ID)
+				if err != nil || !held || !reflect.DeepEqual(hold, retired.Hold) {
+					t.Fatalf("admission changed legacy hold: %+v %v", hold, err)
+				}
+				if _, err := manager.Restore(ctx, old.ID); !errors.Is(err, sessionmanager.ErrWorkerHeld) {
+					t.Fatalf("old worker lost restore fence: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// TestRetirementAdmissionHelperProcess runs only in the adapter's child process.
+func TestRetirementAdmissionHelperProcess(t *testing.T) {
+	callback := os.Getenv("AO_RETIREMENT_TEST_CALLBACK")
+	if callback == "" {
+		return
+	}
+	if len(os.Args) < 4 || os.Args[len(os.Args)-3] != "admit-worker" || os.Args[len(os.Args)-2] != "--request-json" {
+		t.Fatal("missing real admission adapter arguments")
+	}
+	var request map[string]any
+	if err := json.Unmarshal([]byte(os.Args[len(os.Args)-1]), &request); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	response, err := client.Get(callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proof struct {
+		SessionID    string                                   `json:"sessionId"`
+		Held         bool                                     `json:"held"`
+		Retirement   *domain.WorkerRetirement                 `json:"retirement"`
+		Verification *sessionsvc.WorkerRetirementVerification `json:"retirementVerification"`
+	}
+	decodeErr := json.NewDecoder(response.Body).Decode(&proof)
+	_ = response.Body.Close()
+	if decodeErr != nil || response.StatusCode != http.StatusOK || !proof.Held || proof.Retirement == nil || proof.Verification == nil {
+		t.Fatalf("invalid native proof: %+v decode=%v status=%d", proof, decodeErr, response.StatusCode)
+	}
+	u, err := url.Parse(callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Path != "/api/v1/sessions/"+proof.SessionID+"/hold" || proof.Retirement.ProjectID != domain.ProjectID(request["project"].(string)) || proof.Retirement.Ticket != domain.IssueID(request["ticket"].(string)) || proof.Retirement.SessionUpdatedAt.Format(time.RFC3339Nano) != u.Query().Get("expectedUpdatedAt") || proof.Verification.Scope != sessionmanager.WorkerRetirementScope || proof.Verification.ObservedAt.Before(proof.Retirement.RetiredAt) {
+		t.Fatalf("unbound native proof: %+v", proof)
+	}
+	if !proof.Verification.Verified || proof.Verification.RuntimeTermination != "stopped" {
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": false, "command": "admit-worker", "admitted": false, "reason": "retirement_not_verified", "error": "current native retirement proof refused"}); err != nil {
+			t.Fatal(err)
+		}
+		os.Exit(1)
+	}
+	delete(request, "schema")
+	request["repository"] = "owner/repo"
+	request["ok"], request["admitted"], request["command"] = true, true, "admit-worker"
+	request["claim_id"], request["issue_body"] = "fixture:admission", "current task"
+	request["already_held"], request["rebound"] = false, false
+	if err := json.NewEncoder(os.Stdout).Encode(request); err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(0)
 }
 
 func TestSessionsRoutes_DefaultToStubsWithoutService(t *testing.T) {

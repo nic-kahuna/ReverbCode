@@ -219,6 +219,50 @@ func TestWorkerRetirementRechecksSessionAfterProbe(t *testing.T) {
 	}
 }
 
+func TestWorkerRetirementVerificationRefusesDriftDuringProbe(t *testing.T) {
+	for name, change := range map[string]func(*fakeStore, *fakeRuntime, domain.SessionRecord){
+		"session": func(s *fakeStore, _ *fakeRuntime, r domain.SessionRecord) {
+			r.Metadata.Branch = "changed"
+			s.sessions[r.ID] = r
+		},
+		"hold removed": func(s *fakeStore, _ *fakeRuntime, r domain.SessionRecord) { delete(s.holds, r.ID) },
+		"retirement changed": func(s *fakeStore, _ *fakeRuntime, r domain.SessionRecord) {
+			hold := s.holds[r.ID]
+			fact := *hold.Retirement
+			fact.RetiredAt = fact.RetiredAt.Add(time.Second)
+			hold.Retirement = &fact
+			s.holds[r.ID] = hold
+		},
+		"repository changed": func(s *fakeStore, _ *fakeRuntime, _ domain.SessionRecord) {
+			p := s.projects["mer"]
+			p.RepoOriginURL = "https://github.com/other/repo.git"
+			s.projects["mer"] = p
+		},
+		"open PR": func(s *fakeStore, _ *fakeRuntime, r domain.SessionRecord) {
+			s.pr[r.ID] = domain.PRFacts{URL: "new-duty"}
+		},
+		"handle collision": func(s *fakeStore, _ *fakeRuntime, r domain.SessionRecord) {
+			s.sessions["other-1"] = domain.SessionRecord{ID: "other-1", Metadata: domain.SessionMetadata{RuntimeHandleID: string(r.ID)}}
+		},
+		"runtime support lost": func(_ *fakeStore, rt *fakeRuntime, _ domain.SessionRecord) { rt.verifiedStop = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, s, rt, ws, r, e := retirementFixture()
+			if _, err := m.RetireWorkerForRetry(ctx, r.ID, e); err != nil {
+				t.Fatal(err)
+			}
+			m.runtime = &retirementProbeRuntime{fakeRuntime: rt, afterProbe: func() { change(s, rt, r) }}
+			out, err := m.VerifyWorkerRetirement(ctx, r.ID, e)
+			if !errors.Is(err, ErrWorkerRetirementMismatch) || out.Verification.Verified {
+				t.Fatalf("accepted drift: %+v, %v", out, err)
+			}
+			if rt.destroyed != 0 || rt.created != 0 || len(ws.calls) != 0 {
+				t.Fatal("read-only verification touched runtime or workspace")
+			}
+		})
+	}
+}
+
 type retirementFailingStore struct {
 	*fakeStore
 	writeErr error
