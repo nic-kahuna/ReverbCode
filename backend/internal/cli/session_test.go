@@ -370,6 +370,31 @@ func TestSessionCleanup_ReportsSkippedWorkspaces(t *testing.T) {
 	}
 }
 
+func TestSessionCleanup_RecoveryOnlyDoesNotPostOrClaimItWouldClean(t *testing.T) {
+	cfg := setConfigEnv(t)
+	var posted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions" {
+			_, _ = io.WriteString(w, `{"sessions":[{"id":"demo-old","projectId":"demo","kind":"worker","activity":{"state":"exited"},"isTerminated":true,"status":"terminated","recovery":{"state":"awaiting_recovery","policy":"preserve_only","runtimeState":"absent","providerSessionSaved":true,"worktrees":[{"repoName":"__root__","state":"preserved"}]}}]}`)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/cleanup" {
+			posted = true
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "session", "cleanup", "--project", "demo", "--yes")
+	if err != nil {
+		t.Fatalf("session cleanup: %v\nstderr=%s", err, errOut)
+	}
+	if posted || strings.Contains(out, "Would clean") || !strings.Contains(out, "Would skip demo-old (awaiting managed recovery)") {
+		t.Fatalf("cleanup preview = posted %v\n%s", posted, out)
+	}
+}
+
 func TestSessionCleanup_PromptFailsWithoutInput(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv, log := sessionCommandServer(t)

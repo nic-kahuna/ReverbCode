@@ -1881,6 +1881,8 @@ components:
           items:
             $ref: '#/components/schemas/SessionPRFacts'
           type: array
+        recovery:
+          $ref: '#/components/schemas/SessionRecovery'
         requestedRoute:
           $ref: '#/components/schemas/DomainAgentRoute'
         status:
@@ -2334,6 +2336,11 @@ components:
           type: array
         sessionPrefix:
           type: string
+        startupRestorePolicy:
+          enum:
+          - automatic
+          - preserve_only
+          type: string
         symlinks:
           items:
             type: string
@@ -2390,6 +2397,28 @@ components:
       - path
       - kind
       - sessionPrefix
+      type: object
+    RecoveryWorktree:
+      properties:
+        baseSha:
+          type: string
+        branch:
+          type: string
+        preservedRef:
+          type: string
+        repoName:
+          type: string
+        state:
+          type: string
+        worktreePath:
+          type: string
+      required:
+      - repoName
+      - branch
+      - baseSha
+      - worktreePath
+      - preservedRef
+      - state
       type: object
     RemoveProjectResult:
       properties:
@@ -2800,6 +2829,34 @@ components:
           type: string
       required:
       - sessionId
+      type: object
+    SessionRecovery:
+      properties:
+        policy:
+          enum:
+          - preserve_only
+          type: string
+        providerSessionSaved:
+          type: boolean
+        runtimeState:
+          enum:
+          - absent
+          - unknown
+          type: string
+        state:
+          enum:
+          - awaiting_recovery
+          type: string
+        worktrees:
+          items:
+            $ref: '#/components/schemas/RecoveryWorktree'
+          type: array
+      required:
+      - state
+      - policy
+      - runtimeState
+      - providerSessionSaved
+      - worktrees
       type: object
     SessionResponse:
       properties:

@@ -7,6 +7,40 @@ import (
 	"strings"
 )
 
+// StartupRestorePolicy controls what AO does with recoverable sessions during
+// daemon startup. Automatic preserves the historical behavior. Preserve-only
+// records recoverable state but leaves the session stopped until an exact
+// explicit restore is requested.
+type StartupRestorePolicy string
+
+const (
+	// StartupRestoreAutomatic preserves historical startup reconciliation:
+	// recoverable sessions may be relaunched automatically.
+	StartupRestoreAutomatic StartupRestorePolicy = "automatic"
+	// StartupRestorePreserveOnly journals recoverable sessions without
+	// relaunching them until an explicit exact-session restore.
+	StartupRestorePreserveOnly StartupRestorePolicy = "preserve_only"
+)
+
+// WithDefault keeps omitted legacy project configs backward compatible.
+func (p StartupRestorePolicy) WithDefault() StartupRestorePolicy {
+	if p == "" {
+		return StartupRestoreAutomatic
+	}
+	return p
+}
+
+// Validate rejects unknown policies rather than silently selecting a startup
+// behavior. Empty is valid because it is the persisted legacy/default form.
+func (p StartupRestorePolicy) Validate() error {
+	switch p {
+	case "", StartupRestoreAutomatic, StartupRestorePreserveOnly:
+		return nil
+	default:
+		return fmt.Errorf("startupRestorePolicy: unknown policy %q: want automatic or preserve_only", p)
+	}
+}
+
 // ProjectConfig is the typed per-project configuration — the SQLite twin of the
 // legacy agent-orchestrator.yaml `projects.<id>` block. It is persisted as one
 // JSON blob per project and resolved at spawn. Each field is typed and
@@ -14,13 +48,17 @@ import (
 //
 // Only fields with a live consumer are modeled: DefaultBranch, Env, Symlinks,
 // PostCreate, AgentConfig, and the role overrides are consumed at spawn;
-// SessionPrefix feeds the display prefix. TrackerIntake feeds the background
-// issue-intake loop.
+// StartupRestorePolicy controls boot reconciliation; SessionPrefix feeds the
+// display prefix. TrackerIntake feeds the background issue-intake loop.
 type ProjectConfig struct {
 	// DefaultBranch is the base branch new session worktrees are created from.
 	DefaultBranch string `json:"defaultBranch,omitempty"`
 	// SessionPrefix overrides the displayed session-id prefix.
 	SessionPrefix string `json:"sessionPrefix,omitempty"`
+	// StartupRestorePolicy controls daemon-start reconciliation. The omitted
+	// legacy value resolves to automatic; preserve_only requires an explicit
+	// per-session restore before AO starts an agent process.
+	StartupRestorePolicy StartupRestorePolicy `json:"startupRestorePolicy,omitempty" enum:"automatic,preserve_only"`
 
 	// Env are extra environment variables forwarded into worker session
 	// runtimes. AO-internal vars (AO_SESSION, AO_PROJECT_ID, …) always win.
@@ -82,11 +120,13 @@ type RoleOverride struct {
 const DefaultBranchName = "main"
 
 // DefaultProjectConfig returns the config a project has when it sets nothing:
-// branch "main". Every other field defaults to its zero value (no
-// env/symlinks/post-create, agent + role defaults).
+// branch "main" and backward-compatible automatic startup restore. Every other
+// field defaults to its zero value (no env/symlinks/post-create, agent + role
+// defaults).
 func DefaultProjectConfig() ProjectConfig {
 	return ProjectConfig{
-		DefaultBranch: DefaultBranchName,
+		DefaultBranch:        DefaultBranchName,
+		StartupRestorePolicy: StartupRestoreAutomatic,
 	}
 }
 
@@ -97,6 +137,7 @@ func (c ProjectConfig) WithDefaults() ProjectConfig {
 	if c.DefaultBranch == "" {
 		c.DefaultBranch = def.DefaultBranch
 	}
+	c.StartupRestorePolicy = c.StartupRestorePolicy.WithDefault()
 	c.TrackerIntake = c.TrackerIntake.WithDefaults()
 	return c
 }
@@ -110,6 +151,9 @@ func (c ProjectConfig) IsZero() bool {
 // Validate rejects values outside the typed vocabulary so a bad config is
 // refused when it is set (CLI/API) rather than surfacing at spawn.
 func (c ProjectConfig) Validate() error {
+	if err := c.StartupRestorePolicy.Validate(); err != nil {
+		return err
+	}
 	if err := c.AgentConfig.Validate(); err != nil {
 		return err
 	}

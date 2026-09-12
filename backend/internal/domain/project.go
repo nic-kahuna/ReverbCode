@@ -9,6 +9,17 @@ const (
 	ProjectKindWorkspace ProjectKind = "workspace"
 	// RootWorkspaceRepoName is the reserved repo_name used for the parent root repo.
 	RootWorkspaceRepoName = "__root__"
+	// SessionWorktreeStatePreserved marks a recoverable worktree journaled by
+	// preserve-only startup reconciliation at its exact registered path.
+	SessionWorktreeStatePreserved = "preserved"
+	// SessionWorktreeStatePreservedRemoved marks a recoverable worktree whose
+	// exact registered path is absent and may be recreated by explicit restore.
+	SessionWorktreeStatePreservedRemoved = "preserved_removed"
+	// SessionWorktreeStatePreservedPartial marks managed recovery whose runtime,
+	// workspace disposition, or durable transition is ambiguous. It covers both
+	// startup quarantine and an explicit restore that could not safely complete;
+	// it is never eligible for automatic or retry restore.
+	SessionWorktreeStatePreservedPartial = "preserved_partial"
 )
 
 // ProjectKind describes how a registered project materialises session workspaces.
@@ -34,6 +45,10 @@ type ProjectRecord struct {
 	// Config holds the typed per-project configuration AO resolves at spawn. An
 	// IsZero value means unset.
 	Config ProjectConfig
+	// ConfigDecodeError is non-empty when storage kept the project accessible but
+	// could not decode its persisted config JSON. Startup reconciliation must
+	// treat this as unknown policy and fail closed.
+	ConfigDecodeError string
 }
 
 // WorkspaceRepoRecord is a child repo registered under a workspace project.
@@ -56,10 +71,8 @@ type SessionWorktreeRecord struct {
 	BaseSHA      string
 	WorktreePath string
 	PreservedRef string
-	// ponytail: State mirrors session_worktrees.state, an enum that is unused
-	// multi-repo scaffolding. The save/restore lifecycle reads and writes only
-	// PreservedRef and row presence; State is never set by any live code path
-	// and always resolves to the column default ('active' on insert). Wire it
-	// when multi-repo worktree lifecycle states actually ship.
+	// State mirrors session_worktrees.state. In addition to physical worktree
+	// lifecycle values, preserved, preserved_removed, and preserved_partial are
+	// durable managed-recovery journal states.
 	State string
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -82,12 +83,13 @@ func TestProjectConfigRoundTrips(t *testing.T) {
 	// A config with mixed field kinds (scalar, map, list, nested) survives the
 	// JSON round trip.
 	cfg := domain.ProjectConfig{
-		DefaultBranch: "develop",
-		Env:           map[string]string{"FOO": "bar"},
-		Symlinks:      []string{".env"},
-		PostCreate:    []string{"echo hi"},
-		AgentConfig:   domain.AgentConfig{Model: "claude-opus-4-5", Permissions: domain.PermissionModeAcceptEdits},
-		Worker:        domain.RoleOverride{Harness: domain.HarnessCodex},
+		DefaultBranch:        "develop",
+		StartupRestorePolicy: domain.StartupRestorePreserveOnly,
+		Env:                  map[string]string{"FOO": "bar"},
+		Symlinks:             []string{".env"},
+		PostCreate:           []string{"echo hi"},
+		AgentConfig:          domain.AgentConfig{Model: "claude-opus-4-5", Permissions: domain.PermissionModeAcceptEdits},
+		Worker:               domain.RoleOverride{Harness: domain.HarnessCodex},
 	}
 	if err := s.UpsertProject(ctx, domain.ProjectRecord{
 		ID: "cfg", Path: "/tmp/cfg", RegisteredAt: now, Config: cfg,
@@ -100,6 +102,9 @@ func TestProjectConfigRoundTrips(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Config, cfg) {
 		t.Fatalf("config = %#v, want %#v", got.Config, cfg)
+	}
+	if got.ConfigDecodeError != "" {
+		t.Fatalf("valid config decode error = %q, want empty", got.ConfigDecodeError)
 	}
 
 	// An unset config round-trips back to a zero value rather than an empty object.
@@ -117,6 +122,44 @@ func TestProjectConfigRoundTrips(t *testing.T) {
 	}
 	if got, _, _ := s.GetProject(ctx, "cfg"); !got.Config.IsZero() {
 		t.Fatalf("cleared config = %#v, want zero", got.Config)
+	}
+}
+
+func TestProjectUpsertRefusesToEraseUndecodableConfig(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	row := domain.ProjectRecord{
+		ID:           "corrupt",
+		Path:         "/tmp/corrupt",
+		RegisteredAt: now,
+		Config: domain.ProjectConfig{
+			StartupRestorePolicy: domain.StartupRestorePreserveOnly,
+		},
+	}
+	if err := s.UpsertProject(ctx, row); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+
+	row.Path = "/tmp/accidental-overwrite"
+	row.Config = domain.ProjectConfig{}
+	row.ConfigDecodeError = "decode project config: invalid JSON"
+	if err := s.UpsertProject(ctx, row); err == nil || !strings.Contains(err.Error(), "refusing to overwrite undecodable config") {
+		t.Fatalf("UpsertProject error = %v, want undecodable-config refusal", err)
+	}
+	if err := s.UpsertWorkspaceProject(ctx, row, nil); err == nil || !strings.Contains(err.Error(), "refusing to overwrite undecodable config") {
+		t.Fatalf("UpsertWorkspaceProject error = %v, want undecodable-config refusal", err)
+	}
+	got, ok, err := s.GetProject(ctx, row.ID)
+	if err != nil || !ok {
+		t.Fatalf("get preserved project: ok=%v err=%v", ok, err)
+	}
+	if got.Path != "/tmp/corrupt" || got.Config.StartupRestorePolicy != domain.StartupRestorePreserveOnly {
+		t.Fatalf("project changed after refused upserts: %#v", got)
+	}
+	if got.ConfigDecodeError != "" {
+		t.Fatalf("valid stored project gained decode error %q", got.ConfigDecodeError)
 	}
 }
 
@@ -759,6 +802,9 @@ func TestSessionWorktreesRoundTrip(t *testing.T) {
 	rows := []domain.SessionWorktreeRecord{
 		{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, Branch: "ao/ws-1", BaseSHA: "root-base", WorktreePath: "/managed/ws/ws-1", State: "active"},
 		{SessionID: rec.ID, RepoName: "api", Branch: "ao/ws-1", BaseSHA: "api-base", WorktreePath: "/managed/ws/ws-1/api", PreservedRef: "refs/ao/preserved/ws-1", State: "removed"},
+		{SessionID: rec.ID, RepoName: "docs", Branch: "ao/ws-1", BaseSHA: "docs-base", WorktreePath: "/managed/ws/ws-1/docs", PreservedRef: "refs/ao/preserved/ws-1-docs", State: domain.SessionWorktreeStatePreservedPartial},
+		{SessionID: rec.ID, RepoName: "mobile", Branch: "ao/ws-1", BaseSHA: "mobile-base", WorktreePath: "/managed/ws/ws-1/mobile", PreservedRef: "refs/ao/preserved/ws-1-mobile", State: domain.SessionWorktreeStatePreservedRemoved},
+		{SessionID: rec.ID, RepoName: "web", Branch: "ao/ws-1", BaseSHA: "web-base", WorktreePath: "/managed/ws/ws-1/web", PreservedRef: "refs/ao/preserved/ws-1-web", State: domain.SessionWorktreeStatePreserved},
 	}
 	for _, row := range rows {
 		if err := s.UpsertSessionWorktree(ctx, row); err != nil {
@@ -776,6 +822,18 @@ func TestSessionWorktreesRoundTrip(t *testing.T) {
 	if err != nil || !ok || one.PreservedRef != "refs/ao/preserved/ws-1" {
 		t.Fatalf("get api = %#v ok=%v err=%v", one, ok, err)
 	}
+	preserved, ok, err := s.GetSessionWorktree(ctx, rec.ID, "web")
+	if err != nil || !ok || preserved.State != domain.SessionWorktreeStatePreserved || preserved.PreservedRef != "refs/ao/preserved/ws-1-web" {
+		t.Fatalf("get preserved web = %#v ok=%v err=%v", preserved, ok, err)
+	}
+	removed, ok, err := s.GetSessionWorktree(ctx, rec.ID, "mobile")
+	if err != nil || !ok || removed.State != domain.SessionWorktreeStatePreservedRemoved || removed.PreservedRef != "refs/ao/preserved/ws-1-mobile" {
+		t.Fatalf("get preserved-removed mobile = %#v ok=%v err=%v", removed, ok, err)
+	}
+	partial, ok, err := s.GetSessionWorktree(ctx, rec.ID, "docs")
+	if err != nil || !ok || partial.State != domain.SessionWorktreeStatePreservedPartial || partial.PreservedRef != "refs/ao/preserved/ws-1-docs" {
+		t.Fatalf("get preserved-partial docs = %#v ok=%v err=%v", partial, ok, err)
+	}
 	rows[1].State = "active"
 	rows[1].PreservedRef = ""
 	if err := s.UpsertSessionWorktree(ctx, rows[1]); err != nil {
@@ -785,12 +843,42 @@ func TestSessionWorktreesRoundTrip(t *testing.T) {
 	if err != nil || !ok || one.State != "active" || one.PreservedRef != "" {
 		t.Fatalf("updated api = %#v ok=%v err=%v", one, ok, err)
 	}
+	invalid := rows[0]
+	invalid.RepoName = "invalid-state"
+	invalid.State = "unknown"
+	if err := s.UpsertSessionWorktree(ctx, invalid); err == nil {
+		t.Fatal("upsert accepted an unknown worktree state")
+	}
 	if err := s.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 		t.Fatalf("delete worktrees: %v", err)
 	}
 	got, err = s.ListSessionWorktrees(ctx, rec.ID)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("after delete = %#v err=%v", got, err)
+	}
+}
+
+func TestUpsertSessionWorktreesIsAtomic(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "atomic")
+	rec, err := s.CreateSession(ctx, sampleRecord("atomic"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	rows := []domain.SessionWorktreeRecord{
+		{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, Branch: "ao/atomic-1", WorktreePath: "/managed/atomic/root", State: domain.SessionWorktreeStatePreserved},
+		{SessionID: rec.ID, RepoName: "api", Branch: "ao/atomic-1", WorktreePath: "/managed/atomic/api", State: "unknown-state"},
+	}
+	if err := s.UpsertSessionWorktrees(ctx, rows); err == nil {
+		t.Fatal("atomic batch accepted an invalid second row")
+	}
+	got, err := s.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("list worktrees: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("failed atomic batch published partial rows: %#v", got)
 	}
 }
 

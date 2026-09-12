@@ -22,9 +22,10 @@ const commandTimeout = 2 * time.Minute
 // apiError is the subset of the daemon's JSON error envelope the CLI surfaces.
 // RequestID is surfaced so a failed command can be correlated with daemon logs.
 type apiError struct {
-	Message   string `json:"message"`
-	Code      string `json:"code"`
-	RequestID string `json:"requestId"`
+	Message   string         `json:"message"`
+	Code      string         `json:"code"`
+	RequestID string         `json:"requestId"`
+	Details   map[string]any `json:"details,omitempty"`
 }
 
 type apiResponseError struct {
@@ -48,6 +49,11 @@ func (e apiError) String() string {
 	}
 	if e.RequestID != "" {
 		msg = fmt.Sprintf("%s [request %s]", msg, e.RequestID)
+	}
+	if e.Code == "SESSION_RESTORE_FAILED" && e.Details != nil {
+		if reason, ok := e.Details["reason"].(string); ok && reason != "" {
+			msg = fmt.Sprintf("%s [reason %s]", msg, reason)
+		}
 	}
 	return msg
 }

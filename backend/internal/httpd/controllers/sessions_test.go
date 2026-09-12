@@ -32,6 +32,7 @@ type fakeSessionService struct {
 	lastSpawn       ports.SpawnConfig
 	claimErr        error
 	listPRErr       error
+	restoreErr      error
 }
 
 func newFakeSessionService() *fakeSessionService {
@@ -135,6 +136,9 @@ func (f *fakeSessionService) SetPreview(_ context.Context, id domain.SessionID, 
 }
 
 func (f *fakeSessionService) Restore(_ context.Context, id domain.SessionID) (domain.Session, error) {
+	if f.restoreErr != nil {
+		return domain.Session{}, f.restoreErr
+	}
 	s := f.sessions[id]
 	s.IsTerminated = false
 	s.Status = domain.StatusIdle

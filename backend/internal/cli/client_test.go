@@ -14,6 +14,7 @@ func TestAPIErrorString(t *testing.T) {
 		{"message and code", apiError{Message: "boom", Code: "X"}, "boom (X)"},
 		{"with request id", apiError{Message: "boom", Code: "X", RequestID: "req-1"}, "boom (X) [request req-1]"},
 		{"message and request id", apiError{Message: "boom", RequestID: "req-1"}, "boom [request req-1]"},
+		{"managed restore reason", apiError{Message: "cannot restore", Code: "SESSION_RESTORE_FAILED", Details: map[string]any{"reason": "launch_route_missing"}}, "cannot restore (SESSION_RESTORE_FAILED) [reason launch_route_missing]"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

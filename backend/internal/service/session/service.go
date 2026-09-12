@@ -20,6 +20,7 @@ type Store interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	ListSessions(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error)
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	ListSessionWorktrees(ctx context.Context, id domain.SessionID) ([]domain.SessionWorktreeRecord, error)
 	RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error)
 	SetSessionPreviewURL(ctx context.Context, id domain.SessionID, previewURL string, updatedAt time.Time) (bool, error)
 	GetDisplayPRFactsForSession(ctx context.Context, id domain.SessionID) (domain.PRFacts, bool, error)
@@ -469,6 +470,19 @@ func (s *Service) TeardownProject(ctx context.Context, project domain.ProjectID)
 	if err != nil {
 		return err
 	}
+	awaiting := make([]domain.SessionID, 0)
+	for _, rec := range recs {
+		recovery, err := s.sessionRecovery(ctx, rec)
+		if err != nil {
+			return err
+		}
+		if recovery != nil {
+			awaiting = append(awaiting, rec.ID)
+		}
+	}
+	if len(awaiting) > 0 {
+		return apierr.Conflict("PROJECT_HAS_MANAGED_RECOVERY", "Project has sessions awaiting explicit recovery; restore or discard each session before removal", map[string]any{"sessionIds": awaiting})
+	}
 	for _, rec := range recs {
 		if rec.IsTerminated {
 			continue
@@ -489,12 +503,12 @@ func (s *Service) List(ctx context.Context, filter ListFilter) ([]domain.Session
 	}
 	out := make([]domain.Session, 0, len(recs))
 	for _, rec := range recs {
-		if !matchesSessionFilter(rec, filter) {
-			continue
-		}
 		sess, err := s.toSession(ctx, rec)
 		if err != nil {
 			return nil, err
+		}
+		if !matchesSessionFilter(sess.SessionRecord, filter) {
+			continue
 		}
 		out = append(out, sess)
 	}
@@ -545,13 +559,36 @@ func (s *Service) Get(ctx context.Context, id domain.SessionID) (domain.Session,
 // toAPIError maps the session engine's sentinel errors to their REST API
 // equivalents; an unrecognized error passes through and surfaces as a 500.
 func toAPIError(err error) error {
+	var recoveryFailure *sessionmanager.RecoveryFailure
 	switch {
 	case err == nil:
 		return nil
+	case errors.As(err, &recoveryFailure):
+		worktrees := make([]map[string]any, 0, len(recoveryFailure.Worktrees))
+		for _, row := range recoveryFailure.Worktrees {
+			worktrees = append(worktrees, map[string]any{
+				"repoName": row.RepoName, "branch": row.Branch, "baseSha": row.BaseSHA,
+				"worktreePath": row.WorktreePath, "preservedRef": row.PreservedRef, "state": row.State,
+			})
+		}
+		details := map[string]any{
+			"reason": recoveryFailure.Code, "sessionId": recoveryFailure.SessionID,
+			"phase":     recoveryFailure.Phase,
+			"projectId": recoveryFailure.ProjectID, "role": recoveryFailure.Kind,
+			"providerSessionSaved": recoveryFailure.ProviderSessionSaved, "worktrees": worktrees,
+		}
+		if recoveryFailure.RuntimeStopped != nil {
+			details["runtimeStopped"] = *recoveryFailure.RuntimeStopped
+		}
+		return apierr.Conflict("SESSION_RESTORE_FAILED", "Managed session restore did not complete; recovery evidence was preserved", details)
 	case errors.Is(err, sessionmanager.ErrNotFound):
 		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
 	case errors.Is(err, sessionmanager.ErrNotRestorable):
 		return apierr.Conflict("SESSION_NOT_RESTORABLE", "Session is not restorable", nil)
+	case errors.Is(err, sessionmanager.ErrRecoveryAdmission):
+		return apierr.Conflict("SESSION_AWAITING_RECOVERY", "Session recovery requires explicit restore or discard", nil)
+	case errors.Is(err, sessionmanager.ErrProjectConfigInvalid):
+		return apierr.Conflict("PROJECT_CONFIG_INVALID", "Project config must be repaired before starting sessions", nil)
 	case errors.Is(err, sessionmanager.ErrTerminated):
 		return apierr.Conflict("SESSION_TERMINATED", "Session is terminated", nil)
 	case errors.Is(err, sessionmanager.ErrAwaitingDecision):
@@ -588,7 +625,30 @@ func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord) (doma
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("pr facts %s: %w", rec.ID, err)
 	}
-	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, PRs: prs}, nil
+	recovery, err := s.sessionRecovery(ctx, rec)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	status := deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness))
+	terminalHandleID := rec.Metadata.RuntimeHandleID
+	if recovery != nil {
+		// Durable recovery provenance outranks stale activity, PR, and runtime
+		// presentation. Project an exited activity at the read boundary too so
+		// CLI/UI consumers that render activity independently cannot claim the
+		// session is active, idle, or awaiting user input. The stored activity
+		// timestamp/fact remains untouched in SQLite.
+		status = domain.StatusTerminated
+		rec.IsTerminated = true
+		rec.Activity.State = domain.ActivityExited
+		terminalHandleID = ""
+	}
+	return domain.Session{
+		SessionRecord:    rec,
+		Status:           status,
+		Recovery:         recovery,
+		TerminalHandleID: terminalHandleID,
+		PRs:              prs,
+	}, nil
 }
 
 // now tolerates a zero-value Service (tests construct the struct literally

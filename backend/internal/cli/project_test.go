@@ -35,6 +35,48 @@ func projectServer(t *testing.T, status int, respBody string) (*httptest.Server,
 	return srv, capture
 }
 
+func fullyPopulatedProjectConfig(policy string) projectConfig {
+	return projectConfig{
+		DefaultBranch:        "develop",
+		SessionPrefix:        "demo",
+		StartupRestorePolicy: policy,
+		Env:                  map[string]string{"FOO": "bar"},
+		Symlinks:             []string{".env"},
+		PostCreate:           []string{"npm install"},
+		AgentConfig: agentConfig{
+			Model:           "base-model",
+			Profile:         "base-profile",
+			ReasoningEffort: "medium",
+			Permissions:     "auto",
+		},
+		Worker: roleOverride{
+			Agent: "claude-code",
+			AgentConfig: agentConfig{
+				Model:           "worker-model",
+				Profile:         "worker-profile",
+				ReasoningEffort: "high",
+				Permissions:     "accept-edits",
+			},
+		},
+		Orchestrator: roleOverride{
+			Agent: "codex",
+			AgentConfig: agentConfig{
+				Model:           "gpt-5.6-luna",
+				Profile:         "ao-minimal",
+				ReasoningEffort: "low",
+				Permissions:     "bypass-permissions",
+			},
+		},
+		Reviewers: []reviewerConfig{{Harness: "codex"}, {Harness: "claude-code"}},
+		TrackerIntake: trackerIntakeConfig{
+			Enabled:  true,
+			Provider: "github",
+			Repo:     "acme/demo",
+			Assignee: "alice",
+		},
+	}
+}
+
 func TestProjectSetConfig_TrackerIntakeFlags(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv, capture := projectServer(t, http.StatusOK, `{"project":{"id":"demo","path":"/repo/demo"}}`)
@@ -80,44 +122,7 @@ func TestProjectSetConfig_TrackerIntakeJSON(t *testing.T) {
 
 func TestProjectConfigJSONRoundTripPreservesCompleteConfig(t *testing.T) {
 	cfg := setConfigEnv(t)
-	want := projectConfig{
-		DefaultBranch: "develop",
-		SessionPrefix: "demo",
-		Env:           map[string]string{"FOO": "bar"},
-		Symlinks:      []string{".env"},
-		PostCreate:    []string{"npm install"},
-		AgentConfig: agentConfig{
-			Model:           "base-model",
-			Profile:         "base-profile",
-			ReasoningEffort: "medium",
-			Permissions:     "auto",
-		},
-		Worker: roleOverride{
-			Agent: "claude-code",
-			AgentConfig: agentConfig{
-				Model:           "worker-model",
-				Profile:         "worker-profile",
-				ReasoningEffort: "high",
-				Permissions:     "accept-edits",
-			},
-		},
-		Orchestrator: roleOverride{
-			Agent: "codex",
-			AgentConfig: agentConfig{
-				Model:           "gpt-5.6-luna",
-				Profile:         "ao-minimal",
-				ReasoningEffort: "low",
-				Permissions:     "bypass-permissions",
-			},
-		},
-		Reviewers: []reviewerConfig{{Harness: "codex"}, {Harness: "claude-code"}},
-		TrackerIntake: trackerIntakeConfig{
-			Enabled:  true,
-			Provider: "github",
-			Repo:     "acme/demo",
-			Assignee: "alice",
-		},
-	}
+	want := fullyPopulatedProjectConfig("preserve_only")
 	configJSON, err := json.Marshal(want)
 	if err != nil {
 		t.Fatal(err)
@@ -177,6 +182,162 @@ func TestBuildProjectConfigTrackerIntakeFlags(t *testing.T) {
 	}
 	if !got.TrackerIntake.Enabled || got.TrackerIntake.Provider != "github" || got.TrackerIntake.Repo != "acme/demo" || got.TrackerIntake.Assignee != "alice" {
 		t.Fatalf("tracker intake config = %#v", got.TrackerIntake)
+	}
+}
+
+func TestProjectSetConfig_StartupRestorePolicyFlag(t *testing.T) {
+	cfg := setConfigEnv(t)
+	current := fullyPopulatedProjectConfig("automatic")
+	want := current
+	want.StartupRestorePolicy = "preserve_only"
+	currentJSON, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var currentFields map[string]json.RawMessage
+	if err := json.Unmarshal(currentJSON, &currentFields); err != nil {
+		t.Fatal(err)
+	}
+	currentFields["futureConfig"] = json.RawMessage(`{"nested":[1,true,"keep"]}`)
+	currentJSON, err = json.Marshal(currentFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var requests []string
+	var captured setConfigRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/internal/telemetry/cli-invoked" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","path":"/repo/demo","config":`+string(currentJSON)+`}}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/projects/demo/config":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Errorf("decode set-config request: %v", err)
+			}
+			_, _ = io.WriteString(w, `{"project":{"id":"demo","path":"/repo/demo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	_, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "set-config", "demo", "--startup-restore-policy", "preserve_only", "--json")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	if !reflect.DeepEqual(requests, []string{
+		"GET /api/v1/projects/demo",
+		"PUT /api/v1/projects/demo/config",
+	}) {
+		t.Fatalf("requests = %#v, want GET then PUT", requests)
+	}
+	if got := string(captured.Config.Extra["futureConfig"]); got != `{"nested":[1,true,"keep"]}` {
+		t.Fatalf("unknown forward config = %s, want preserved verbatim", got)
+	}
+	captured.Config.Extra = nil
+	if !reflect.DeepEqual(captured.Config, want) {
+		t.Fatalf("policy patch config = %#v, want unrelated fields preserved %#v", captured.Config, want)
+	}
+}
+
+func TestProjectSetConfig_StartupRestorePolicyRejectsOtherMutationFlags(t *testing.T) {
+	setConfigEnv(t)
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{name: "default branch", args: []string{"--default-branch", "main"}},
+		{name: "session prefix", args: []string{"--session-prefix", "demo"}},
+		{name: "model", args: []string{"--model", "model"}},
+		{name: "permission", args: []string{"--permission", "auto"}},
+		{name: "worker agent", args: []string{"--worker-agent", "codex"}},
+		{name: "orchestrator agent", args: []string{"--orchestrator-agent", "codex"}},
+		{name: "env", args: []string{"--env", "KEY=value"}},
+		{name: "symlink", args: []string{"--symlink", ".env"}},
+		{name: "post create", args: []string{"--post-create", "make setup"}},
+		{name: "tracker intake", args: []string{"--tracker-intake"}},
+		{name: "tracker repo", args: []string{"--tracker-repo", "acme/demo"}},
+		{name: "tracker assignee", args: []string{"--tracker-assignee", "alice"}},
+		{name: "config json", args: []string{"--config-json", `{}`}},
+		{name: "clear", args: []string{"--clear"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{"project", "set-config", "demo", "--startup-restore-policy", "automatic"}
+			args = append(args, tc.args...)
+			_, errOut, err := executeCLI(t, Deps{}, args...)
+			if err == nil || ExitCode(err) != 2 {
+				t.Fatalf("error = %v exit=%d, want usage error\nstderr=%s", err, ExitCode(err), errOut)
+			}
+			if !strings.Contains(err.Error(), "cannot be combined") && !strings.Contains(errOut, "cannot be combined") {
+				t.Fatalf("error missing combination guidance: %v\nstderr=%s", err, errOut)
+			}
+		})
+	}
+}
+
+func TestProjectSetConfig_StartupRestorePolicyRejectsInvalidValueBeforeRead(t *testing.T) {
+	setConfigEnv(t)
+	_, errOut, err := executeCLI(t, Deps{}, "project", "set-config", "demo", "--startup-restore-policy", "managed")
+	if err == nil || ExitCode(err) != 2 {
+		t.Fatalf("error = %v exit=%d, want usage error\nstderr=%s", err, ExitCode(err), errOut)
+	}
+	if !strings.Contains(err.Error(), "want automatic or preserve_only") && !strings.Contains(errOut, "want automatic or preserve_only") {
+		t.Fatalf("error missing accepted values: %v\nstderr=%s", err, errOut)
+	}
+}
+
+func TestProjectSetConfig_StartupRestorePolicyRefusesDegradedConfig(t *testing.T) {
+	cfg := setConfigEnv(t)
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/internal/telemetry/cli-invoked" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/projects/demo" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected write", http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"degraded","project":{"id":"demo","path":"/repo/demo","resolveError":"decode project config: invalid JSON"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	_, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "project", "set-config", "demo", "--startup-restore-policy", "automatic")
+	if err == nil || ExitCode(err) != 1 {
+		t.Fatalf("error = %v exit=%d, want runtime refusal\nstderr=%s", err, ExitCode(err), errOut)
+	}
+	if !strings.Contains(err.Error(), "decode project config") && !strings.Contains(errOut, "decode project config") {
+		t.Fatalf("error missing degraded reason: %v\nstderr=%s", err, errOut)
+	}
+	if !reflect.DeepEqual(requests, []string{"GET /api/v1/projects/demo"}) {
+		t.Fatalf("requests = %#v, want read only", requests)
+	}
+}
+
+func TestProjectSetConfigHelpIncludesStartupRestorePolicy(t *testing.T) {
+	out, errOut, err := executeCLI(t, Deps{}, "project", "set-config", "--help")
+	if err != nil {
+		t.Fatalf("set-config help: %v\nstderr=%s", err, errOut)
+	}
+	if !strings.Contains(out, "--startup-restore-policy") ||
+		!strings.Contains(out, "automatic or preserve_only") ||
+		!strings.Contains(out, "narrow patch") ||
+		!strings.Contains(out, "preserve every unrelated config field") {
+		t.Fatalf("set-config help missing startup restore policy:\n%s", out)
 	}
 }
 
